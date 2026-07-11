@@ -1,0 +1,236 @@
+// Dark Medical theme — global styles
+
+:root {
+  --mv-bg: #0F1419;
+  --mv-surface: #1A2028;
+  --mv-surface-2: #222B36;
+  --mv-border: #2A3441;
+  --mv-border-strong: #3A4A5C;
+  --mv-text: #E8EEF2;
+  --mv-text-dim: #8FA0B0;
+  --mv-text-muted: #5A6877;
+  --mv-accent: #00D4AA;
+  --mv-accent-dim: #007E66;
+  --mv-warning: #FFB454;
+  --mv-error: #FF5C7A;
+  --mv-shadow: 0 1px 0 rgba(255,255,255,0.04), 0 4px 12px rgba(0,0,0,0.4);
+}
+
+html, body, #app {
+  background: var(--mv-bg);
+  color: var(--mv-text);
+  height: 100%;
+  margin: 0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-feature-settings: 'cv11', 'ss01';
+}
+
+// Vuetify v-app default 余白を消し詰める
+.v-application {
+  background: var(--mv-bg) !important;
+}
+
+.v-main {
+  // Vuetify が --v-layout-top/-left/-right で計算する余白をそのまま使う。
+  // 以前は `padding: 0 !important` で潰してしまい、app-bar が画像領域に被っていた。
+  --v-layout-top: 48px !important; // app-bar 高さに合わせる
+  padding-top: var(--v-layout-top) !important;
+  padding-right: var(--v-layout-right) !important;
+  padding-bottom: var(--v-layout-bottom) !important;
+  padding-left: var(--v-layout-left) !important;
+}
+.v-main__wrap {
+  padding: 0 !important;
+}
+
+// drawer の境界線
+.v-navigation-drawer.mv-pane {
+  border-right: 1px solid var(--mv-border);
+}
+.v-navigation-drawer.mv-pane[data-location="right"],
+.v-navigation-drawer--location-right.mv-pane {
+  border-right: 0;
+  border-left: 1px solid var(--mv-border);
+}
+
+.mv-section {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--mv-border);
+}
+.mv-section + .mv-section {
+  /* 連続セクションでは上に subtle 二重線（メリハリ）*/
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+}
+
+.mv-section-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--mv-text-muted);
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mv-divider {
+  border: none;
+  border-top: 1px solid var(--mv-border);
+  margin: 8px 0;
+}
+
+// Tool icon button (上部ツールバー用)
+.mv-tool-btn {
+  background: transparent !important;
+  color: var(--mv-text-dim) !important;
+  border: 1px solid transparent !important;
+  border-radius: 6px;
+  min-width: 0;
+  width: 36px;
+  height: 36px;
+  padding: 0 !important;
+  transition: all 0.12s ease;
+
+  &:hover {
+    background: var(--mv-surface-2) !important;
+    color: var(--mv-text) !important;
+  }
+
+  &.is-active {
+    background: rgba(0, 212, 170, 0.14) !important;
+    color: var(--mv-accent) !important;
+    border-color: var(--mv-accent-dim) !important;
+  }
+}
+
+// Sidebar/Inspector シェル
+.mv-pane {
+  background: var(--mv-surface);
+  border-color: var(--mv-border) !important;
+  color: var(--mv-text);
+  overflow-y: auto;
+}
+
+// 上部 app-bar
+.mv-appbar {
+  background: var(--mv-surface) !important;
+  border-bottom: 1px solid var(--mv-border);
+  height: 48px;
+}
+
+.mv-brand {
+  font-family: 'Inter', sans-serif;
+  font-weight: 700;
+  font-size: 17px;
+  letter-spacing: 0.02em;
+  color: var(--mv-text);
+
+  .mv-brand-accent {
+    color: var(--mv-accent);
+  }
+}
+
+// Image area: 黒背景、中央寄せ。v-main の中に入るので height は親に合わせる
+// 注意:
+//   - overflow: hidden にすることで「scrollbar が出る → content 幅が縮む → さらに溢れる」
+//     のフィードバックループを断つ。Fit 計算が多少甘くてもスクロールバーが出ない。
+//   - justify-content に "safe" を付けると、コンテンツが領域より高いときに
+//     "center" を諦めて先頭揃え (flex-start) にフォールバック → title bar が上端で見切れない。
+.mv-imagearea {
+  background: #000;
+  width: 100%;
+  height: calc(100vh - 48px); // app-bar 分を引く
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: safe center;
+  overflow: hidden;
+  padding: 8px;
+}
+
+// Image box cell: 1px subtle border by default, accent ring on selection.
+// 太枠 (3px) を撤去し、selected 時はアクセントカラーの outer ring (box-shadow) で
+// 強調するモダンな focus-style に。
+.mv-imagebox-cell {
+  border: 1px solid var(--mv-border);
+  border-radius: 4px;
+  overflow: hidden;
+  transition: border-color 0.2s ease, box-shadow 0.25s ease;
+
+  &:hover {
+    border-color: var(--mv-border-strong);
+  }
+
+  &.is-selected {
+    border-color: var(--mv-accent);
+    box-shadow:
+      0 0 0 1px var(--mv-accent),
+      0 0 18px 2px rgba(0, 212, 170, 0.32),
+      inset 0 0 0 1px rgba(0, 212, 170, 0.15);
+  }
+}
+
+// Tool icon button — hover で subtle accent glow
+.mv-tool-btn {
+  transition: transform 0.12s ease, color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease !important;
+
+  &:hover:not(.is-active) {
+    color: var(--mv-accent) !important;
+    box-shadow: 0 0 8px rgba(0, 212, 170, 0.25);
+  }
+
+  &.is-active {
+    box-shadow: 0 0 12px rgba(0, 212, 170, 0.35);
+  }
+
+  &:active {
+    transform: scale(0.96);
+  }
+}
+
+// PET Standard / 主要アクションボタンの hover で軽く光る
+.mv-pet-std-btn {
+  transition: transform 0.12s ease, box-shadow 0.2s ease, background 0.15s ease !important;
+
+  &:hover {
+    box-shadow: 0 0 16px rgba(0, 212, 170, 0.55);
+  }
+
+  &:active {
+    transform: scale(0.97);
+  }
+}
+
+// Sidebar の Series カードに subtle hover lift
+.series-card {
+  transition: transform 0.12s ease, border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease !important;
+}
+.series-card:hover {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+// 細いスクロールバー
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: var(--mv-bg); }
+::-webkit-scrollbar-thumb { background: var(--mv-border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--mv-border-strong); }
+
+// 中身が詰まったボタンセット用
+.mv-btn-row {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+
+  .v-btn {
+    font-size: 12px;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+}
+
+// 数値情報の monospace 表示
+.mv-mono {
+  font-family: 'JetBrains Mono', 'Consolas', 'Courier New', monospace;
+  font-size: 11px;
+}

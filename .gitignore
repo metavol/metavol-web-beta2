@@ -1,0 +1,36 @@
+.DS_Store
+node_modules
+/dist
+
+# local env files
+.env.local
+.env.*.local
+
+# Log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Claude Code local settings
+.claude/
+
+# Local DICOM sample data (served via /api/cases for dev only)
+sample-data/
+# README は同梱したい (どんなテスト用データを置けば良いかの guide)
+!sample-data/README.md
+
+# Playwright MCP scratch output
+.playwright-mcp/
+
+# Test screenshots from Playwright runs
+/*.png
