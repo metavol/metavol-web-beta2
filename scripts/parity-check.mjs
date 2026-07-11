@@ -23,7 +23,7 @@ const opt = (name, fallback) => {
     return i >= 0 ? args[i + 1] : fallback;
 };
 const PORT = parseInt(opt('port', '3000'), 10);
-const BASE = opt('base', '/metavol-web-beta');
+const BASE = opt('base', '/metavol-web-beta2');
 const TEST_CASE = opt('case', 'parity');         // ?test=parity
 const LOAD_TIMEOUT_MS = parseInt(opt('load-timeout', '60000'), 10);
 const WAIT_RENDER_MS = parseInt(opt('wait-render', '2000'), 10);

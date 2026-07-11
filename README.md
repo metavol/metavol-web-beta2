@@ -22,9 +22,9 @@ npm install
 npm run dev
 ```
 
-ブラウザで http://localhost:3000/metavol-web-beta/ を開きます（3000 が使用中なら 3001 にフォールバック）。
+ブラウザで http://localhost:3000/metavol-web-beta2/ を開きます（3000 が使用中なら 3001 にフォールバック）。
 
-公開版: https://metavol.github.io/metavol-web-beta/
+公開版: https://metavol.github.io/metavol-web-beta2/
 
 その他のコマンド:
 - `npm run build` — 型チェック + 本番ビルド

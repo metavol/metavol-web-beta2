@@ -486,7 +486,7 @@ const loadDevCase = async (caseId: string) => {
 //   public/demo/<id>/manifest.json   → { "files": ["ct.nii.gz", "pet.nii.gz"], "description": "..." }
 //   public/demo/<id>/<file>          → 実体
 // dev-case と違い vite middleware を通さず static 配信なので GitHub Pages でも動く。
-// base path は import.meta.env.BASE_URL を使う (vite.config.mts の base= '/metavol-web-beta/')。
+// base path は import.meta.env.BASE_URL を使う (vite.config.mts の base= '/metavol-web-beta2/')。
 const loadDemoCase = async (caseId: string) => {
   try {
     const base = (import.meta.env?.BASE_URL ?? '/').replace(/\/$/, '');

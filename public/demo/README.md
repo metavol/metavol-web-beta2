@@ -37,7 +37,7 @@ fetches them in parallel (4 concurrent), then feeds them to the standard
 ## URL
 
 ```
-https://metavol.github.io/metavol-web-beta/?demo=lung01
+https://metavol.github.io/metavol-web-beta2/?demo=lung01
 ```
 
 ## Size guidance

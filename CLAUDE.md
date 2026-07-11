@@ -32,9 +32,9 @@ npm install        # 初回のみ
 npm run dev
 ```
 
-`vite.config.mts` で `base: '/metavol-web-beta/'` を設定しているため URL は
-**http://localhost:3000/metavol-web-beta/**（3000 が使用中なら 3001 等にフォールバック）。
-公開版: https://metavol.github.io/metavol-web-beta/
+`vite.config.mts` で `base: '/metavol-web-beta2/'` を設定しているため URL は
+**http://localhost:3000/metavol-web-beta2/**（3000 が使用中なら 3001 等にフォールバック）。
+公開版: https://metavol.github.io/metavol-web-beta2/
 
 その他:
 - `npm run build` — 型チェック (`vue-tsc --noEmit`) + 本番ビルド
@@ -285,7 +285,7 @@ Volume 単独 / Fusion 両方をハンドル（`isVolumeImageBoxInfo` は `clut1
 ### 次セッション再開時のチェックポイント
 
 1. **動作確認の最短手順**
-   - `npm run dev` → ブラウザで http://localhost:3000/metavol-web-beta/
+   - `npm run dev` → ブラウザで http://localhost:3000/metavol-web-beta2/
    - **Test** ボタン → PET/CT フォルダ選択 → 自動で PET Standard が出る
    - Inspector で **Apply** → 赤マスク → polygon erase → Find islands → Assign label → Save NIfTI
 

@@ -95,7 +95,7 @@ const devSampleDataPlugin = (): Plugin => ({
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  base: '/metavol-web-beta/',
+  base: '/metavol-web-beta2/',
   plugins: [
     Vue({
       template: { transformAssetUrls },
