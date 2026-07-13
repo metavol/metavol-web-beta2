@@ -9,6 +9,17 @@ defineProps<{
         value: number | null;
         inBounds: boolean;
     }>;
+    mask?: {
+        i: number; j: number; k: number; inBounds: boolean;
+        threshold: number | null;
+        manualRaw: number | null;
+        manualLabel: string;
+        final: number | null;
+        finalLabel: string;
+        component: number | null;
+        componentValid: boolean;
+        componentCount: number;
+    } | null;
     world: { x: number; y: number; z: number } | null;
     screenX: number;
     screenY: number;
@@ -62,6 +73,56 @@ defineProps<{
                 </tr>
             </tbody>
         </table>
+
+        <!-- Mask / segment 層 (PET 格子)。assign 波及などの診断用。 -->
+        <template v-if="mask">
+            <div class="mask-hdr">
+                mask @ PET
+                <span class="mono dim ml-1">
+                    <template v-if="mask.inBounds">{{ mask.i }},{{ mask.j }},{{ mask.k }}</template>
+                    <template v-else>out of grid</template>
+                </span>
+            </div>
+            <table v-if="mask.inBounds">
+                <tbody>
+                    <tr>
+                        <td class="layer">final (shown)</td>
+                        <td class="mono num">
+                            <span :class="{ dim: !mask.final }">{{ mask.final ?? 0 }}</span>
+                        </td>
+                        <td class="mono seg-label">
+                            <span :class="{ dim: mask.finalLabel === '-' }">{{ mask.finalLabel }}</span>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="layer">threshold</td>
+                        <td class="mono num"><span :class="{ dim: !mask.threshold }">{{ mask.threshold ?? 0 }}</span></td>
+                        <td></td>
+                    </tr>
+                    <tr>
+                        <td class="layer">manual edit</td>
+                        <td class="mono num">
+                            <span :class="{ dim: !mask.manualRaw, erase: mask.manualRaw === 0xFFFF }">
+                                {{ mask.manualRaw === 0xFFFF ? '0xFFFF' : (mask.manualRaw ?? 0) }}
+                            </span>
+                        </td>
+                        <td class="mono seg-label">
+                            <span :class="{ dim: mask.manualLabel === '-', erase: mask.manualLabel === 'erase' }">{{ mask.manualLabel }}</span>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="layer">component</td>
+                        <td class="mono num">
+                            <span v-if="mask.componentValid" :class="{ dim: !mask.component }">{{ mask.component ?? 0 }}</span>
+                            <span v-else class="dim">stale</span>
+                        </td>
+                        <td class="mono dim">
+                            <span v-if="mask.componentValid">/ {{ mask.componentCount }} islands</span>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </template>
     </div>
 </template>
 
@@ -167,5 +228,30 @@ td {
 }
 .desc {
     color: var(--mv-text);
+}
+
+.mask-hdr {
+    margin-top: 6px;
+    padding-top: 4px;
+    border-top: 1px solid var(--mv-border);
+    color: var(--mv-accent);
+    font-weight: 600;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+.layer {
+    color: var(--mv-text-muted);
+    font-size: 10px;
+    padding-right: 8px;
+}
+.seg-label {
+    color: var(--mv-text);
+}
+.erase {
+    color: #ff7f7f;
+}
+.ml-1 {
+    margin-left: 4px;
 }
 </style>

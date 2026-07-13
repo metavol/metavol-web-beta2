@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia';
 import * as THREE from 'three';
 import type { Volume } from '../components/Volume';
-import { connectedComponents26, assignLabelToComponent, extractCtBodyMask, sphereStatsInPet } from '../components/segmentation/maskOps';
+import { connectedComponents26, floodFillAssignLabel, extractCtBodyMask, sphereStatsInPet } from '../components/segmentation/maskOps';
 import { writeNiftiUint16, triggerDownload } from '../components/segmentation/niftiWriter';
 
 export interface LabelEntry {
@@ -622,25 +622,15 @@ export const useSegmentationStore = defineStore('segmentation', {
             const pet = this.petVolumeRef;
             const m = this.finalMask;
             if (!pet || !m) return 0;
-            // 古い componentMap で操作すると意図しない領域に波及するため、
-            // 必ず最新状態に基づいて計算する。
-            this.ensureComponentMap();
-            const cm = this.componentMap;
-            if (!cm) return 0;
-
-            const seedIdx = k * pet.nx * pet.ny + j * pet.nx + i;
-            const compId = cm[seedIdx];
-            if (compId === 0) return 0;
-
-            const n = assignLabelToComponent(cm, m, { i, j, k }, pet.nx, pet.ny, labelId);
-            // 確定後はその領域を manualEdits にも反映（再計算で消えないように）
-            const me = this.manualEdits;
-            if (me) {
-                for (let p = 0; p < cm.length; p++) {
-                    if (cm[p] === compId) me[p] = labelId;
-                }
-            }
-            this.maskVersion++;
+            // クリック位置から現在の mask を 26-連結で局所 flood fill し、その島だけを
+            // labelId に書き換える (finalMask + manualEdits 両方)。
+            // 旧実装は毎回 connectedComponents26 で全 volume を再ラベリングしていて重く、
+            // かつ古い componentMap 経由で別の島へ波及する既知バグがあった。局所 flood fill は
+            // O(領域サイズ) で完了し、その場の連結性を辿るので波及もしない。
+            const n = floodFillAssignLabel(m, this.manualEdits, { i, j, k }, pet.nx, pet.ny, pet.nz, labelId);
+            // ラベル値を書き換えただけで非ゼロ集合 (= 連結成分の構造) は不変なので
+            // componentMap は依然有効。maskVersion だけ bump して overlay を再描画させる。
+            if (n > 0) this.maskVersion++;
             return n;
         },
 

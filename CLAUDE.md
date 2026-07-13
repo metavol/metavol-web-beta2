@@ -112,7 +112,12 @@ src/
 2. PET color overlay（hot/rainbow CLUT、Fusion なら 50% 重み）
 3. mask label color（`finalMask` をサンプル、α=overlayAlpha でブレンド）
 4. 球輪郭（スライス面と球の交差円、`ctx.arc()`）
-5. 進行中 polygon（`ctx.stroke()` + 頂点ドット）
+5. 進行中 polygon（`ctx.stroke()` + 頂点ドット + カーソルへのラバーバンド）
+
+**重要: アノテーション (球/rect/polygon) は base 描画の後に重ねること。**
+draw メソッドは全て async (GPU パスは offscreen → `ctx.drawImage`)。`showImage` は各 draw の
+promise を `drawPromise` に捕まえ、**解決後**に `drawAnnotationOverlays` を呼ぶ。同期的に描くと
+GPU 描画に上書きされてアノテーションが消える (描画中 polygon の線が見えない不具合の原因だった)。
 
 ---
 
@@ -126,7 +131,16 @@ src/
 | `page` | ドラッグでスライス送り |
 | `sphereROI` | クリックで球中心配置、球内ホイールで半径変更（外なら slice送り） |
 | `polygonROI` | 左クリック=頂点 / 右クリック or ダブルクリック=確定 / Esc=取消 / Ctrl+Z=undo |
-| `assignLabel` | クリックでその voxel が属する 26連結成分に現在ラベルID を付与 |
+| `brushROI` | 左ドラッグで円形ブラシ (半径 mm)。add=現ラベル / erase |
+| `assignLabel` | クリックでその voxel が属する連結領域に現在ラベルID を付与 (局所 flood fill) |
+
+**編集ツールの共通仕様 (polygon / brush): 既存ラベルの修正専用。**
+polygon 内・brush 円内であっても **背景 (finalMask==0) は一切変更しない** (`fillPolygonOnSlice` の
+`gate` 引数 / `paintBrushAt` の `fmask[idx]===0` スキップ)。add は既存ラベルの付け替え、erase は既存ラベルの
+除去のみ。ゼロから新規領域を塗るのは threshold Apply の役割。
+これら 3 ツールは右 Inspector の **Edit tool** トグルからも選択でき、上の Tumor/Physiological
+(currentLabelId) を共有する。
+**slice index は必ず `Math.round(vc[sliceAxis])`** で決める (overlay サンプリング = `floor(mv+0.5)` と一致させる)。
 
 ### ツール非依存の常時操作
 
@@ -188,15 +202,26 @@ Volume 単独 / Fusion 両方をハンドル（`isVolumeImageBoxInfo` は `clut1
 - グローバル CSS は `src/styles/app.scss` で CSS 変数管理（`--mv-bg` `--mv-surface` `--mv-accent` 等）
 - フォント: Inter / JetBrains Mono（unplugin-fonts 経由）
 
-### 1. Polygon ROI が 1 スライス隣に反映される場合がある
-- 原因仮説: `handlePolygonClick` で `sliceIndexInPet = Math.round(vc[sliceAxis])` としているが、`centerInWorld` がスライス境界ぴったりに乗ったとき floor/round の差で 1 ずれる。
-- 修正方針: `sliceIndex` を確定する基準を「現在表示中の中心 voxel」ではなく「画面中央画素を screenToWorld → worldToVoxel した結果」にし、丸めも floor で統一して矛盾を防ぐ。
-- 表示時 (`drawNiftiSliceFusion` の overlay サンプリング) も同じ基準で voxel index を決めるべき。
+### 1. Polygon ROI が 1 スライス隣に反映される (解決済み 2026-07-12)
+- 真因: overlay の mask サンプリングは shader (`sliceShader.ts`) / CPU とも `floor(mv + 0.5)` = **round-to-nearest**。
+  一方 fill の slice index を `Math.floor(vc[sliceAxis])` で決めていたため、小数部 ≥0.5 のとき
+  「表示スライス = round」と「書き込みスライス = floor」が 1 ずれ、描いた面と別の面に ROI が出ていた。
+  (過去に round→floor へ変えた対策は shader が floor だという誤った前提に基づくもので、逆効果だった。)
+- 修正: `handlePolygonClick` / `brushMouseDown` の slice index を `Math.round(vc[sliceAxis])` に統一し、
+  overlay の round サンプリングと一致させた。今後 slice index を決めるコードは必ず round に揃えること。
 
-### 2. Polygon で不連続化したあとに片方の島だけラベル付けると、もう一方にも波及する場合がある（要設計）
-- 現在の動作: `assignLabelAtVoxel` は `componentMap`（`finalMask` に対する 26連結 CC）の seed 成分を全部書き換える。
-- ところが `findIslands` を **polygon erase 前に1度実行**していると、erase で分かれた後でも CC が古い → 元々 1 成分だった voxel すべてに伝播。
-- → ラベル付け前に **必ず Find islands を再実行**する／erase / polygon 操作のたびに `componentMap = null` に invalidate する／`assignLabel` 時に成分が古ければ自動再計算する、のいずれか。仕様化が必要。
+### 2. 分離した片方の島だけ assign したら他方にも波及する (調査中)
+- `assignLabelAtVoxel` は `componentMap` を使わず、クリック位置から `finalMask` を **その場で局所
+  flood fill** する (`floodFillAssignLabel`, 26-連結)。常に最新の連結性を辿るので、**本当に非連結**なら
+  他島へは波及しない (旧 componentMap ベースの stale 波及は解消済み)。
+- それでも「両方塗られる」場合、最有力の原因は **3D 連結**: polygon/brush の erase は 1 スライス単位
+  なので、見た目 2D で分離したつもりでも隣接スライスで繋がっていれば 3D 的には 1 連結成分 → assign
+  (3D flood) は両方を塗る。これは連結性 (6 vs 26) の問題ではなく「どこまで erase したか」の問題。
+- **診断手段**: voxel inspector (Ctrl+Shift+D) を ON にすると mask 各層 (threshold / manual /
+  final / component id) を表示する。2 つの segment を hover して同じ component id なら 3D 連結。
+  gap を各スライスで hover し final==0 か確認すると、どのスライスで繋がっているか特定できる。
+- 連結性は findIslands / summarizeLesions / assign すべて 26-連結で統一 (inspector の component 欄が
+  assign 波及範囲をそのまま予測する)。
 
 ### 3. `setPetVolume(v)` が呼ばれるたびに mask が破棄される
 - `setPetVolume` は `thresholdMask`/`manualEdits`/`finalMask`/`undoStack`/`sphere`/`polygon` を全 null 化する。

@@ -105,6 +105,8 @@ const gunzipAsync = async (data: Uint8Array, filename?: string): Promise<Uint8Ar
 import * as Phantom from './phantom.ts';
 import { useSegmentationStore } from '../stores/segmentation';
 import { usePerfStore } from '../stores/perf';
+import { isWebGpuAvailable, getGpuDeviceSync } from './webgpu/gpuContext';
+import { updateMaskTextureSlice } from './webgpu/maskCache';
 import { sphereStatsInPet, fillPolygonOnSlice, findMaximumAxis as maxAxis } from './segmentation/maskOps';
 import { TRACER_PRESETS, tracerById, detectTracer, type TracerPreset } from './tracerPresets';
 import { buildOpacityLut, DEFAULT_TF, TF_PRESETS } from './vrTf';
@@ -117,6 +119,8 @@ import { useAutoSave } from '../composables/useAutoSave';
 import { loadSession, deleteSession, type SessionPayload } from '../stores/persistence';
 
 const segStore = useSegmentationStore();
+// voxel brush の即時 GPU 反映 (updateMaskTextureSlice) で gpuAllowed を参照するため保持。
+const perfStore = usePerfStore();
 
 
 const closingImages = defineModel<boolean>("closingImages");
@@ -220,6 +224,19 @@ const debugHoverRows = ref<Array<{
   i: number; j: number; k: number;
   value: number | null; inBounds: boolean;
 }>>([]);
+// マスク各層 (PET 格子) の値。voxel inspector で「この画素がどのセグメントか / どの層で
+// その値が決まっているか」を可視化して assign 波及などの不具合診断に使う。
+const debugMaskInfo = ref<{
+  i: number; j: number; k: number; inBounds: boolean;
+  threshold: number | null;              // thresholdMask (閾値由来ラベル)
+  manualRaw: number | null;              // manualEdits 生値 (0xFFFF = erase sentinel)
+  manualLabel: string;                   // 人間可読の manualEdits
+  final: number | null;                  // finalMask (実表示ラベル)
+  finalLabel: string;
+  component: number | null;              // componentMap の成分 ID (無効なら null)
+  componentValid: boolean;
+  componentCount: number;
+} | null>(null);
 const debugScreenX = ref(0);
 const debugScreenY = ref(0);
 const debugShow = ref(false);
@@ -761,6 +778,52 @@ const updateDebugHover = (boxId: number, e: MouseEvent) => {
     });
   }
   debugHoverRows.value = rows;
+
+  // ===== マスク各層 (PET 格子) の値 =====
+  // mask は PET 格子上に保持されるので、world → PET voxel に変換して層ごとに読む。
+  // overlay サンプリングと同じ nearest-center (floor(x+0.5)) で index を決める。
+  const petIdx = findPetSeriesIndex();
+  const pet = segStore.petVolumeRef;
+  if (petIdx >= 0 && pet) {
+    const vox = worldToVoxel_(w, petIdx);
+    const mi = Math.floor(vox.x + 0.5), mj = Math.floor(vox.y + 0.5), mk = Math.floor(vox.z + 0.5);
+    const inB = mi >= 0 && mi < pet.nx && mj >= 0 && mj < pet.ny && mk >= 0 && mk < pet.nz;
+    if (inB) {
+      const idx = mk * pet.nx * pet.ny + mj * pet.nx + mi;
+      const th = segStore.thresholdMask ? segStore.thresholdMask[idx] : null;
+      const meRaw = segStore.manualEdits ? segStore.manualEdits[idx] : null;
+      const fin = segStore.finalMask ? segStore.finalMask[idx] : null;
+      const comp = (segStore.componentMapValid && segStore.componentMap) ? segStore.componentMap[idx] : null;
+      const labelName = (v: number | null): string => {
+        if (v == null || v === 0) return '-';
+        return segStore.labelById(v)?.name ?? `#${v}`;
+      };
+      debugMaskInfo.value = {
+        i: mi, j: mj, k: mk, inBounds: true,
+        threshold: th,
+        manualRaw: meRaw,
+        manualLabel: meRaw == null ? '-'
+          : meRaw === 0xFFFF ? 'erase'
+          : meRaw === 0 ? '-'
+          : labelName(meRaw),
+        final: fin,
+        finalLabel: labelName(fin),
+        component: comp,
+        componentValid: segStore.componentMapValid,
+        componentCount: segStore.componentCount,
+      };
+    } else {
+      debugMaskInfo.value = {
+        i: mi, j: mj, k: mk, inBounds: false,
+        threshold: null, manualRaw: null, manualLabel: '-',
+        final: null, finalLabel: '-', component: null,
+        componentValid: segStore.componentMapValid, componentCount: segStore.componentCount,
+      };
+    }
+  } else {
+    debugMaskInfo.value = null;
+  }
+
   debugScreenX.value = e.clientX;
   debugScreenY.value = e.clientY;
   debugShow.value = true;
@@ -2100,10 +2163,8 @@ initializeDicomListsImagesBoxInfos();
 
 const changeSlice_ = (add_number: number) => {
   const srcId = selectedImageBoxId.value;
-  doOneOrAll(srcId, (id: number) => {
-    changeSlice(id, add_number);
-    showImage(id);
-  });
+  // world 座標同期 paging (スライス厚差を吸収して同じ断面に揃える)
+  applySyncPaging(srcId, add_number);
   // crosshair を source box の through-plane vec で連動
   if (segStore.crosshairWorld && isAnyVolumeBox(srcId)) {
     const src = imageBoxInfos.value[srcId] as VolumeImageBoxInfo;
@@ -2132,6 +2193,48 @@ const changeSlice = (index: number, add_number: number) => {
     }else{
       a.centerInWorld.addScaledVector(a.vecz, add_number);
     }
+  }
+};
+
+// Sync group 内の target volume box の断面を、world 点 srcCenter を通る位置へ揃える。
+// スライス厚 (vecz の長さ) が box ごとに違っても world 座標で一致させるのが狙い。
+// pan (面内位置) は保持し、through-plane 成分だけ動かす:
+//   centerInWorld += n * ((srcCenter - centerInWorld)·n)   (n = vecz 単位ベクトル)
+const alignBoxThroughPlaneToWorld = (i: number, srcCenter: THREE.Vector3) => {
+  const a = getVolumeImageBoxInfo(i);
+  if (a.isMip || a.isVr || !a.vecz) return;
+  const n = a.vecz.clone().normalize();
+  const d = srcCenter.clone().sub(a.centerInWorld).dot(n);
+  a.centerInWorld.addScaledVector(n, d);
+};
+
+// paging を sync group 全体へ world 座標同期で適用する。
+//   - source box は add_number 分だけ通常送り。
+//   - Volume↔Volume は「同じ world 断面」に一致させる (スライス厚差を吸収)。
+//   - DICOM slice 等、world 断面を持たない box は従来通り同数送り。
+// MIP/VR は isSyncPagingCompatible が false を返すため対象外 (回転と混ざらない)。
+const applySyncPaging = (srcId: number, add_number: number) => {
+  changeSlice(srcId, add_number);
+  showImage(srcId);
+  if (!syncImageBox.value) return;
+
+  // source が Volume (非 MIP/VR) なら、その新しい断面中心を同期の基準にする。
+  let srcCenter: THREE.Vector3 | null = null;
+  if (isAnyVolumeBox(srcId)) {
+    const sa = getVolumeImageBoxInfo(srcId);
+    if (!sa.isMip && !sa.isVr) srcCenter = sa.centerInWorld;
+  }
+
+  for (let i = 0; i < imb.value!.length; i++) {
+    if (i === srcId) continue;
+    if (!isBoxSyncEnabled(i)) continue;
+    if (!isSyncPagingCompatible(srcId, i)) continue;
+    if (srcCenter && isAnyVolumeBox(i)) {
+      alignBoxThroughPlaneToWorld(i, srcCenter);
+    } else {
+      changeSlice(i, add_number);
+    }
+    showImage(i);
   }
 };
 
@@ -2552,6 +2655,14 @@ const rightDragActive = ref(false);
 // 確定すると segStore.rectRois に voxel 座標で push される。
 const rectRoiDraft = ref<{ boxId: number; x0: number; y0: number; x1: number; y1: number } | null>(null);
 
+// Polygon 描画中に「最後の確定頂点 → カーソル」を結ぶラバーバンド線のプレビュー座標。
+// null = プレビューなし。頂点確定 / finalize / cancel でクリアする。
+const polygonCursor = ref<[number, number] | null>(null);
+
+// Voxel brush ツール選択中の、カーソル位置のブラシ円プレビュー (canvas 座標)。
+// box から出たら null。ブラシサイズを視覚化する目的。
+const brushCursor = ref<{ boxId: number; x: number; y: number } | null>(null);
+
 const mouseMove = (e: MouseEvent) => {
   const id = getIdOfEventOccured(e);
   const infoV = getVolumeImageBoxInfo;
@@ -2576,11 +2687,23 @@ const mouseMove = (e: MouseEvent) => {
     return;
   }
 
-  // Voxel brush: 左ボタンドラッグ中なら同一 box 上でブラシを描き続ける。
-  if (leftButtonFunction.value == "brushROI" && brushStroke.value && (e.buttons & 1) !== 0) {
-    if (brushStroke.value.boxId === id) {
-      const [x, y] = getCanvasXY(e);
-      paintBrushAt(x, y);
+  // Polygon 描画中: カーソルまでのラバーバンド線をライブ表示 (hover, ボタン非押下)。
+  if (leftButtonFunction.value === "polygonROI" && segStore.polygon?.inProgress
+      && segStore.polygon.imageBoxId === id && e.buttons === 0) {
+    const [x, y] = getCanvasXY(e);
+    polygonCursor.value = [x, y];
+    showImage(id);   // base を再描画してから drawAnnotationOverlays でラバーバンドを重ねる
+    return;
+  }
+
+  // Voxel brush: カーソル円プレビューを追従表示しつつ、左ドラッグ中は描画する。
+  if (leftButtonFunction.value == "brushROI" && isVolumeImageBoxInfo(id)) {
+    const [x, y] = getCanvasXY(e);
+    brushCursor.value = { boxId: id, x, y };
+    if ((e.buttons & 1) !== 0 && brushStroke.value?.boxId === id) {
+      paintBrushAt(x, y);   // paintBrushAt 内で showImage する (カーソル円も一緒に再描画)
+    } else if (e.buttons === 0) {
+      showImage(id);        // hover: ブラシ円だけ追従再描画
     }
     return;
   }
@@ -2712,14 +2835,11 @@ const wheel = (e: WheelEvent) => {
     }
   }
 
-  // wheel paging は plane-aware sync (axial paging で MIP が回転しないように)
-  doOneOrAllSamePlane(id, (id: number) => {
-    const change = e.deltaY > 0 ? 1 : -1;
-    changeSlice(id, change);
-    showImage(id);
-  });
-  // crosshair を source box の through-plane vec で連動 (1 回だけ実行)
+  // wheel paging は plane-aware + world 座標同期 (axial paging で MIP が回転しない、
+  // かつスライス厚が違う box 同士でも同じ world 断面に揃う)
   const change = e.deltaY > 0 ? 1 : -1;
+  applySyncPaging(id, change);
+  // crosshair を source box の through-plane vec で連動 (1 回だけ実行)
   if (segStore.crosshairWorld && isAnyVolumeBox(id)) {
     const src = imageBoxInfos.value[id] as VolumeImageBoxInfo;
     if (src.vecz && !src.isMip) {
@@ -2754,8 +2874,8 @@ const imageBoxClicked = (e:MouseEvent) => {
 const handleAssignLabelClick = (e: MouseEvent) => {
   const id = getIdOfEventOccured(e);
   if (!isVolumeImageBoxInfo(id)) return;
-  // componentMap が未計算でも assignLabelAtVoxel 内で ensureComponentMap が走るので
-  // ここでは要求しない (要求すると Find islands 前の初回クリックが無反応になる)。
+  // assignLabelAtVoxel はクリック位置からの局所 flood fill でその島だけを塗るため、
+  // 事前の Find islands (componentMap 計算) は不要。初回クリックからそのまま反映される。
   if (!segStore.petVolumeRef) return;
   const petIdx = findPetSeriesIndex();
   if (petIdx < 0) return;
@@ -2853,12 +2973,13 @@ const brushMouseDown = (e: MouseEvent) => {
   if (petIdx < 0) return;
   segStore.ensureMaskAllocated();
   if (!segStore.manualEdits || !segStore.finalMask) return;
-  // slice 確定: 画面中央画素を world→PET voxel し、polygon と同じ floor 規則で決定。
+  // slice 確定: 画面中央画素を world→PET voxel し、overlay サンプリング (floor(mv+0.5)=round)
+  // と同じ round 規則で決定。polygon と揃える。
   const sliceAxis = maxAxis(a.vecz);
   const wCenter = screenToWorld(id, imageBoxW.value!/2, imageBoxH.value!/2);
   const vc = worldToVoxel_(wCenter, petIdx);
   const arr = [vc.x, vc.y, vc.z];
-  const sliceIndex = Math.floor(arr[sliceAxis]);
+  const sliceIndex = Math.round(arr[sliceAxis]);
   // stroke 全体を 1 つの undo entry にする (描き始める前に slice を退避)
   saveSliceToUndoStack(sliceAxis, sliceIndex);
   brushStroke.value = { boxId: id, petIdx, sliceAxis, sliceIndex };
@@ -2900,11 +3021,28 @@ const paintBrushAt = (sx: number, sy: number) => {
       if (st.sliceAxis === 2) idx = st.sliceIndex * nx * ny + vv * nx + u;
       else if (st.sliceAxis === 1) idx = vv * nx * ny + st.sliceIndex * nx + u;
       else idx = vv * nx * ny + u * nx + st.sliceIndex;
+      // Brush は既存ラベルの修正用途。ブラシ円内でも背景 (ラベル無し) は変更しない。
+      if (fmask[idx] === 0) continue;
       m[idx] = writeValue;
       fmask[idx] = fval;   // recomputeFinalMask と同じ結果を inline 反映
     }
   }
-  show();
+
+  // ブラシは「カーソルと同時に画面へ反映」がユーザ期待値。ここを軽くするのが重要:
+  //  ★ stroke 中は maskVersion を bump しない。bump すると lesionRows (summarizeLesions =
+  //    全 volume 26-CC, ~30ms) / labelHistogram / volumesByLabel 等の重い reactive computed が
+  //    毎 mousemove で再計算され、これがブラシ遅延の主因だった。統計は brushMouseUp で 1 回だけ更新。
+  //  ・GPU 有効時は変更した 1 スライスだけを直接テクスチャに部分アップロードして表示を更新する
+  //    (reactive version には依存しない。現在の maskVersion をそのまま渡せば cache が整合する)。
+  //  ・CPU パスは overlay が finalMask を直接サンプルするので showImage だけで即反映される。
+  //  ・全 box (高価な MIP 含む) ではなく描いている box だけ再描画する。
+  if (perfStore.gpuAllowed && isWebGpuAvailable()) {
+    const device = getGpuDeviceSync();
+    if (device) {
+      updateMaskTextureSlice(device, fmask, nx, ny, nz, segStore.maskVersion, st.sliceAxis, st.sliceIndex);
+    }
+  }
+  showImage(st.boxId);
 };
 
 const brushMouseUp = () => {
@@ -2924,6 +3062,15 @@ const onBoxMouseDown = (e: MouseEvent) => {
 const onBoxMouseUp = () => {
   if (rectRoiDraft.value) rectRoiMouseUp();
   if (brushStroke.value) brushMouseUp();
+};
+
+// box から出たらデバッグ hover を消し、ブラシカーソル円も消す (残像防止)。
+const onBoxMouseLeave = (id: number) => {
+  debugShow.value = false;
+  if (brushCursor.value){
+    brushCursor.value = null;
+    showImage(id);   // ブラシ円を消すため再描画
+  }
 };
 
 const handlePolygonClick = (e: MouseEvent) => {
@@ -2947,7 +3094,10 @@ const handlePolygonClick = (e: MouseEvent) => {
       const wCenter = screenToWorld(id, imageBoxW.value!/2, imageBoxH.value!/2);
       const vc = worldToVoxel_(wCenter, petIdx);
       const arr = [vc.x, vc.y, vc.z];
-      sliceIndexInPet = Math.floor(arr[sliceAxis]);
+      // overlay の mask サンプリングは shader/CPU とも floor(mv + 0.5) = round-to-nearest。
+      // ここを floor にすると表示スライスと書き込みスライスが 1 ずれ、描いた面と別の面に
+      // ROI が出る (小数部 ≥0.5 のとき)。round に統一して表示スライスへ確実に書き込む。
+      sliceIndexInPet = Math.round(arr[sliceAxis]);
     }
     segStore.polygon = {
       plane: planeName,
@@ -3009,17 +3159,21 @@ const finalizePolygon = () => {
     sliceIndex: p.sliceIndexInPet,
     polygonVoxelXY: polyVoxelUV,
     writeValue,
+    // Polygon は既存ラベルの修正用途。polygon 内でも背景 (finalMask==0) は触らない。
+    gate: segStore.finalMask ?? undefined,
   });
 
   segStore.recomputeFinalMask();
   segStore.markManualEditsChanged();
   segStore.polygon = null;
+  polygonCursor.value = null;
   show();
 };
 
 const cancelPolygon = () => {
   if (segStore.polygon){
     segStore.polygon = null;
+    polygonCursor.value = null;
     show();
   }
 };
@@ -3905,6 +4059,12 @@ const showImage = (i:number) => {
 
   const info1 = imageBoxInfos.value[i];
 
+  // 各 draw メソッドは async (GPU パスは offscreen 描画後に ctx.drawImage する)。
+  // アノテーション (polygon / sphere / rect) を同期的に描くと、後から解決する GPU 描画に
+  // 上書きされて消える (特に描画中 polygon の線が見えない)。draw の promise を捕まえて
+  // 完了後に drawAnnotationOverlays を走らせる。
+  let drawPromise: Promise<unknown> | void;
+
   if (isDicomSliceImageBoxInfo(i)){
     const info = info1 as DicomSliceImageBoxInfo;
 
@@ -3990,12 +4150,12 @@ const showImage = (i:number) => {
 
         if (dataSet.string("x00280004") == "RGB") {
           const ui8a = new Uint8Array(buf, offset, length);
-          imb.value![i].showRgb(ui8a, rows!, cols!, centerX, centerY, zoom);
+          drawPromise = imb.value![i].showRgb(ui8a, rows!, cols!, centerX, centerY, zoom);
         } else {
           // BitsAllocated に従って 8-bit / 16-bit を読み分ける (DX や Secondary
           // Capture は 8-bit grayscale で、Int16 固定読みだと画素が壊れる)。
           const i16a = readDicomPixelsAsInt16(dataSet);
-          imb.value![i].show(
+          drawPromise = imb.value![i].show(
             i16a, rows, cols, wc, ww, intercept, slope, centerX, centerY, zoom,
             info.interpolation ?? 'bilinear'
           );
@@ -4032,7 +4192,7 @@ const showImage = (i:number) => {
       const tf = info.mip?.vrOpacityTF ?? DEFAULT_TF;
       const opacityLut = buildOpacityLut(tf);
       const shading = info.mip?.vrShading;
-      imb.value![i].drawNiftiVR(pixelData0, nx, ny, nz, wc!, ww!,
+      drawPromise = imb.value![i].drawNiftiVR(pixelData0, nx, ny, nz, wc!, ww!,
         p00, v01, v10, vForward, maxSteps, clut, opacityLut, mipFastBoxes.has(i), aScale, shading);
     } else if (!info.isMip){
         // CT 寝台除去: この volume が CT で、segStore に body mask があれば適用
@@ -4045,7 +4205,7 @@ const showImage = (i:number) => {
             && isThisCt)
           ? segStore.ctBodyMask
           : undefined;
-        imb.value![i].drawNiftiSlice(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,clut,
+        drawPromise = imb.value![i].drawNiftiSlice(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,clut,
           buildMaskOverlayForBox(i), ctBodyMask, info.interpolation ?? 'bilinear');
       }else{
       const angle = info.mip!.mipAngle;
@@ -4055,7 +4215,7 @@ const showImage = (i:number) => {
       const overlayForMip = (info.currentSeriesNumber === petIdx)
         ? buildMipMaskOverlay(i)
         : undefined;
-      imb.value![i].drawNiftiMip(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,
+      drawPromise = imb.value![i].drawNiftiMip(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,
         angle, info.mip!.thresholdSurfaceMip, info.mip!.depthSurfaceMip, clut,
         info.mip!.isSurface, overlayForMip, mipFastBoxes.has(i));
       }
@@ -4106,7 +4266,7 @@ const showImage = (i:number) => {
     if (info.isVr) {
       // Fusion VR: CT VR + PET VR を α blend
       const angle = info.mip?.mipAngle ?? 0;
-      imb.value![i].drawFusionVR(
+      drawPromise = imb.value![i].drawFusionVR(
         pixelData0, nx0,ny0,nz0, wc0!, ww0!, p00_0,v01_0,v10_0,clut0,
         pixelData1, nx1,ny1,nz1, wc1!, ww1!, p00_1,v01_1,v10_1,clut1,
         angle, info.overlayAlpha ?? 0.5,
@@ -4114,13 +4274,13 @@ const showImage = (i:number) => {
     } else if (info.isMip) {
       // Fusion MIP: CT base MIP + PET overlay MIP を α blend
       const angle = info.mip?.mipAngle ?? 0;
-      imb.value![i].drawFusionMip(
+      drawPromise = imb.value![i].drawFusionMip(
         pixelData0, nx0,ny0,nz0, wc0!, ww0!, p00_0,v01_0,v10_0,clut0,
         pixelData1, nx1,ny1,nz1, wc1!, ww1!, p00_1,v01_1,v10_1,clut1,
         angle, info.overlayAlpha ?? 0.5,
       );
     } else {
-      imb.value![i].drawNiftiSliceFusion(
+      drawPromise = imb.value![i].drawNiftiSliceFusion(
         pixelData0, nx0,ny0,nz0, wc0!, ww0!, p00_0,v01_0,v10_0,clut0,
         pixelData1, nx1,ny1,nz1, wc1!, ww1!, p00_1,v01_1,v10_1,clut1,
         undefined,
@@ -4132,7 +4292,13 @@ const showImage = (i:number) => {
     }
   }
 
-  drawAnnotationOverlays(i);
+  // アノテーションは base 描画 (async GPU 含む) の完了後に重ねる。
+  // 同期的に描くと GPU の ctx.drawImage に上書きされ、描画中 polygon が見えなくなる。
+  if (drawPromise && typeof (drawPromise as Promise<unknown>).then === 'function') {
+    (drawPromise as Promise<unknown>).then(() => drawAnnotationOverlays(i)).catch(() => { /* 描画失敗時はアノテーションもスキップ */ });
+  } else {
+    drawAnnotationOverlays(i);
+  }
   // box i の state が更新されたので reactive trigger を bump (cross-ref line 等)
   boxStateVersion.value++;
 };
@@ -4178,10 +4344,24 @@ const drawAnnotationOverlays = (i: number) => {
     }
   }
 
-  // polygon: 描画中のものをオーバーレイ。
+  // polygon: 描画中のものをオーバーレイ。inProgress ならカーソルまでのラバーバンドも描く。
   const p = segStore.polygon;
   if (p && p.imageBoxId === i && p.screenVertices.length > 0){
-    imb.value![i].drawPolygonOverlay(p.screenVertices, p.mode, !p.inProgress);
+    const verts = (p.inProgress && polygonCursor.value)
+      ? [...p.screenVertices, polygonCursor.value]
+      : p.screenVertices;
+    imb.value![i].drawPolygonOverlay(verts, p.mode, !p.inProgress);
+  }
+
+  // brush: ツール選択中はカーソル位置にブラシサイズの円 (物理 mm → screen 投影) を表示。
+  // |vecx| / |vecy| = screen 1px あたりの world mm なので、その逆数が px/mm。
+  if (leftButtonFunction.value === 'brushROI' && brushCursor.value && brushCursor.value.boxId === i && !a.isMip && !a.isVr){
+    const rMm = segStore.brushRadiusMm;
+    const pxPerMmX = 1 / Math.max(a.vecx.length(), 1e-6);
+    const pxPerMmY = 1 / Math.max(a.vecy.length(), 1e-6);
+    imb.value![i].drawBrushCursorOverlay(
+      brushCursor.value.x, brushCursor.value.y, rMm * pxPerMmX, rMm * pxPerMmY, segStore.brushMode,
+    );
   }
 };
 
@@ -4412,6 +4592,26 @@ const findPetSeriesIndex = (): number => {
   return -1;
 };
 
+// 描画パイプラインが使う labelClut を store の各ラベル色から動的生成する。
+// index = label id で参照される (CPU: labelClut[lid % len], GPU: lid % len)。
+// 静的 labelClut (Clut.ts) は palette index であり label.color と一致しないため
+// (例: Physiological id=2 は水色 [120,200,255] を意図しているが labelClut[2] は緑)、
+// ここで label.color を単一の真実として color を引けるようにする。
+// computed なので labels の色/数が変わらない限り同一配列参照を返し、
+// GPU 側の clutBufCache (WeakMap keyed by array identity) が正しくヒットする。
+const labelClutDynamic = computed<number[][]>(() => {
+  const maxId = segStore.labels.reduce((m, l) => Math.max(m, l.id), 0);
+  const arr: number[][] = [[0, 0, 0]];  // index 0 = background
+  for (let id = 1; id <= maxId; id++) {
+    const lbl = segStore.labels.find(l => l.id === id);
+    // ラベルが存在すればその明示色。欠番 id は静的 palette にフォールバック。
+    arr[id] = lbl
+      ? [lbl.color[0], lbl.color[1], lbl.color[2]]
+      : labelClut[id % labelClut.length];
+  }
+  return arr;
+});
+
 // MIP 用のマスクオーバレイ。drawNiftiMip では mask の (nx,ny,nz) が
 // pix と一致している前提で、内部で投影マップを生成する。
 // p00/v01/v10 は drawNiftiMip 側では使われない（投影後の 2D 配列で参照）が、
@@ -4428,7 +4628,7 @@ const buildMipMaskOverlay = (boxId?: number) => {
     v01: new THREE.Vector3(0,0,0),
     v10: new THREE.Vector3(0,0,0),
     nx: pet.nx, ny: pet.ny, nz: pet.nz,
-    labelClut,
+    labelClut: labelClutDynamic.value,
     alpha: segStore.overlayAlpha,
     version: segStore.maskVersion,
   };
@@ -4451,8 +4651,12 @@ const buildMaskOverlayForBox = (i: number) => {
     mask,
     p00, v01, v10,
     nx: pet.nx, ny: pet.ny, nz: pet.nz,
-    labelClut,
+    labelClut: labelClutDynamic.value,
     alpha: segStore.overlayAlpha,
+    // GPU mask texture cache の invalidation key。これが無いと version=0 固定になり、
+    // finalMask を in-place 編集 (assign label / polygon) しても再 upload されず、
+    // paging 等で別 version 要求が走るまで変更が画面に反映されない。
+    version: segStore.maskVersion,
   };
 };
 
@@ -5773,7 +5977,7 @@ defineExpose({
       <imagebox
         v-for="i in tileN"
         :key="i"
-        :class="['mv-imagebox-cell', { 'is-selected': i-1 === selectedImageBoxId, 'cursor-grab': leftButtonFunction==='pan' }]"
+        :class="['mv-imagebox-cell', { 'is-selected': i-1 === selectedImageBoxId, 'cursor-grab': leftButtonFunction==='pan', 'mv-cursor-cross': leftButtonFunction==='brushROI' || leftButtonFunction==='polygonROI' }]"
         ref="imb"
         :imageBoxId="i-1"
         :width="imageBoxW"
@@ -5781,7 +5985,7 @@ defineExpose({
         @wheel.prevent="wheel"
         @click="imageBoxClicked"
         @mousemove="mouseMove"
-        @mouseleave="debugShow = false"
+        @mouseleave="onBoxMouseLeave(i-1)"
         @mousedown.left="onBoxMouseDown"
         @mouseup.left="onBoxMouseUp"
         @mousedown.middle.prevent
@@ -5855,6 +6059,7 @@ defineExpose({
     <DebugInspector
       :enabled="debugMode"
       :rows="debugHoverRows"
+      :mask="debugMaskInfo"
       :world="debugWorld"
       :screen-x="debugScreenX"
       :screen-y="debugScreenY"

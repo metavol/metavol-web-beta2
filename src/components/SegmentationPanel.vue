@@ -98,9 +98,16 @@ const activeLabelIdProxy = computed({
 });
 const currentLabelName = computed(() => store.labelById(store.currentLabelId)?.name ?? '(none)');
 // currentLabelColorCss は既存 (histogram 用) を再利用する。
-const isAssignToolActive = computed(() => props.activeTool === 'assignLabel');
-const onActivateAssignTool = () => {
-    emit('set-tool', isAssignToolActive.value ? 'window' : 'assignLabel');
+// ===== 編集ツール選択 (assign / polygon / brush を同列に) =====
+// いずれのツールも上の Tumor / Physiological (currentLabelId) を共有して使う。
+type SegEditTool = 'assignLabel' | 'polygonROI' | 'brushROI';
+const activeSegTool = computed<SegEditTool | null>(() => {
+    const t = props.activeTool;
+    return (t === 'assignLabel' || t === 'polygonROI' || t === 'brushROI') ? t : null;
+});
+// v-btn-toggle は非 mandatory。同じツールを再選択で null (=解除→window) が来る。
+const onSegToolToggle = (val: SegEditTool | null | undefined) => {
+    emit('set-tool', val ?? 'window');
 };
 
 // 現在ラベルの PET 値ヒストグラム。
@@ -1200,23 +1207,46 @@ const brushRadiusProxy = computed({
                     <v-btn size="small" variant="outlined" @click="onClearThreshold">Clear</v-btn>
                 </div>
 
-                <!-- Assign label ツール起動 (#8): 動線は Apply → clicked region を割当 -->
-                <v-btn
-                    size="small"
-                    block
-                    class="mt-2"
-                    :variant="isAssignToolActive ? 'flat' : 'outlined'"
-                    :color="isAssignToolActive ? 'primary' : undefined"
-                    @click="onActivateAssignTool"
+                <!-- 編集ツール (#8): Assign / Polygon / Brush を同列に。
+                     いずれも上で選んだ Tumor / Physiological ラベルを共有して書き込む。 -->
+                <div class="mv-row-label mt-2">
+                    <span>Edit tool</span>
+                    <span class="mv-mono">
+                        <span class="mv-color-swatch mr-1" :style="{ background: currentLabelColorCss }" />{{ currentLabelName }}
+                    </span>
+                </div>
+                <v-btn-toggle
+                    :model-value="activeSegTool"
+                    @update:model-value="onSegToolToggle"
+                    density="compact"
+                    color="primary"
+                    variant="outlined"
+                    divided
+                    class="mv-tool-toggle"
                 >
-                    <v-icon icon="mdi-tag-outline" size="small" class="mr-1" />
-                    <span class="mv-color-swatch mr-1" :style="{ background: currentLabelColorCss }" />
-                    Assign clicked region → {{ currentLabelName }}
-                </v-btn>
+                    <v-btn value="assignLabel" size="small">
+                        <v-icon icon="mdi-tag-outline" size="small" class="mr-1" />Assign
+                    </v-btn>
+                    <v-btn value="polygonROI" size="small">
+                        <v-icon icon="mdi-vector-polygon" size="small" class="mr-1" />Polygon
+                    </v-btn>
+                    <v-btn value="brushROI" size="small">
+                        <v-icon icon="mdi-brush" size="small" class="mr-1" />Brush
+                    </v-btn>
+                </v-btn-toggle>
                 <div class="mv-hint mt-1">
-                    {{ isAssignToolActive
-                        ? 'Click a lesion on any Volume box to label its whole 3D island.'
-                        : 'Activates the Assign Label tool, then click a lesion to label the whole 3D island.' }}
+                    <template v-if="activeSegTool === 'assignLabel'">
+                        Click a lesion on any Volume box to label its whole 3D island as {{ currentLabelName }}.
+                    </template>
+                    <template v-else-if="activeSegTool === 'polygonROI'">
+                        Left click = vertex, right / double click = finish. Fills the drawn slice as {{ currentLabelName }} (see Polygon ROI for Add / Erase).
+                    </template>
+                    <template v-else-if="activeSegTool === 'brushROI'">
+                        Drag on a Volume slice to paint {{ currentLabelName }} (see Voxel Brush for radius and Paint / Erase).
+                    </template>
+                    <template v-else>
+                        Pick a tool, then edit on any Volume box. All tools write into the label selected above.
+                    </template>
                 </div>
             </section>
 
@@ -1916,6 +1946,19 @@ const brushRadiusProxy = computed({
     display: flex;
     gap: 6px;
     flex-wrap: wrap;
+}
+
+/* Edit tool 選択トグル: 3 ボタンを等幅で 320px パネル幅に収める */
+.mv-tool-toggle {
+    display: flex;
+    width: 100%;
+}
+.mv-tool-toggle :deep(.v-btn) {
+    flex: 1 1 0;
+    min-width: 0;
+    text-transform: none;
+    letter-spacing: 0;
+    padding-inline: 6px;
 }
 .mv-btn-row .v-btn {
     text-transform: none;

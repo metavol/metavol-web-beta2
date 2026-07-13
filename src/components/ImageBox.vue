@@ -1393,6 +1393,21 @@ const drawSphereOverlay = (cx: number, cy: number, radiusPx: number) => {
   ctx.restore();
 };
 
+// Voxel brush のカーソル円。物理的に円形なブラシ (mm) を画面へ投影するため rx/ry は
+// px 単位で別々に受け取り (anisotropic 表示に対応) 楕円で描く。mode で色を変える。
+const drawBrushCursorOverlay = (cx: number, cy: number, rx: number, ry: number, mode: 'add' | 'erase') => {
+  if (cv1.value === null || ctx === null) return;
+  if (!isFinite(rx) || !isFinite(ry) || rx <= 0 || ry <= 0) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  ctx.strokeStyle = mode === 'add' ? "#7fff7f" : "#ff7f7f";
+  ctx.lineWidth = 1.25;
+  ctx.setLineDash([4, 3]);
+  ctx.stroke();
+  ctx.restore();
+};
+
 const drawPolygonOverlay = (vertices: Array<[number, number]>, mode: 'add' | 'erase', closed: boolean) => {
   if (cv1.value === null || ctx === null) return;
   if (vertices.length === 0) return;
@@ -1449,7 +1464,7 @@ const drawRectRoiOverlay = (
 defineExpose({init, show, show2, showRgb, showDirect,
    drawNiftiSlice, drawNiftiSliceFusion, drawNiftiMip, drawNiftiVR,
    drawFusionMip, drawFusionVR, clear,
-   drawSphereOverlay, drawPolygonOverlay, drawRectRoiOverlay,
+   drawSphereOverlay, drawPolygonOverlay, drawRectRoiOverlay, drawBrushCursorOverlay,
    // canvas pixel を外部から読む用 (parity test 等)
    cv1});
 

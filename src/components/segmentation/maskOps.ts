@@ -94,10 +94,13 @@ export interface PolygonPlaneFillParams {
     sliceIndex: number;
     polygonVoxelXY: Array<[number, number]>;
     writeValue: number;
+    // 指定した場合、gate[idx] !== 0 の voxel (= 既にラベルのある前景) のみ書き換える。
+    // Polygon は「既存ラベルの修正」用途なので、背景 (ラベル無し) は polygon 内でも触らない。
+    gate?: Uint16Array;
 }
 
 export const fillPolygonOnSlice = (params: PolygonPlaneFillParams) => {
-    const { pet, target, sliceAxis, sliceIndex, polygonVoxelXY, writeValue } = params;
+    const { pet, target, sliceAxis, sliceIndex, polygonVoxelXY, writeValue, gate } = params;
     const { nx, ny, nz } = pet;
 
     let dimU: number, dimV: number;
@@ -128,6 +131,7 @@ export const fillPolygonOnSlice = (params: PolygonPlaneFillParams) => {
         for (let u = u0; u <= u1; u++) {
             if (!pointInPolygon(u + 0.5, v + 0.5, polygonVoxelXY)) continue;
             const idx = voxelIndexFromAxis(sliceAxis, sliceIndex, u, v, nx, ny);
+            if (gate && gate[idx] === 0) continue;   // 背景 (ラベル無し) は変更しない
             target[idx] = writeValue;
         }
     }
@@ -380,6 +384,64 @@ export const summarizeLesions = (
     }
     out.sort((a, b) => b.suvMax - a.suvMax);
     return out;
+};
+
+// クリック位置 (seed) から mask 上を 26-連結で局所 flood fill し、その連結領域だけを
+// labelId に書き換える。画像全体の連結成分ラベリング (connectedComponents26) を毎回
+// 走らせる必要がないため O(領域サイズ) で完了する (全 voxel 数に依存しない)。
+// 連結性は findIslands / summarizeLesions と同じ 26-連結に揃える (voxel inspector の
+// component 欄が assign の波及範囲をそのまま予測できるように)。
+//
+// - foreground = 非ゼロ voxel (ラベル値は問わない)。0 の voxel は領域境界。
+// - 現在の mask の連結性をその場で辿るので、erase で本当に分断されていれば別島へは波及しない。
+//   逆に、隣接スライス等で 3D 的に繋がっている限り (=同一連結成分) 両方が塗られる。これは
+//   「見た目 2D で分離したつもりでも 3D では 1 成分」というケースを inspector で確認できる。
+// - manualEdits が渡された場合は同じ voxel を labelId に書き込み、recomputeFinalMask で
+//   ラベルが元に戻らないようにする。
+export const floodFillAssignLabel = (
+    mask: Uint16Array,
+    manualEdits: Uint16Array | null,
+    seed: { i: number; j: number; k: number },
+    nx: number, ny: number, nz: number,
+    labelId: number,
+): number => {
+    const seedIdx = seed.k * nx * ny + seed.j * nx + seed.i;
+    if (mask[seedIdx] === 0) return 0;   // クリック位置がマスク外なら何もしない
+
+    const visited = new Set<number>();
+    const stack: number[] = [seedIdx];
+    visited.add(seedIdx);
+    const nxny = nx * ny;
+    let count = 0;
+
+    while (stack.length > 0) {
+        const cur = stack.pop()!;
+        const k = (cur / nxny) | 0;
+        const rem = cur - k * nxny;
+        const j = (rem / nx) | 0;
+        const i = rem - j * nx;
+
+        mask[cur] = labelId;
+        if (manualEdits) manualEdits[cur] = labelId;
+        count++;
+
+        for (let dk = -1; dk <= 1; dk++) {
+            const nk = k + dk; if (nk < 0 || nk >= nz) continue;
+            for (let dj = -1; dj <= 1; dj++) {
+                const nj = j + dj; if (nj < 0 || nj >= ny) continue;
+                for (let di = -1; di <= 1; di++) {
+                    if (di === 0 && dj === 0 && dk === 0) continue;
+                    const ni = i + di; if (ni < 0 || ni >= nx) continue;
+                    const b = nk * nxny + nj * nx + ni;
+                    if (mask[b] === 0) continue;        // 背景は境界
+                    if (visited.has(b)) continue;
+                    visited.add(b);
+                    stack.push(b);
+                }
+            }
+        }
+    }
+    return count;
 };
 
 // 与えられた voxel (i,j,k) が属する成分の全 voxel に対して mask 上で labelId に書き換える。
