@@ -92,10 +92,6 @@ const quickLabels = computed(() => {
     const list = picks.length >= 1 ? picks : store.labels.slice(0, 2);
     return list.map(l => ({ id: l.id, name: l.name, colorCss: `rgb(${l.color[0]},${l.color[1]},${l.color[2]})` }));
 });
-const activeLabelIdProxy = computed({
-    get: () => store.currentLabelId,
-    set: (id: number) => { store.currentLabelId = id; },
-});
 const currentLabelName = computed(() => store.labelById(store.currentLabelId)?.name ?? '(none)');
 // currentLabelColorCss は既存 (histogram 用) を再利用する。
 // ===== 編集ツール選択 (assign / polygon / brush を同列に) =====
@@ -108,6 +104,34 @@ const activeSegTool = computed<SegEditTool | null>(() => {
 // v-btn-toggle は非 mandatory。同じツールを再選択で null (=解除→window) が来る。
 const onSegToolToggle = (val: SegEditTool | null | undefined) => {
     emit('set-tool', val ?? 'window');
+};
+
+// ===== Advanced (詳細機能) の開閉。Persona 1 の主要フローを既定で簡潔に保つため、
+// 使用頻度の低い機能 (threshold method / reference sphere / Sphere ROI / Labels 編集 /
+// Histogram+radiomics / Islands / Rectangle ROI) は Advanced に畳んでおく。localStorage で記憶。 =====
+const ADV_KEY = 'mv-seg-advanced-open';
+const showAdvanced = ref<boolean>(false);
+try { showAdvanced.value = localStorage.getItem(ADV_KEY) === '1'; } catch { /* ignore */ }
+const toggleAdvanced = () => {
+    showAdvanced.value = !showAdvanced.value;
+    try { localStorage.setItem(ADV_KEY, showAdvanced.value ? '1' : '0'); } catch { /* ignore */ }
+};
+
+// ===== 編集履歴 (undo / redo / jump) =====
+const historyTimeline = computed(() => store.historyTimeline);
+// 現在地 = 適用済みの最後 (timeline index = history.length - 1)。-1 なら初期状態。
+const currentStep = computed(() => store.history.length - 1);
+const onUndo = () => { if (store.undo()) emit('redraw'); };
+const onRedo = () => { if (store.redo()) emit('redraw'); };
+// timeline の index t をクリック → 「item 0..t を適用した状態」= 適用長 t+1 へジャンプ。
+const onJumpHistory = (t: number) => { store.gotoHistory(t + 1); emit('redraw'); };
+const relTime = (ts: number): string => {
+    const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+    if (s < 5) return 'now';
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m`;
+    return `${Math.floor(m / 60)}h`;
 };
 
 // 現在ラベルの PET 値ヒストグラム。
@@ -240,6 +264,17 @@ const onClearThreshold = () => {
     store.clearThresholdMask();
     emit('redraw');
 };
+
+// Apply split-button: caret メニューで対象ラベル (Tumor/Physio) を選んで即適用。
+const onApplyAs = (id: number) => {
+    store.currentLabelId = id;
+    onApplyThreshold();
+};
+// Edit tool (assign/polygon/brush) 共通のラベルピッカー用。全ラベルから選べる。
+const labelPickItems = computed(() => store.labels.map(l => ({
+    id: l.id, name: l.name, colorCss: `rgb(${l.color[0]},${l.color[1]},${l.color[2]})`,
+})));
+const onPickLabel = (id: number) => { store.currentLabelId = id; };
 
 const onClearManual = () => {
     store.clearManualEdits();
@@ -917,7 +952,7 @@ const brushRadiusProxy = computed({
         <!-- Rectangle ROI: PET volume 非依存 (2D DICOM slice box でも使える)。
              Persona 1 の初期表示では不要なので、ROI が 1 つ以上あるときだけ表示する。
              新規作成はツールバーの Rectangle ROI ツールから行う。 -->
-        <section v-if="store.rectRois.length" class="mv-section">
+        <section v-if="store.rectRois.length && showAdvanced" class="mv-section">
             <div class="mv-section-title">
                 <v-icon icon="mdi-rectangle-outline" size="x-small" />
                 Rectangle ROI
@@ -1081,25 +1116,31 @@ const brushRadiusProxy = computed({
 
             <!-- MR-PET Registration と CT bed removal は app-bar の ☰ Preprocessing メニューに移動 (2026-05) -->
 
-            <!-- Threshold -->
-            <section class="mv-section">
-                <div class="mv-section-title">
-                    <v-icon icon="mdi-tune-variant" size="x-small" />
-                    Threshold ({{ store.thresholdUnit }})
-                </div>
-
-                <!-- Threshold method selector (PERCIST/Deauville サポート) -->
-                <v-select
-                    :model-value="store.thresholdMethod"
-                    @update:model-value="(v: any) => store.thresholdMethod = v"
-                    :items="thresholdMethodItems"
-                    density="compact"
-                    hide-details
-                    variant="outlined"
-                    label="Method"
+            <!-- Overlay: step ①〜④ すべてに関わるので最上部に 1 行で。mask 表示切替 + 不透明度。 -->
+            <div class="mv-overlay-bar">
+                <v-btn
+                    :icon="store.overlayEnabled ? 'mdi-eye' : 'mdi-eye-off'"
+                    size="x-small" variant="text" density="compact"
+                    :color="store.overlayEnabled ? 'primary' : undefined"
+                    @click="onToggleOverlay(!store.overlayEnabled)"
+                    :title="store.overlayEnabled ? 'Hide mask' : 'Show mask'"
                 />
+                <span class="mv-overlay-label">Mask</span>
+                <v-slider
+                    :model-value="store.overlayAlpha"
+                    :min="0.05" :max="1" :step="0.05"
+                    density="compact" hide-details color="primary" track-color="surface-light"
+                    class="mv-overlay-slider"
+                    :disabled="!store.overlayEnabled"
+                    @update:model-value="onAlphaChange($event as number)"
+                />
+                <span class="mv-mono mv-overlay-pct">{{ (store.overlayAlpha * 100).toFixed(0) }}%</span>
+            </div>
 
-                <!-- Method 別の追加 input -->
+            <!-- ① Segment: 閾値でまるごと seg -->
+            <div class="mv-step-head"><span class="mv-step-num">1</span>Segment</div>
+            <section class="mv-section">
+                <!-- method=fixed の SUV preset (Persona 1 の主用途)。method 選択は Advanced。 -->
                 <v-select
                     v-if="store.thresholdMethod === 'fixed'"
                     :model-value="thresholdSelection"
@@ -1108,7 +1149,7 @@ const brushRadiusProxy = computed({
                     density="compact"
                     hide-details
                     variant="outlined"
-                    class="mt-1"
+                    label="Threshold (SUV)"
                 />
                 <v-text-field
                     v-if="store.thresholdMethod === 'fixed' && thresholdSelection === 'manual'"
@@ -1121,19 +1162,35 @@ const brushRadiusProxy = computed({
                     label="SUV value"
                     class="mt-1"
                 />
-                <v-text-field
-                    v-if="store.thresholdMethod === 'pctMax' || store.thresholdMethod === 'liverPct'"
-                    :model-value="(store.thresholdPct * 100).toFixed(0)"
-                    @update:model-value="(v: string) => store.thresholdPct = Math.max(0.01, Math.min(2, Number(v) / 100))"
-                    type="number"
-                    step="1"
-                    density="compact"
-                    hide-details
-                    variant="outlined"
-                    :label="store.thresholdMethod === 'pctMax' ? '% of SUVmax' : '% of liver SUVmean'"
-                    suffix="%"
-                    class="mt-1"
-                />
+                <div v-if="store.thresholdMethod !== 'fixed'" class="mv-hint">
+                    Method: {{ store.thresholdMethod }} — configure in Advanced
+                </div>
+
+                <!-- Threshold method selector + method 別 input + reference sphere は Advanced -->
+                <template v-if="showAdvanced">
+                    <v-select
+                        :model-value="store.thresholdMethod"
+                        @update:model-value="(v: any) => store.thresholdMethod = v"
+                        :items="thresholdMethodItems"
+                        density="compact"
+                        hide-details
+                        variant="outlined"
+                        label="Method"
+                        class="mt-1"
+                    />
+                    <v-text-field
+                        v-if="store.thresholdMethod === 'pctMax' || store.thresholdMethod === 'liverPct'"
+                        :model-value="(store.thresholdPct * 100).toFixed(0)"
+                        @update:model-value="(v: string) => store.thresholdPct = Math.max(0.01, Math.min(2, Number(v) / 100))"
+                        type="number"
+                        step="1"
+                        density="compact"
+                        hide-details
+                        variant="outlined"
+                        :label="store.thresholdMethod === 'pctMax' ? '% of SUVmax' : '% of liver SUVmean'"
+                        suffix="%"
+                        class="mt-1"
+                    />
 
                 <!-- Reference sphere placement (liver / bloodPool) — PERCIST / Deauville 用 -->
                 <div v-if="needsLiverReference || showRefSpheres" class="mv-ref-spheres mt-2">
@@ -1181,40 +1238,78 @@ const brushRadiusProxy = computed({
                         Use the Sphere ROI tool and click on the {{ store.referencePlacementMode === 'liver' ? 'right liver lobe' : 'descending aorta' }} (any Volume box).
                     </div>
                 </div>
+                </template>
+
                 <div v-if="resolvedThresholdHint" class="mv-hint mt-1">
                     → {{ resolvedThresholdHint }}
                 </div>
 
-                <!-- Apply / Assign 対象ラベルのクイック選択 (#5): Tumor / Physiological -->
-                <div class="mv-row-label mt-2"><span>Apply / assign as</span></div>
-                <v-btn-toggle
-                    v-model="activeLabelIdProxy"
-                    density="compact"
-                    mandatory
-                    color="primary"
-                    variant="outlined"
-                    divided
-                >
-                    <v-btn v-for="q in quickLabels" :key="q.id" :value="q.id" size="small">
-                        <span class="mv-color-swatch mr-1" :style="{ background: q.colorCss }" />{{ q.name }}
-                    </v-btn>
-                </v-btn-toggle>
-
-                <div class="mv-btn-row mt-2">
-                    <v-btn size="small" color="primary" variant="flat" :disabled="!canApplyThreshold" @click="onApplyThreshold">
-                        <v-icon icon="mdi-play" size="small" class="mr-1" />Apply
-                    </v-btn>
+                <!-- Apply split button: メインは現在ラベルで適用、caret で Tumor/Physio を選んで即適用。 -->
+                <div class="mv-apply-row mt-2">
+                    <div class="mv-apply-split">
+                        <v-btn
+                            class="mv-apply-main"
+                            color="primary" variant="flat" size="small"
+                            :disabled="!canApplyThreshold"
+                            @click="onApplyThreshold"
+                        >
+                            <v-icon icon="mdi-play" size="small" class="mr-1" />Apply
+                            <span class="mv-color-swatch mx-1" :style="{ background: currentLabelColorCss }" />
+                            <span class="mv-apply-label">{{ currentLabelName }}</span>
+                        </v-btn>
+                        <v-menu location="bottom end">
+                            <template #activator="{ props }">
+                                <v-btn
+                                    class="mv-apply-caret"
+                                    color="primary" variant="flat" size="small"
+                                    :disabled="!canApplyThreshold"
+                                    v-bind="props"
+                                >
+                                    <v-icon icon="mdi-menu-down" size="small" />
+                                </v-btn>
+                            </template>
+                            <v-list density="compact">
+                                <v-list-item v-for="q in quickLabels" :key="q.id" @click="onApplyAs(q.id)">
+                                    <template #prepend>
+                                        <span class="mv-color-swatch mr-2" :style="{ background: q.colorCss }" />
+                                    </template>
+                                    <v-list-item-title>Apply as {{ q.name }}</v-list-item-title>
+                                </v-list-item>
+                            </v-list>
+                        </v-menu>
+                    </div>
                     <v-btn size="small" variant="outlined" @click="onClearThreshold">Clear</v-btn>
                 </div>
+            </section>
 
-                <!-- 編集ツール (#8): Assign / Polygon / Brush を同列に。
-                     いずれも上で選んだ Tumor / Physiological ラベルを共有して書き込む。 -->
-                <div class="mv-row-label mt-2">
-                    <span>Edit tool</span>
-                    <span class="mv-mono">
-                        <span class="mv-color-swatch mr-1" :style="{ background: currentLabelColorCss }" />{{ currentLabelName }}
-                    </span>
-                </div>
+            <!-- ② Refine: assign / polygon / brush でラベル修正 -->
+            <div class="mv-step-head"><span class="mv-step-num">2</span>Refine</div>
+            <section class="mv-section">
+                <!-- 共通ラベルピッカー: assign / polygon / brush すべてがこのラベルへ書き込む。
+                     Tumor だけでなく Lymph node 等あらゆるラベルから選べる。 -->
+                <v-menu location="bottom">
+                    <template #activator="{ props }">
+                        <v-btn class="mv-label-picker" variant="outlined" size="small" block v-bind="props">
+                            <span class="mv-color-swatch mr-2" :style="{ background: currentLabelColorCss }" />
+                            <span class="mv-label-picker-name">{{ currentLabelName }}</span>
+                            <v-icon icon="mdi-menu-down" size="small" class="ml-auto" />
+                        </v-btn>
+                    </template>
+                    <v-list density="compact">
+                        <v-list-item
+                            v-for="l in labelPickItems"
+                            :key="l.id"
+                            :active="l.id === store.currentLabelId"
+                            @click="onPickLabel(l.id)"
+                        >
+                            <template #prepend>
+                                <span class="mv-color-swatch mr-2" :style="{ background: l.colorCss }" />
+                            </template>
+                            <v-list-item-title>{{ l.name }}</v-list-item-title>
+                        </v-list-item>
+                    </v-list>
+                </v-menu>
+                <!-- 編集ツール: Assign / Polygon / Brush を同列に。上のラベルへ書き込む。 -->
                 <v-btn-toggle
                     :model-value="activeSegTool"
                     @update:model-value="onSegToolToggle"
@@ -1222,7 +1317,7 @@ const brushRadiusProxy = computed({
                     color="primary"
                     variant="outlined"
                     divided
-                    class="mv-tool-toggle"
+                    class="mv-tool-toggle mt-2"
                 >
                     <v-btn value="assignLabel" size="small">
                         <v-icon icon="mdi-tag-outline" size="small" class="mr-1" />Assign
@@ -1250,37 +1345,46 @@ const brushRadiusProxy = computed({
                 </div>
             </section>
 
-            <!-- Overlay -->
-            <section class="mv-section">
+            <!-- History (undo / redo / jump) — Advanced。undo/redo は app-bar と Ctrl+Z/Ctrl+Shift+Z にも。 -->
+            <section v-if="showAdvanced" class="mv-section">
                 <div class="mv-section-title">
-                    <v-icon icon="mdi-layers-outline" size="x-small" />
-                    Overlay
+                    <v-icon icon="mdi-history" size="x-small" />
+                    History
+                    <div class="mv-history-actions">
+                        <v-btn size="x-small" variant="text" icon :disabled="!store.canUndo" @click="onUndo" title="Undo (Ctrl+Z)">
+                            <v-icon icon="mdi-undo" size="small" />
+                        </v-btn>
+                        <v-btn size="x-small" variant="text" icon :disabled="!store.canRedo" @click="onRedo" title="Redo (Ctrl+Shift+Z)">
+                            <v-icon icon="mdi-redo" size="small" />
+                        </v-btn>
+                    </div>
                 </div>
-                <v-switch
-                    :model-value="store.overlayEnabled"
-                    @update:model-value="onToggleOverlay($event as boolean)"
-                    label="Show mask"
-                    density="compact"
-                    hide-details
-                    color="primary"
-                />
-                <div class="mv-row-label mt-1">
-                    <span>Opacity</span>
-                    <span class="mv-mono">{{ (store.overlayAlpha * 100).toFixed(0) }}%</span>
+                <div v-if="historyTimeline.length === 0" class="mv-hint">
+                    No edits yet. Apply threshold, paint, or assign to build history.
                 </div>
-                <v-slider
-                    :model-value="store.overlayAlpha"
-                    :min="0.05" :max="1" :step="0.05"
-                    density="compact"
-                    hide-details
-                    color="primary"
-                    track-color="surface-light"
-                    @update:model-value="onAlphaChange($event as number)"
-                />
+                <div v-else class="mv-history-list">
+                    <div
+                        v-for="(h, t) in historyTimeline"
+                        :key="t"
+                        :class="['mv-history-item', { applied: h.applied, current: t === currentStep }]"
+                        @click="onJumpHistory(t)"
+                        :title="h.applied ? 'Click to undo back to here' : 'Click to redo up to here'"
+                    >
+                        <v-icon
+                            :icon="t === currentStep ? 'mdi-arrow-right-bold' : (h.applied ? 'mdi-circle-small' : 'mdi-circle-outline')"
+                            size="x-small"
+                            class="mv-history-marker"
+                        />
+                        <span class="mv-history-label">{{ h.label }}</span>
+                        <span class="mv-history-time mv-mono">{{ relTime(h.ts) }}</span>
+                    </div>
+                </div>
             </section>
 
-            <!-- Sphere ROI -->
-            <section class="mv-section">
+            <!-- Overlay は最上部の 1 行バーへ移動済み (step 共通のため) -->
+
+            <!-- Sphere ROI (Advanced) -->
+            <section v-if="showAdvanced" class="mv-section">
                 <div class="mv-section-title">
                     <v-icon icon="mdi-circle-outline" size="x-small" />
                     Sphere ROI
@@ -1316,8 +1420,8 @@ const brushRadiusProxy = computed({
                 </div>
             </section>
 
-            <!-- Polygon ROI -->
-            <section class="mv-section">
+            <!-- Polygon ROI params: polygon ツール選択時のみ (または Advanced) 表示 -->
+            <section v-if="activeSegTool === 'polygonROI' || showAdvanced" class="mv-section">
                 <div class="mv-section-title">
                     <v-icon icon="mdi-vector-polygon" size="x-small" />
                     Polygon ROI
@@ -1344,8 +1448,8 @@ const brushRadiusProxy = computed({
                 </div>
             </section>
 
-            <!-- Voxel Brush -->
-            <section class="mv-section">
+            <!-- Voxel Brush params: brush ツール選択時のみ (または Advanced) 表示 -->
+            <section v-if="activeSegTool === 'brushROI' || showAdvanced" class="mv-section">
                 <div class="mv-section-title">
                     <v-icon icon="mdi-brush" size="x-small" />
                     Voxel Brush
@@ -1383,8 +1487,8 @@ const brushRadiusProxy = computed({
                 </div>
             </section>
 
-            <!-- Labels -->
-            <section class="mv-section">
+            <!-- Labels (Advanced): 既定 6 ラベルで足りるので通常は畳む。 -->
+            <section v-if="showAdvanced" class="mv-section">
                 <div class="mv-section-title">
                     <v-icon icon="mdi-tag-multiple-outline" size="x-small" />
                     Labels
@@ -1425,8 +1529,8 @@ const brushRadiusProxy = computed({
                 </div>
             </section>
 
-            <!-- Histogram (per label) -->
-            <section class="mv-section">
+            <!-- Histogram (per label) — Advanced -->
+            <section v-if="showAdvanced" class="mv-section">
                 <div class="mv-section-title mv-section-title-row">
                     <span>
                         <v-icon icon="mdi-chart-bar" size="x-small" />
@@ -1508,8 +1612,8 @@ const brushRadiusProxy = computed({
                 </div>
             </section>
 
-            <!-- Islands -->
-            <section class="mv-section">
+            <!-- Islands (Advanced): assign が自動 flood するため通常不要 -->
+            <section v-if="showAdvanced" class="mv-section">
                 <div class="mv-section-title">
                     <v-icon icon="mdi-island" size="x-small" />
                     Islands
@@ -1535,6 +1639,8 @@ const brushRadiusProxy = computed({
                 </v-btn>
             </section>
 
+            <!-- ③ Measure: MTV / TLG を読む -->
+            <div v-if="store.finalMask" class="mv-step-head"><span class="mv-step-num">3</span>Measure</div>
             <!-- Lesion table -->
             <section v-if="store.finalMask" class="mv-section">
                 <div class="mv-section-title mv-section-title-row">
@@ -1641,6 +1747,8 @@ const brushRadiusProxy = computed({
                 </template>
             </section>
 
+            <!-- ④ Save -->
+            <div class="mv-step-head"><span class="mv-step-num">4</span>Save</div>
             <!-- Save / Load / Clean -->
             <section class="mv-section">
                 <div class="mv-btn-row">
@@ -1697,6 +1805,14 @@ const brushRadiusProxy = computed({
                     @change="onLoadSnapshotFile"
                 />
             </section>
+
+            <!-- Advanced 開閉: 使用頻度の低い機能 (threshold method / reference sphere /
+                 Sphere ROI / Labels 編集 / Histogram + radiomics / Islands / Rectangle ROI) を出し入れ。 -->
+            <button type="button" class="mv-advanced-toggle" @click="toggleAdvanced">
+                <v-icon :icon="showAdvanced ? 'mdi-chevron-down' : 'mdi-chevron-right'" size="small" />
+                Advanced tools
+                <span class="mv-advanced-hint">{{ showAdvanced ? 'hide' : 'method · reference SUV · sphere · labels · histogram · radiomics · islands' }}</span>
+            </button>
         </template>
     </div>
 </template>
@@ -1946,6 +2062,193 @@ const brushRadiusProxy = computed({
     display: flex;
     gap: 6px;
     flex-wrap: wrap;
+}
+
+/* 最上部の Overlay 1 行バー (mask 表示切替 + 不透明度) */
+.mv-overlay-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px;
+    margin-bottom: 2px;
+    border: 1px solid var(--mv-border);
+    border-radius: 4px;
+    background: var(--mv-surface-2);
+}
+.mv-overlay-label {
+    font-size: 11px;
+    color: var(--mv-text-muted);
+    flex-shrink: 0;
+}
+.mv-overlay-slider {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.mv-overlay-pct {
+    font-size: 10px;
+    color: var(--mv-text-muted);
+    width: 30px;
+    text-align: right;
+    flex-shrink: 0;
+}
+
+/* Apply split-button (メイン + caret) + Clear */
+.mv-apply-row {
+    display: flex;
+    gap: 6px;
+    align-items: stretch;
+}
+.mv-apply-split {
+    display: flex;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.mv-apply-main {
+    flex: 1 1 auto;
+    min-width: 0;
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+    text-transform: none;
+    letter-spacing: 0;
+}
+.mv-apply-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.mv-apply-caret {
+    min-width: 28px !important;
+    padding: 0 !important;
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    border-left: 1px solid rgba(255, 255, 255, 0.25);
+}
+
+/* 共通ラベルピッカー (assign/polygon/brush) */
+.mv-label-picker {
+    justify-content: flex-start;
+    text-transform: none;
+    letter-spacing: 0;
+}
+.mv-label-picker-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ステップ見出し (① Segment … ④ Save) */
+.mv-step-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 10px 0 2px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--mv-accent);
+}
+.mv-step-head:first-child {
+    margin-top: 2px;
+}
+.mv-step-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--mv-accent);
+    color: #0F1419;
+    font-size: 10px;
+    font-weight: 800;
+}
+
+/* Advanced 開閉トグル (フッター) */
+.mv-advanced-toggle {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    margin-top: 10px;
+    padding: 6px 8px;
+    background: transparent;
+    border: 1px dashed var(--mv-border);
+    border-radius: 4px;
+    color: var(--mv-text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+}
+.mv-advanced-toggle:hover {
+    border-color: var(--mv-accent-dim);
+    color: var(--mv-text);
+}
+.mv-advanced-hint {
+    margin-left: auto;
+    font-size: 9px;
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--mv-text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 60%;
+}
+
+/* History パネル */
+.mv-history-actions {
+    margin-left: auto;
+    display: flex;
+    gap: 2px;
+}
+.mv-history-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    max-height: 200px;
+    overflow-y: auto;
+    margin-top: 2px;
+}
+.mv-history-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 4px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--mv-text-muted);      /* 未適用 (redo 待ち) は薄く */
+    border: 1px solid transparent;
+}
+.mv-history-item.applied {
+    color: var(--mv-text);
+}
+.mv-history-item:hover {
+    background: var(--mv-surface-2);
+}
+.mv-history-item.current {
+    background: rgba(0, 212, 170, 0.10);
+    border-color: var(--mv-accent-dim);
+    color: var(--mv-accent);
+}
+.mv-history-marker {
+    flex-shrink: 0;
+    opacity: 0.8;
+}
+.mv-history-label {
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.mv-history-time {
+    flex-shrink: 0;
+    font-size: 10px;
+    color: var(--mv-text-muted);
 }
 
 /* Edit tool 選択トグル: 3 ボタンを等幅で 320px パネル幅に収める */

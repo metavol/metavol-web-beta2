@@ -29,21 +29,29 @@ export interface PolygonROIState {
     imageBoxId: number;
 }
 
-export interface UndoEntry {
-    sliceAxis: 0 | 1 | 2;
-    sliceIndex: number;
-    before: Uint16Array;
+// ===== 編集履歴 (undo / redo) =====
+// マスク編集 (Apply / Clear / polygon / brush / assign) は thresholdMask と manualEdits の
+// **sparse diff** (変更された voxel だけ) で記録する。finalMask は recomputeFinalMask で
+// threshold+manual から導出できるので diff には含めない。矩形 ROI 操作も同じ履歴に載せて
+// 1 本のタイムラインで undo/redo できるようにする。
+export interface MaskDiff {
+    idx: Uint32Array;      // 変更された voxel の flat index
+    tBefore: Uint16Array;  // thresholdMask の before 値 (idx と並行)
+    tAfter: Uint16Array;   // thresholdMask の after 値
+    mBefore: Uint16Array;  // manualEdits の before 値
+    mAfter: Uint16Array;   // manualEdits の after 値
+}
+export type HistoryOp =
+    | { kind: 'mask'; diff: MaskDiff }
+    | { kind: 'rectAdd'; roi: RectROI }
+    | { kind: 'rectRemove'; roi: RectROI };
+export interface HistoryEntry {
+    label: string;   // 履歴パネル表示用ラベル (UI ポリシーに従い英語)
+    ts: number;      // epoch ms
+    op: HistoryOp;
 }
 
-// 統合 undo: ROI 操作とマスク編集を 1 本のスタックで時系列管理する。
-// Ctrl+Z / Undo ボタンはこのスタックを pop して直前操作を巻き戻す。
-//   - maskSlice : polygon add/erase。manualEdits の 1 スライス分の before 状態
-//   - rectAdd   : 矩形 ROI 追加。undo で当該 ROI を削除する
-//   - rectRemove: 矩形 ROI 削除。undo で当該 ROI を復元する
-export type UndoAction =
-    | { kind: 'maskSlice'; sliceAxis: 0 | 1 | 2; sliceIndex: number; before: Uint16Array }
-    | { kind: 'rectAdd'; roiId: number }
-    | { kind: 'rectRemove'; roi: RectROI };
+const HISTORY_LIMIT = 50;
 
 // 矩形 ROI。ドラッグした対角線の 2 隅を voxel 座標で保持する。
 // topLeft / bottomRight は当該 series の voxel index 空間 (= ワールド座標ではない)。
@@ -108,9 +116,12 @@ interface State {
     rectRois: RectROI[];
     nextRectRoiId: number;
 
-    undoStack: UndoEntry[];
-    // 統合 undo スタック (ROI 操作 + マスク編集を時系列で 1 本に)
-    undoLog: UndoAction[];
+    // 編集履歴 (undo/redo)。ROI 操作 + マスク編集を時系列で 1 本に。
+    history: HistoryEntry[];   // 適用済み (古い→新しい)。undo で末尾を巻き戻す。
+    redoStack: HistoryEntry[]; // undo で取り消した操作 (redo で戻せる)。
+    // マスク編集の diff 計算用スナップショット (transient、永続化しない)。
+    editSnapT: Uint16Array | null;
+    editSnapM: Uint16Array | null;
 
     overlayAlpha: number;
     overlayEnabled: boolean;
@@ -200,8 +211,10 @@ export const useSegmentationStore = defineStore('segmentation', {
         rectRois: [],
         nextRectRoiId: 1,
 
-        undoStack: [],
-        undoLog: [],
+        history: [],
+        redoStack: [],
+        editSnapT: null,
+        editSnapM: null,
 
         overlayAlpha: 0.4,
         overlayEnabled: true,
@@ -247,9 +260,24 @@ export const useSegmentationStore = defineStore('segmentation', {
         hasPet(state): boolean {
             return state.petVolumeRef != null;
         },
-        // 統合 undo スタックに巻き戻せる操作があるか (Undo ボタン / Ctrl+Z の活性判定)
+        // Undo / Redo ボタン・Ctrl+Z / Ctrl+Shift+Z の活性判定
         canUndo(state): boolean {
-            return state.undoLog.length > 0;
+            return state.history.length > 0;
+        },
+        canRedo(state): boolean {
+            return state.redoStack.length > 0;
+        },
+        // 履歴パネル表示用タイムライン。適用済み (古い→新しい) の後に、redo 可能な操作を
+        // 「次に redo される順」で並べる。applied=false が redo 待ち。
+        historyTimeline(state): Array<{ label: string; ts: number; applied: boolean; step: number }> {
+            const out: Array<{ label: string; ts: number; applied: boolean; step: number }> = [];
+            state.history.forEach((e, i) => out.push({ label: e.label, ts: e.ts, applied: true, step: i }));
+            // redoStack は「最後に undo したもの」が末尾。次に redo されるのは末尾なので逆順に並べる。
+            for (let i = state.redoStack.length - 1; i >= 0; i--) {
+                const e = state.redoStack[i];
+                out.push({ label: e.label, ts: e.ts, applied: false, step: state.redoStack.length - 1 - i });
+            }
+            return out;
         },
         labelById: (state) => (id: number): LabelEntry | undefined => {
             return state.labels.find(l => l.id === id);
@@ -315,7 +343,7 @@ export const useSegmentationStore = defineStore('segmentation', {
                 this.thresholdMask = null;
                 this.manualEdits = null;
                 this.finalMask = null;
-                this.clearMaskUndo();
+                this.clearHistory();
                 this.sphere = null;
                 this.polygon = null;
                 this.invalidateComponentMap();
@@ -361,6 +389,7 @@ export const useSegmentationStore = defineStore('segmentation', {
         applyThreshold(threshold: number) {
             this.threshold = threshold;
             if (!this.ensureMaskAllocated()) return;
+            this.beginMaskEdit();
             const v = this.petVolumeRef!;
             const t = this.thresholdMask!;
             const pet = v.voxel;
@@ -370,6 +399,8 @@ export const useSegmentationStore = defineStore('segmentation', {
             }
             this.recomputeFinalMask();
             this.invalidateComponentMap();
+            const lname = this.labelById(id)?.name ?? `#${id}`;
+            this.commitMaskEdit(`Apply threshold SUV ${threshold} → ${lname}`);
         },
 
         // PERCIST/Deauville 派生の threshold method を解決して effective threshold (SUV) を返す。
@@ -416,14 +447,17 @@ export const useSegmentationStore = defineStore('segmentation', {
         },
 
         clearThresholdMask() {
-            if (this.thresholdMask) this.thresholdMask.fill(0);
+            if (!this.thresholdMask) return;
+            this.beginMaskEdit();
+            this.thresholdMask.fill(0);
             this.recomputeFinalMask();
             this.invalidateComponentMap();
+            this.commitMaskEdit('Clear threshold');
         },
 
         clearManualEdits() {
             if (this.manualEdits) this.manualEdits.fill(0);
-            this.clearMaskUndo();
+            this.clearHistory();
             this.recomputeFinalMask();
             this.invalidateComponentMap();
         },
@@ -433,40 +467,130 @@ export const useSegmentationStore = defineStore('segmentation', {
             this.invalidateComponentMap();
         },
 
-        // ===== 統合 Undo =====
-        // マスクが置き換わったとき: マスク編集の undo は無効化するが、矩形 ROI の
-        // undo 履歴 (rectAdd / rectRemove) は独立なので残す。
-        clearMaskUndo() {
-            this.undoStack = [];
-            this.undoLog = this.undoLog.filter(a => a.kind !== 'maskSlice');
+        // ===== 編集履歴 (undo / redo) =====
+        // マスクが置き換わった等で履歴が無効になったとき全消去する。
+        clearHistory() {
+            this.history = [];
+            this.redoStack = [];
+            this.editSnapT = null;
+            this.editSnapM = null;
         },
 
-        // polygon add/erase 確定前に呼ぶ。manualEdits の 1 スライス分 before を記録。
-        pushMaskSliceUndo(sliceAxis: 0 | 1 | 2, sliceIndex: number, before: Uint16Array) {
-            const entry: UndoEntry = { sliceAxis, sliceIndex, before };
-            this.undoStack.push(entry);
-            if (this.undoStack.length > 50) this.undoStack.shift();
-            this.undoLog.push({ kind: 'maskSlice', sliceAxis, sliceIndex, before });
-            if (this.undoLog.length > 100) this.undoLog.shift();
+        // マスク編集を始める直前に呼ぶ。現在の threshold/manual を snapshot して diff の基準にする。
+        // begin → (編集) → commitMaskEdit(label) の対で 1 履歴エントリを作る。
+        beginMaskEdit() {
+            this.editSnapT = this.thresholdMask ? this.thresholdMask.slice() : null;
+            this.editSnapM = this.manualEdits ? this.manualEdits.slice() : null;
         },
 
-        // 直前操作を 1 つ巻き戻す。戻り値はどの種別を undo したか (null = 履歴なし)。
-        // maskSlice の実際のスライス復元は呼び出し側 (DicomView) が担当する
-        // (PET grid 上の voxel index 計算を持っているため)。ここでは履歴管理のみ。
-        undo(): UndoAction | null {
-            const action = this.undoLog.pop();
-            if (!action) return null;
-            if (action.kind === 'rectAdd') {
-                // 追加を取り消す = その ROI を消す
-                this.rectRois = this.rectRois.filter(r => r.id !== action.roiId);
-            } else if (action.kind === 'rectRemove') {
-                // 削除を取り消す = その ROI を復元 (id 含めそのまま戻す)
-                this.rectRois.push(action.roi);
-            } else if (action.kind === 'maskSlice') {
-                // undoStack 側の対応エントリも 1 つ取り除いて整合させる
-                this.undoStack.pop();
+        // beginMaskEdit 後の編集を履歴に確定する。変更が無ければ何もしない (false)。
+        commitMaskEdit(label: string): boolean {
+            const t = this.thresholdMask;
+            const m = this.manualEdits;
+            const tb = this.editSnapT;
+            const mb = this.editSnapM;
+            this.editSnapT = null;
+            this.editSnapM = null;
+            if (!t || !m) return false;
+
+            // 変更のあった voxel index を収集 (threshold か manual のどちらかが変わった所)。
+            const changed: number[] = [];
+            const n = t.length;
+            for (let i = 0; i < n; i++) {
+                const tPrev = tb ? tb[i] : 0;
+                const mPrev = mb ? mb[i] : 0;
+                if (t[i] !== tPrev || m[i] !== mPrev) changed.push(i);
             }
-            return action;
+            if (changed.length === 0) return false;
+
+            const cnt = changed.length;
+            const idx = Uint32Array.from(changed);
+            const tBefore = new Uint16Array(cnt), tAfter = new Uint16Array(cnt);
+            const mBefore = new Uint16Array(cnt), mAfter = new Uint16Array(cnt);
+            for (let e = 0; e < cnt; e++) {
+                const i = idx[e];
+                tBefore[e] = tb ? tb[i] : 0; tAfter[e] = t[i];
+                mBefore[e] = mb ? mb[i] : 0; mAfter[e] = m[i];
+            }
+            this.pushHistory({ label, ts: Date.now(), op: { kind: 'mask', diff: { idx, tBefore, tAfter, mBefore, mAfter } } });
+            return true;
+        },
+
+        // 履歴へ 1 件積む。新規操作なので redo スタックは無効化する。
+        pushHistory(entry: HistoryEntry) {
+            this.history.push(entry);
+            if (this.history.length > HISTORY_LIMIT) this.history.shift();
+            this.redoStack = [];
+        },
+
+        // MaskDiff を dir 方向へ適用 (undo=before / redo=after)。finalMask は recompute で導出。
+        applyMaskDiff(diff: MaskDiff, dir: 'undo' | 'redo') {
+            const t = this.thresholdMask;
+            const m = this.manualEdits;
+            if (!t || !m) return;
+            const tv = dir === 'undo' ? diff.tBefore : diff.tAfter;
+            const mv = dir === 'undo' ? diff.mBefore : diff.mAfter;
+            for (let e = 0; e < diff.idx.length; e++) {
+                const i = diff.idx[e];
+                t[i] = tv[e];
+                m[i] = mv[e];
+            }
+            this.recomputeFinalMask();
+            this.invalidateComponentMap();
+        },
+
+        // 履歴エントリを「取り消す」(undo) / 「やり直す」(redo) 方向へ適用する内部ヘルパ。
+        applyHistoryEntry(entry: HistoryEntry, dir: 'undo' | 'redo') {
+            const op = entry.op;
+            if (op.kind === 'mask') {
+                this.applyMaskDiff(op.diff, dir);
+            } else if (op.kind === 'rectAdd') {
+                // 追加 op: undo=消す / redo=戻す
+                if (dir === 'undo') {
+                    this.rectRois = this.rectRois.filter(r => r.id !== op.roi.id);
+                } else if (!this.rectRois.some(r => r.id === op.roi.id)) {
+                    this.rectRois.push(op.roi);
+                }
+            } else if (op.kind === 'rectRemove') {
+                // 削除 op: undo=戻す / redo=消す
+                if (dir === 'undo') {
+                    if (!this.rectRois.some(r => r.id === op.roi.id)) this.rectRois.push(op.roi);
+                } else {
+                    this.rectRois = this.rectRois.filter(r => r.id !== op.roi.id);
+                }
+            }
+        },
+
+        // 直前操作を 1 つ巻き戻す。成功で true。
+        undo(): boolean {
+            const entry = this.history.pop();
+            if (!entry) return false;
+            this.applyHistoryEntry(entry, 'undo');
+            this.redoStack.push(entry);
+            if (this.redoStack.length > HISTORY_LIMIT) this.redoStack.shift();
+            return true;
+        },
+
+        // 取り消した操作を 1 つやり直す。成功で true。
+        redo(): boolean {
+            const entry = this.redoStack.pop();
+            if (!entry) return false;
+            this.applyHistoryEntry(entry, 'redo');
+            this.history.push(entry);
+            if (this.history.length > HISTORY_LIMIT) this.history.shift();
+            return true;
+        },
+
+        // 履歴パネルから任意地点へジャンプ: 適用済みを targetAppliedLen 件にする。
+        // (現在 > target なら undo、現在 < target なら redo を繰り返す)
+        gotoHistory(targetAppliedLen: number) {
+            let guard = 0;
+            while (this.history.length > targetAppliedLen && guard++ < 1000) {
+                if (!this.undo()) break;
+            }
+            while (this.history.length < targetAppliedLen && guard++ < 1000) {
+                if (!this.redo()) break;
+            }
         },
 
         addLabel(name: string): LabelEntry {
@@ -535,8 +659,8 @@ export const useSegmentationStore = defineStore('segmentation', {
             };
             this.rectRois.push(roi);
             if (recordUndo) {
-                this.undoLog.push({ kind: 'rectAdd', roiId: roi.id });
-                if (this.undoLog.length > 100) this.undoLog.shift();
+                // roi 実体を履歴に載せる (redo で同一 id を復元できるように)
+                this.pushHistory({ label: `Add rectangle ROI ${roi.label ?? '#' + this.rectRois.length}`, ts: Date.now(), op: { kind: 'rectAdd', roi: { ...roi } } });
             }
             return roi;
         },
@@ -546,8 +670,7 @@ export const useSegmentationStore = defineStore('segmentation', {
             if (!roi) return;
             this.rectRois = this.rectRois.filter(r => r.id !== id);
             // 削除を undo できるよう ROI 実体を保持
-            this.undoLog.push({ kind: 'rectRemove', roi });
-            if (this.undoLog.length > 100) this.undoLog.shift();
+            this.pushHistory({ label: `Remove rectangle ROI ${roi.label ?? '#' + id}`, ts: Date.now(), op: { kind: 'rectRemove', roi: { ...roi } } });
         },
 
         // 矩形 ROI を配列内で fromIndex → toIndex に移動 (一覧の並べ替え)。
@@ -562,13 +685,13 @@ export const useSegmentationStore = defineStore('segmentation', {
             this.rectRois.splice(toIndex, 0, moved);
         },
 
-        // 全削除。undo 履歴からも矩形 ROI 関連エントリを除去する
+        // 全削除。履歴からも矩形 ROI 関連エントリを除去する
         // (履歴に残しても復元先の整合が取れないため)。
         clearRectRois() {
             this.rectRois = [];
-            this.undoLog = this.undoLog.filter(
-                a => a.kind !== 'rectAdd' && a.kind !== 'rectRemove',
-            );
+            const notRect = (e: HistoryEntry) => e.op.kind !== 'rectAdd' && e.op.kind !== 'rectRemove';
+            this.history = this.history.filter(notRect);
+            this.redoStack = this.redoStack.filter(notRect);
         },
 
         // Reference sphere (liver / bloodPool) を配置 + 内部 SUV stats 計算
@@ -622,15 +745,21 @@ export const useSegmentationStore = defineStore('segmentation', {
             const pet = this.petVolumeRef;
             const m = this.finalMask;
             if (!pet || !m) return 0;
-            // クリック位置から現在の mask を 26-連結で局所 flood fill し、その島だけを
-            // labelId に書き換える (finalMask + manualEdits 両方)。
-            // 旧実装は毎回 connectedComponents26 で全 volume を再ラベリングしていて重く、
-            // かつ古い componentMap 経由で別の島へ波及する既知バグがあった。局所 flood fill は
-            // O(領域サイズ) で完了し、その場の連結性を辿るので波及もしない。
+            // クリック位置から現在の mask を 26-連結で局所 flood fill し、seed と同一ラベルの
+            // 島だけを labelId に書き換える (finalMask + manualEdits 両方)。O(領域サイズ)。
+            this.beginMaskEdit();
             const n = floodFillAssignLabel(m, this.manualEdits, { i, j, k }, pet.nx, pet.ny, pet.nz, labelId);
             // ラベル値を書き換えただけで非ゼロ集合 (= 連結成分の構造) は不変なので
             // componentMap は依然有効。maskVersion だけ bump して overlay を再描画させる。
-            if (n > 0) this.maskVersion++;
+            if (n > 0) {
+                this.maskVersion++;
+                const lname = this.labelById(labelId)?.name ?? `#${labelId}`;
+                this.commitMaskEdit(`Assign region → ${lname}`);
+            } else {
+                // 変更なし: snapshot を破棄
+                this.editSnapT = null;
+                this.editSnapM = null;
+            }
             return n;
         },
 
@@ -663,7 +792,7 @@ export const useSegmentationStore = defineStore('segmentation', {
                 if (this.thresholdMask) this.thresholdMask.fill(0);
                 if (this.manualEdits) this.manualEdits.fill(0);
                 if (this.finalMask) this.finalMask.fill(0);
-                this.clearMaskUndo();
+                this.clearHistory();
                 this.invalidateComponentMap();
                 this.maskVersion++;
             }
@@ -764,7 +893,7 @@ export const useSegmentationStore = defineStore('segmentation', {
                     suvMax: 0, suvMean: 0, suvStd: 0, voxelCount: 0,
                 };
             }
-            this.clearMaskUndo();
+            this.clearHistory();
             this.invalidateComponentMap();
             this.maskVersion++;
             this.lastAutoSavedAt = payload.savedAt;
@@ -890,7 +1019,7 @@ export const useSegmentationStore = defineStore('segmentation', {
             const tm = this.thresholdMask!;
             me.set(mask);
             tm.fill(0);
-            this.clearMaskUndo();
+            this.clearHistory();
             this.recomputeFinalMask();
             this.invalidateComponentMap();
             this.maskVersion++;

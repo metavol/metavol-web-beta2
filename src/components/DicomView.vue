@@ -2980,8 +2980,8 @@ const brushMouseDown = (e: MouseEvent) => {
   const vc = worldToVoxel_(wCenter, petIdx);
   const arr = [vc.x, vc.y, vc.z];
   const sliceIndex = Math.round(arr[sliceAxis]);
-  // stroke 全体を 1 つの undo entry にする (描き始める前に slice を退避)
-  saveSliceToUndoStack(sliceAxis, sliceIndex);
+  // stroke 全体を 1 つの履歴エントリにする (描き始める前に snapshot)
+  segStore.beginMaskEdit();
   brushStroke.value = { boxId: id, petIdx, sliceAxis, sliceIndex };
   selectedImageBoxId.value = id;
   const [x, y] = getCanvasXY(e);
@@ -3047,10 +3047,13 @@ const paintBrushAt = (sx: number, sy: number) => {
 
 const brushMouseUp = () => {
   if (!brushStroke.value) return;
+  const mode = segStore.brushMode;
   brushStroke.value = null;
   // canonical state へ同期 + lesion 統計/component map を更新 (stroke 終了時に 1 回だけ)。
   segStore.recomputeFinalMask();
   segStore.markManualEditsChanged();
+  // stroke 全体を 1 履歴エントリに確定 (何も塗られなければ commit は false で無視される)
+  segStore.commitMaskEdit(mode === 'add' ? 'Brush paint' : 'Brush erase');
   show();
 };
 
@@ -3147,10 +3150,11 @@ const finalizePolygon = () => {
     polyVoxelUV.push([u, vv]);
   }
 
-  // 操作前のスライスをundoStackに保存
-  saveSliceToUndoStack(p.sliceAxis, p.sliceIndexInPet);
+  // 操作前状態を履歴 (undo/redo) 用に snapshot
+  segStore.beginMaskEdit();
 
-  const writeValue = p.mode === 'add' ? segStore.currentLabelId : (0xFFFF /* erase sentinel */);
+  const mode = p.mode;
+  const writeValue = mode === 'add' ? segStore.currentLabelId : (0xFFFF /* erase sentinel */);
 
   fillPolygonOnSlice({
     pet: segStore.petVolumeRef,
@@ -3165,6 +3169,7 @@ const finalizePolygon = () => {
 
   segStore.recomputeFinalMask();
   segStore.markManualEditsChanged();
+  segStore.commitMaskEdit(mode === 'add' ? 'Polygon add' : 'Polygon erase');
   segStore.polygon = null;
   polygonCursor.value = null;
   show();
@@ -3178,63 +3183,18 @@ const cancelPolygon = () => {
   }
 };
 
-const saveSliceToUndoStack = (sliceAxis: 0|1|2, sliceIndex: number) => {
-  const m = segStore.manualEdits;
-  const pet = segStore.petVolumeRef;
-  if (!m || !pet) return;
-  const { nx, ny, nz } = pet;
-  let dimU: number, dimV: number;
-  if (sliceAxis === 2){ dimU = nx; dimV = ny; }
-  else if (sliceAxis === 1){ dimU = nx; dimV = nz; }
-  else { dimU = ny; dimV = nz; }
-  const before = new Uint16Array(dimU * dimV);
-  let k = 0;
-  for (let v = 0; v < dimV; v++){
-    for (let u = 0; u < dimU; u++){
-      let idx: number;
-      if (sliceAxis === 2) idx = sliceIndex * nx * ny + v * nx + u;
-      else if (sliceAxis === 1) idx = v * nx * ny + sliceIndex * nx + u;
-      else idx = v * nx * ny + u * nx + sliceIndex;
-      before[k++] = m[idx];
-    }
-  }
-  // 統合 undo スタックへ記録 (undoStack と undoLog の両方を更新)
-  segStore.pushMaskSliceUndo(sliceAxis, sliceIndex, before);
-};
-
-// maskSlice undo: manualEdits の 1 スライス分を before 状態に巻き戻す。
-const applyMaskSliceUndo = (e: { sliceAxis: 0|1|2; sliceIndex: number; before: Uint16Array }) => {
-  const m = segStore.manualEdits;
-  const pet = segStore.petVolumeRef;
-  if (!m || !pet) return;
-  const { nx, ny, nz } = pet;
-  let dimU: number, dimV: number;
-  if (e.sliceAxis === 2){ dimU = nx; dimV = ny; }
-  else if (e.sliceAxis === 1){ dimU = nx; dimV = nz; }
-  else { dimU = ny; dimV = nz; }
-  let k = 0;
-  for (let v = 0; v < dimV; v++){
-    for (let u = 0; u < dimU; u++){
-      let idx: number;
-      if (e.sliceAxis === 2) idx = e.sliceIndex * nx * ny + v * nx + u;
-      else if (e.sliceAxis === 1) idx = v * nx * ny + e.sliceIndex * nx + u;
-      else idx = v * nx * ny + u * nx + e.sliceIndex;
-      m[idx] = e.before[k++];
-    }
-  }
-  segStore.recomputeFinalMask();
-  segStore.markManualEditsChanged();
-};
-
-// 統合 Undo: 直前操作 (矩形 ROI 追加/削除 or polygon マスク編集) を巻き戻す。
-// Undo ボタン / Ctrl+Z 共通のエントリポイント。
+// 統合 Undo / Redo: マスク編集 (Apply/Clear/polygon/brush/assign) と 矩形 ROI 追加/削除を
+// 1 本の履歴で巻き戻す/やり直す。マスク復元は store 側 (diff + recompute) が担当するので、
+// ここは再描画のみ。Undo ボタン / Ctrl+Z / History パネル共通のエントリポイント。
 const undoLastAction = () => {
-  const action = segStore.undo();
-  if (!action) return;
-  if (action.kind === 'maskSlice') {
-    applyMaskSliceUndo(action);
-  }
-  // rectAdd / rectRemove は store.undo() 内で rectRois を更新済み。再描画のみ。
+  if (segStore.undo()) show();
+};
+const redoLastAction = () => {
+  if (segStore.redo()) show();
+};
+// History パネルから任意地点へジャンプ
+const gotoHistoryStep = (targetAppliedLen: number) => {
+  segStore.gotoHistory(targetAppliedLen);
   show();
 };
 
@@ -3265,9 +3225,17 @@ const onDblClick = (e: MouseEvent) => {
 const onKeyDown = (e: KeyboardEvent) => {
   if (e.key === "Escape" && segStore.polygon?.inProgress){
     cancelPolygon();
-  } else if ((e.key === "z" || e.key === "Z") && (e.ctrlKey || e.metaKey)){
+  } else if ((e.key === "z" || e.key === "Z") && (e.ctrlKey || e.metaKey) && e.shiftKey){
+    // Ctrl+Shift+Z = redo
     e.preventDefault();
-    // 統合 undo: 矩形 ROI 追加/削除 と polygon 編集をまとめて時系列で巻き戻す
+    redoLastAction();
+  } else if ((e.key === "y" || e.key === "Y") && (e.ctrlKey || e.metaKey)){
+    // Ctrl+Y = redo (Windows 慣習)
+    e.preventDefault();
+    redoLastAction();
+  } else if ((e.key === "z" || e.key === "Z") && (e.ctrlKey || e.metaKey)){
+    // Ctrl+Z = undo。マスク編集 (Apply/Clear/polygon/brush/assign) と 矩形 ROI をまとめて巻き戻す
+    e.preventDefault();
     undoLastAction();
   }
 };
@@ -5834,8 +5802,9 @@ defineExpose({
   // ROI (矩形 / sphere) を JSON 書き出し / 読み込み
   exportRoisAsJson,
   importRoisFromJsonFile,
-  // 統合 Undo (App-bar の Undo ボタン用)
+  // 統合 Undo / Redo (App-bar の Undo/Redo ボタン用)
   undoLastAction,
+  redoLastAction,
   setupTriplanarPt,
   setupTriplanarFused,
   setupPtOnly4up,

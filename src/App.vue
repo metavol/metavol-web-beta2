@@ -234,7 +234,7 @@
 
       <v-divider vertical class="mx-3" />
 
-      <!-- Undo: 矩形 ROI 追加/削除 + polygon マスク編集を時系列で巻き戻す (Ctrl+Z) -->
+      <!-- Undo / Redo: マスク編集 (Apply/Clear/polygon/brush/assign) + 矩形 ROI を時系列で巻き戻す/やり直す -->
       <v-btn
         class="mv-tool-btn"
         variant="text"
@@ -244,6 +244,16 @@
       >
         <v-icon icon="mdi-undo" />
         <v-tooltip activator="parent" location="bottom">Undo (Ctrl+Z)</v-tooltip>
+      </v-btn>
+      <v-btn
+        class="mv-tool-btn"
+        variant="text"
+        size="small"
+        :disabled="!canRedo"
+        @click="onRedo"
+      >
+        <v-icon icon="mdi-redo" />
+        <v-tooltip activator="parent" location="bottom">Redo (Ctrl+Shift+Z)</v-tooltip>
       </v-btn>
 
       <v-spacer />
@@ -1006,10 +1016,14 @@ const onExportRois = () => {
   }
 };
 
-// 統合 Undo (矩形 ROI 追加/削除 + polygon マスク編集)。Ctrl+Z と同じ動作。
+// 統合 Undo / Redo (Apply/Clear/polygon/brush/assign + 矩形 ROI)。Ctrl+Z / Ctrl+Shift+Z と同じ。
 const canUndo = computed(() => segStore.canUndo);
+const canRedo = computed(() => segStore.canRedo);
 const onUndo = () => {
   dicomViewRef.value?.undoLastAction?.();
+};
+const onRedo = () => {
+  dicomViewRef.value?.redoLastAction?.();
 };
 const onSnapshotInputChange = async (e: Event) => {
   const inp = e.target as HTMLInputElement;

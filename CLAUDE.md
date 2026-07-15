@@ -159,9 +159,24 @@ Volume 単独 / Fusion 両方をハンドル（`isVolumeImageBoxInfo` は `clut1
 
 ## キーバインド
 
-- **Ctrl+Z** : 直前 polygon 編集の undo（`undoStack` から pop してスライス全 voxel を巻き戻し）
+- **Ctrl+Z** : undo / **Ctrl+Shift+Z** or **Ctrl+Y** : redo（下記「編集履歴」参照）
 - **Esc** : 進行中 polygon キャンセル
 - **右クリック / ダブルクリック** : polygon 確定
+
+## 編集履歴 (undo / redo)
+
+- store (`segmentation.ts`) に **1 本の履歴タイムライン** `history` (適用済み) + `redoStack` (取消済み) を持つ。
+- 記録単位: マスク編集 (Apply / Clear / polygon / brush stroke / assign) と 矩形 ROI 追加/削除。
+- マスク編集は **thresholdMask + manualEdits の sparse diff** (`MaskDiff`: 変更 voxel の idx と before/after)
+  で保存する。finalMask は diff に含めず undo/redo 時に `recomputeFinalMask` で導出。背景が広い PET では
+  diff は病変サイズに比例するので省メモリ。
+- 使い方: 編集の直前に `beginMaskEdit()` (threshold/manual を snapshot) → 編集 → `commitMaskEdit(label)`
+  (diff を計算して history に push、変更無しなら false で無視)。undo/redo は store が復元まで担当し、
+  呼び出し側 (DicomView) は `show()` するだけ。
+- UI: app-bar の Undo/Redo ボタン、右 Inspector の **History** セクション (タイムラインをクリックで
+  任意地点へ `gotoHistory` ジャンプ)。
+- 履歴を無効化するのは `clearHistory()` (setPetVolume で別 volume、snapshot 復元、tracer preset 変更、
+  manual 全消去 時)。`history`/`redoStack` は .mvs にも auto-save にも永続化しない。
 
 ---
 
@@ -171,6 +186,27 @@ Volume 単独 / Fusion 両方をハンドル（`isVolumeImageBoxInfo` は `clut1
   - `{seriesUID}_{YYYYMMDD-HHMMSS}.nii` : Uint16 多ラベルマスク（PET 格子、PET と同一 affine）
   - 同名 `.json` : ラベル一覧、SUV閾値、PET metadata、voxel size、dims
 - NIfTI ヘッダは自前実装（348B + 4B magic + raw voxel）。`niftiWriter.ts` を参照。
+
+---
+
+## 右 Inspector (SegmentationPanel) レイアウト — Persona 1 ワークフロー順 (2026-07)
+
+Persona 1 (MTV 測定) の動線に沿って、既定は 4 ステップの一本道に簡略化してある:
+- **最上部 Overlay バー**: mask 表示切替 + 不透明度を **1 行** で (step ①〜④ 共通のため最上段固定)。
+- **① Segment**: SUV threshold preset + **Apply split-button**。メインは現在ラベルで適用、caret メニューで
+  Tumor/Physiological を選んで即適用 (`onApplyAs`)。+ Clear
+- **② Refine**: **共通ラベルピッカー** (`labelPickItems` = 全ラベルを v-menu で選択、`currentLabelId` へ) +
+  Edit tool (Assign/Polygon/Brush)。polygon/brush の詳細 (Add/Erase, radius) は**そのツール選択中のみ**表示。
+  assign/polygon/brush は全てこの共通ラベルへ書き込む。
+- **③ Measure**: Lesion table (MTV/TLG/SUVpeak, TMTV cutoff, Deauville)。`finalMask` があるときのみ
+- **④ Save**: Save NIfTI / snapshot / PDF
+- History のクリック可能タイムラインは Advanced に格納 (undo/redo は app-bar と Ctrl+Z/Ctrl+Shift+Z に常設)。
+
+使用頻度の低い機能は削除せず **Advanced トグル** (`showAdvanced` ref, localStorage 記憶) に格納:
+threshold method (PERCIST/Deauville/%max/%liver) + reference sphere、Sphere ROI、Labels 編集、
+Histogram + radiomics、Find islands、Rectangle ROI。各セクションの `<section>` に `v-if="showAdvanced"`
+(polygon/brush は `activeSegTool` との OR) を付けて出し入れする。ステップ見出しは `.mv-step-head`。
+**新セクションを足すときは「① 主要フローか / Advanced か」を必ず判断し、後者は `v-if="showAdvanced"` で畳む。**
 
 ---
 
@@ -210,18 +246,17 @@ Volume 単独 / Fusion 両方をハンドル（`isVolumeImageBoxInfo` は `clut1
 - 修正: `handlePolygonClick` / `brushMouseDown` の slice index を `Math.round(vc[sliceAxis])` に統一し、
   overlay の round サンプリングと一致させた。今後 slice index を決めるコードは必ず round に揃えること。
 
-### 2. 分離した片方の島だけ assign したら他方にも波及する (調査中)
-- `assignLabelAtVoxel` は `componentMap` を使わず、クリック位置から `finalMask` を **その場で局所
-  flood fill** する (`floodFillAssignLabel`, 26-連結)。常に最新の連結性を辿るので、**本当に非連結**なら
-  他島へは波及しない (旧 componentMap ベースの stale 波及は解消済み)。
-- それでも「両方塗られる」場合、最有力の原因は **3D 連結**: polygon/brush の erase は 1 スライス単位
-  なので、見た目 2D で分離したつもりでも隣接スライスで繋がっていれば 3D 的には 1 連結成分 → assign
-  (3D flood) は両方を塗る。これは連結性 (6 vs 26) の問題ではなく「どこまで erase したか」の問題。
-- **診断手段**: voxel inspector (Ctrl+Shift+D) を ON にすると mask 各層 (threshold / manual /
-  final / component id) を表示する。2 つの segment を hover して同じ component id なら 3D 連結。
-  gap を各スライスで hover し final==0 か確認すると、どのスライスで繋がっているか特定できる。
-- 連結性は findIslands / summarizeLesions / assign すべて 26-連結で統一 (inspector の component 欄が
-  assign 波及範囲をそのまま予測する)。
+### 2. 分離した片方の島だけ assign したら他方にも波及する (解決済み 2026-07-14)
+- **真因**: `floodFillAssignLabel` の連結判定が「mask ≠ 0 (非ゼロなら前景)」だった。
+  再現: 球全体 Tumor → 中間スライスを polygon で **Physio に変更** (erase ではない) → 上半球に assign
+  すると、Physio スライスは非ゼロなので flood が **通過**して下半球まで波及した。
+  球体ファントム実験 (41³ grid, r=10) で再現・修正を確認: 修正前 4169 voxel (全体) → 修正後 1926 voxel (上半球のみ)。
+- **修正**: flood の連結条件を「**seed voxel と同一ラベル**」に変更。背景 (0) も他ラベルも境界として
+  働くので、ユーザが視覚的に区別している「segment」単位で塗り替わる。分離のない単一ラベル領域への
+  assign は従来通り全体に及ぶ (回帰確認済み)。
+- **注意 (将来の変更時)**: assign の領域単位 = 「同一ラベルの 26-連結成分」。
+  `findIslands`/`summarizeLesions` の島 = 「非ゼロの 26-連結成分」で定義が異なる (こちらは病変単位)。
+  voxel inspector (Ctrl+Shift+D) で mask 各層 (threshold / manual / final / component) を hover 確認できる。
 
 ### 3. `setPetVolume(v)` が呼ばれるたびに mask が破棄される
 - `setPetVolume` は `thresholdMask`/`manualEdits`/`finalMask`/`undoStack`/`sphere`/`polygon` を全 null 化する。

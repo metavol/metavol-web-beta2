@@ -43,7 +43,7 @@ export interface SessionPayload {
     currentLabelId: number;
     // ROI state (optional)
     sphere?: { centerWorld: [number, number, number]; radiusMm: number } | null;
-    // 注意: undoStack は意図的に保存しない (容量肥大化を避けるため)
+    // 注意: 編集履歴 (history / redoStack) は意図的に保存しない (容量肥大化を避けるため)
 }
 
 let _dbPromise: Promise<IDBDatabase> | null = null;

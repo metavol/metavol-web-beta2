@@ -386,16 +386,18 @@ export const summarizeLesions = (
     return out;
 };
 
-// クリック位置 (seed) から mask 上を 26-連結で局所 flood fill し、その連結領域だけを
-// labelId に書き換える。画像全体の連結成分ラベリング (connectedComponents26) を毎回
-// 走らせる必要がないため O(領域サイズ) で完了する (全 voxel 数に依存しない)。
-// 連結性は findIslands / summarizeLesions と同じ 26-連結に揃える (voxel inspector の
-// component 欄が assign の波及範囲をそのまま予測できるように)。
+// クリック位置 (seed) から mask 上を 26-連結で局所 flood fill し、**seed と同じラベルの
+// 連結領域だけ** を labelId に書き換える。画像全体の連結成分ラベリングを毎回走らせる
+// 必要がないため O(領域サイズ) で完了する (全 voxel 数に依存しない)。
 //
-// - foreground = 非ゼロ voxel (ラベル値は問わない)。0 の voxel は領域境界。
-// - 現在の mask の連結性をその場で辿るので、erase で本当に分断されていれば別島へは波及しない。
-//   逆に、隣接スライス等で 3D 的に繋がっている限り (=同一連結成分) 両方が塗られる。これは
-//   「見た目 2D で分離したつもりでも 3D では 1 成分」というケースを inspector で確認できる。
+// ★ 連結性の定義は「seed と同一ラベル」であって「非ゼロ」ではない。
+//   非ゼロ判定だと、例えば球全体 Tumor → 中間スライスを polygon で Physio に変えた後、
+//   上半球に assign すると Physio スライス (非ゼロ) を **通過して** 下半球まで波及する
+//   バグになる (球体ファントム実験で再現・確認済み)。同一ラベル判定なら、異なるラベルの
+//   領域が境界として働き、ユーザが視覚的に区別している「segment」単位で塗り替えられる。
+//
+// - 背景 (0) も他ラベルも境界。seed が背景なら何もしない。
+// - seed のラベルが既に labelId でも塗り直す (manualEdits へ確定させる意味がある)。
 // - manualEdits が渡された場合は同じ voxel を labelId に書き込み、recomputeFinalMask で
 //   ラベルが元に戻らないようにする。
 export const floodFillAssignLabel = (
@@ -406,7 +408,8 @@ export const floodFillAssignLabel = (
     labelId: number,
 ): number => {
     const seedIdx = seed.k * nx * ny + seed.j * nx + seed.i;
-    if (mask[seedIdx] === 0) return 0;   // クリック位置がマスク外なら何もしない
+    const seedLabel = mask[seedIdx];
+    if (seedLabel === 0) return 0;   // クリック位置がマスク外なら何もしない
 
     const visited = new Set<number>();
     const stack: number[] = [seedIdx];
@@ -433,7 +436,7 @@ export const floodFillAssignLabel = (
                     if (di === 0 && dj === 0 && dk === 0) continue;
                     const ni = i + di; if (ni < 0 || ni >= nx) continue;
                     const b = nk * nxny + nj * nx + ni;
-                    if (mask[b] === 0) continue;        // 背景は境界
+                    if (mask[b] !== seedLabel) continue;   // 背景も他ラベルも境界
                     if (visited.has(b)) continue;
                     visited.add(b);
                     stack.push(b);
