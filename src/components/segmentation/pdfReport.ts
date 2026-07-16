@@ -154,7 +154,7 @@ export const generateReport = async (input: PdfReportInput): Promise<void> => {
             { key: 'SUVmax',  w: 18, align: 'right' as const },
             { key: 'SUVpeak', w: 22, align: 'right' as const },
             { key: 'SUVmean', w: 22, align: 'right' as const },
-            { key: 'MTV cc',  w: 22, align: 'right' as const },
+            { key: 'MTV ml',  w: 22, align: 'right' as const },
             { key: 'TLG',     w: 22, align: 'right' as const },
             { key: 'Vox',     w: 18, align: 'right' as const },
         ];

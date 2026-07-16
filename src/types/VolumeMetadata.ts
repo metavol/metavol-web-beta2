@@ -29,6 +29,13 @@ export interface VolumeMetadata {
     injectionDateTimeIso?: string;
     decayCorrection?: string;
 
+    // SUV 減衰補正の 2 モード用 factor。voxBase = 減衰時刻を整数秒に切り捨て (Vox-BASE と一致、既定)。
+    // precise = 小数秒まで使用 (より正確)。両者は定数比。`suvMode` が現在 voxel に適用中のモード。
+    // voxel は常に suvFactor (= 現モードの factor) 済み。トグルは voxel を factor 比で rescale する。
+    suvFactorVoxBase?: number;
+    suvFactorPrecise?: number;
+    suvMode?: 'voxbase' | 'precise';
+
     // 元データの voxel datatype label (例 'Int16', 'Uint16', 'Float32')。
     // 内部 voxel は常に Float32 だが、ロード元が何だったかを表示用に保持。
     datatypeName?: string;

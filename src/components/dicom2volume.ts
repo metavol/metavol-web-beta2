@@ -14,7 +14,8 @@ interface MyDataSet extends DataSet {
   }
 
 export interface SuvResult {
-    factor: number;
+    factor: number;            // 適用する factor (既定 = voxBase = 整数秒切り捨て)
+    factorPrecise?: number;    // 小数秒まで使う "より正確" 版 (BQML のみ差が出る。無ければ factor と同じ)
     ok: boolean;
     reason: string;
     source: SuvSource;
@@ -195,6 +196,15 @@ export const generateVolumeFromDicom = (dcmList: MyDataSet[]) => {
         if (suvResult.acquisitionDt) metadata.acquisitionDateTimeIso = suvResult.acquisitionDt.toISOString();
         if (suvResult.injectionDt) metadata.injectionDateTimeIso = suvResult.injectionDt.toISOString();
         if (suvResult.decayCorrection) metadata.decayCorrection = suvResult.decayCorrection;
+        // SUV mode 切替用の 2 factor。voxel は voxBase (整数秒) で bake 済み (= 既定)。
+        // 小数秒の差が実在する (BQML で 2 factor が異なる) ときだけモードを設定 → UI トグル表示。
+        if (suvResult.source === 'BQML'
+            && suvResult.factorPrecise != null
+            && Math.abs(suvResult.factorPrecise - suvResult.factor) > Math.abs(suvResult.factor) * 1e-9) {
+            metadata.suvFactorVoxBase = suvResult.factor;
+            metadata.suvFactorPrecise = suvResult.factorPrecise;
+            metadata.suvMode = 'voxbase';
+        }
     }
 
     const dicomVolume: Volume = {
@@ -366,7 +376,14 @@ const tryBqmlSuvFactor = (dd: MyDataSet[]): SuvResult => {
         return { factor: 1, ok: false, reason: 'missing radiopharmaceutical start time', source: 'none' };
     }
 
-    const dt_sec = (acq_dt.getTime() - inj_dt.getTime()) / 1000;
+    // Δt を 2 通り計算する:
+    //   dt_trunc : inj/acq を整数秒に切り捨て (= Vox-BASE と一致。既定で適用)
+    //   dt_frac  : 小数秒まで使う (= より正確)
+    // 参照ビューア (Vox-BASE 等) は減衰補正時刻を整数秒 (HH:MM:SS) で扱うため、既定は
+    // 整数秒版に合わせる。両者は SUV 全体で定数比 (F-18 half-life に対し <0.02%) だけ異なる。
+    const floorToSec = (t: Date) => Math.floor(t.getTime() / 1000) * 1000;
+    const dt_sec = (floorToSec(acq_dt) - floorToSec(inj_dt)) / 1000;   // 整数秒 Δt (voxBase)
+    const dt_sec_frac = (acq_dt.getTime() - inj_dt.getTime()) / 1000;  // 小数秒 Δt (precise)
     const dc = (d.string("x00541102") ?? "").toUpperCase().trim();
 
     // DecayCorrection の解釈:
@@ -375,8 +392,10 @@ const tryBqmlSuvFactor = (dd: MyDataSet[]): SuvResult => {
     //   NONE  : pixel は acq 時の活性 (補正なし)            → dose を inj→acq に decay
     //   missing: START と仮定 (もっとも一般的)
     let dose_at_ref: number;
+    let dose_at_ref_frac: number;
     if (dc === "ADMIN") {
         dose_at_ref = Number(dose);
+        dose_at_ref_frac = Number(dose);
     } else {
         if (dt_sec < 0) {
             return {
@@ -386,8 +405,8 @@ const tryBqmlSuvFactor = (dd: MyDataSet[]): SuvResult => {
                 acquisitionDt: acq_dt, injectionDt: inj_dt, decayCorrection: dc || undefined,
             };
         }
-        const decay = Math.pow(0.5, dt_sec / Number(hl));
-        dose_at_ref = Number(dose) * decay;
+        dose_at_ref = Number(dose) * Math.pow(0.5, dt_sec / Number(hl));
+        dose_at_ref_frac = Number(dose) * Math.pow(0.5, dt_sec_frac / Number(hl));
     }
 
     if (!Number.isFinite(dose_at_ref) || dose_at_ref <= 0) {
@@ -395,8 +414,11 @@ const tryBqmlSuvFactor = (dd: MyDataSet[]): SuvResult => {
     }
 
     const factor = (Number(bw) * 1000.0) / dose_at_ref;
+    const factorPrecise = (dose_at_ref_frac > 0 && Number.isFinite(dose_at_ref_frac))
+        ? (Number(bw) * 1000.0) / dose_at_ref_frac
+        : factor;
     return {
-        factor, ok: true, reason: 'ok', source: 'BQML',
+        factor, factorPrecise, ok: true, reason: 'ok', source: 'BQML',
         acquisitionDt: acq_dt, injectionDt: inj_dt, decayCorrection: dc || undefined,
     };
 };

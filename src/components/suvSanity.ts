@@ -151,10 +151,14 @@ export interface SuvMetadataSummary {
     doseMBq: number | null;
     halfLifeMin: number | null;
     uptakeMin: number | null;
+    uptakeSec: number | null;         // Δt (inj→acq) を秒で (Vox-BASE との厳密照合用)
+    decayFactor: number | null;       // 2^(-Δt/half-life)
+    doseAtRefBq: number | null;       // 補正時刻に減衰補正した総投与量 = dose × decayFactor
     decayCorrection: string | null;
     units: string | null;
-    suvFactor: number | null;
+    suvFactor: number | null;         // BW SUV rescale slope = BW[g] / doseAtRef (現モード)
     suvSource: string | null;
+    suvMode: 'voxbase' | 'precise' | null;
     acquisitionDateTime: string | null;
     injectionDateTime: string | null;
 }
@@ -165,29 +169,53 @@ export const getSuvMetadataSummary = (volume: Volume | null | undefined): SuvMet
         doseMBq: null,
         halfLifeMin: null,
         uptakeMin: null,
+        uptakeSec: null,
+        decayFactor: null,
+        doseAtRefBq: null,
         decayCorrection: null,
         units: null,
         suvFactor: null,
         suvSource: null,
+        suvMode: null,
         acquisitionDateTime: null,
         injectionDateTime: null,
     };
     if (!volume?.metadata) return empty;
     const md = volume.metadata;
-    let uptakeMin: number | null = null;
-    if (md.acquisitionDateTimeIso && md.injectionDateTimeIso) {
-        const dt = (new Date(md.acquisitionDateTimeIso).getTime() - new Date(md.injectionDateTimeIso).getTime()) / 60000;
-        if (Number.isFinite(dt)) uptakeMin = dt;
+
+    // ★ dose@corr / decayFactor / Δt は **現在の suvFactor** から逆算する (SUV mode を反映)。
+    // SUV = voxel × suvFactor, suvFactor = BW[g]/doseAtRef なので doseAtRef = BW[g]/suvFactor。
+    let doseAtRefBq: number | null = null;
+    if (md.suvSource === 'BQML' && md.patientWeightKg && md.suvFactor && md.suvFactor > 0) {
+        doseAtRefBq = (md.patientWeightKg * 1000) / md.suvFactor;
     }
+    let decayFactor: number | null = null;
+    if (doseAtRefBq != null && md.radionuclideTotalDoseBq && md.radionuclideTotalDoseBq > 0) {
+        decayFactor = doseAtRefBq / md.radionuclideTotalDoseBq;
+    }
+    // Δt: 減衰係数が有効 (0<df<1) なら逆算して現モードの整数秒/小数秒を反映。無ければ inj/acq ISO。
+    let uptakeSec: number | null = null;
+    if (decayFactor != null && decayFactor > 0 && decayFactor < 1 && md.radionuclideHalfLifeSec && md.radionuclideHalfLifeSec > 0) {
+        uptakeSec = -Math.log2(decayFactor) * md.radionuclideHalfLifeSec;
+    } else if (md.acquisitionDateTimeIso && md.injectionDateTimeIso) {
+        const dtSec = (new Date(md.acquisitionDateTimeIso).getTime() - new Date(md.injectionDateTimeIso).getTime()) / 1000;
+        if (Number.isFinite(dtSec)) uptakeSec = dtSec;
+    }
+    const uptakeMin = uptakeSec != null ? uptakeSec / 60 : null;
+
     return {
         patientWeightKg: md.patientWeightKg ?? null,
         doseMBq: md.radionuclideTotalDoseBq != null ? md.radionuclideTotalDoseBq / 1e6 : null,
         halfLifeMin: md.radionuclideHalfLifeSec != null ? md.radionuclideHalfLifeSec / 60 : null,
         uptakeMin,
+        uptakeSec,
+        decayFactor,
+        doseAtRefBq,
         decayCorrection: md.decayCorrection ?? null,
         units: md.units ?? null,
         suvFactor: md.suvFactor ?? null,
         suvSource: md.suvSource ?? null,
+        suvMode: md.suvMode ?? null,
         acquisitionDateTime: md.acquisitionDateTimeIso ?? null,
         injectionDateTime: md.injectionDateTimeIso ?? null,
     };

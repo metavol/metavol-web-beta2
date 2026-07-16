@@ -447,6 +447,46 @@ export const floodFillAssignLabel = (
     return count;
 };
 
+// seed voxel が属する 26-連結成分 (非ゼロ = summarizeLesions の binary と同定義) の
+// 各 voxel の PET 値 (SUV) を集める。病変単位ヒストグラム用。read-only。
+export const collectComponentSuv = (
+    mask: Uint16Array,
+    petVoxel: Float32Array | Int16Array,
+    seed: { i: number; j: number; k: number },
+    nx: number, ny: number, nz: number,
+): number[] => {
+    const nxny = nx * ny;
+    const seedIdx = seed.k * nxny + seed.j * nx + seed.i;
+    if (seedIdx < 0 || seedIdx >= mask.length || mask[seedIdx] === 0) return [];
+    const visited = new Set<number>();
+    const stack: number[] = [seedIdx];
+    visited.add(seedIdx);
+    const out: number[] = [];
+    while (stack.length > 0) {
+        const cur = stack.pop()!;
+        const k = (cur / nxny) | 0;
+        const rem = cur - k * nxny;
+        const j = (rem / nx) | 0;
+        const i = rem - j * nx;
+        out.push(petVoxel[cur]);
+        for (let dk = -1; dk <= 1; dk++) {
+            const nk = k + dk; if (nk < 0 || nk >= nz) continue;
+            for (let dj = -1; dj <= 1; dj++) {
+                const nj = j + dj; if (nj < 0 || nj >= ny) continue;
+                for (let di = -1; di <= 1; di++) {
+                    if (di === 0 && dj === 0 && dk === 0) continue;
+                    const ni = i + di; if (ni < 0 || ni >= nx) continue;
+                    const b = nk * nxny + nj * nx + ni;
+                    if (mask[b] === 0 || visited.has(b)) continue;
+                    visited.add(b);
+                    stack.push(b);
+                }
+            }
+        }
+    }
+    return out;
+};
+
 // 与えられた voxel (i,j,k) が属する成分の全 voxel に対して mask 上で labelId に書き換える。
 export const assignLabelToComponent = (
     components: Uint16Array,

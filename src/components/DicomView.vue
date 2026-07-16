@@ -2826,7 +2826,8 @@ const wheel = (e: WheelEvent) => {
     if (dist < segStore.sphere.radiusMm){
       const step = e.deltaY > 0 ? -2 : 2;
       let r = segStore.sphere.radiusMm + step;
-      if (r < 1) r = 1;
+      // 最小 5mm: これ未満だと球が小さすぎて再度大きくする際にカーソルが球内に入れられない。
+      if (r < 5) r = 5;
       if (r > 200) r = 200;
       segStore.sphere.radiusMm = r;
       recomputeSphereStats();
@@ -2896,7 +2897,7 @@ const jumpToWorld = (p: THREE.Vector3) => {
   for (let i = 0; i < imageBoxInfos.value.length; i++){
     if (!isAnyVolumeBox(i)) continue;
     const a = getVolumeImageBoxInfo(i);
-    if (a.isMip || a.isVr) continue;
+    if (a.isMip || a.isVr || !a.centerInWorld) continue;   // 未初期化 box を防御
     a.centerInWorld.copy(p);
   }
   segStore.setCrosshairWorld(p);
@@ -3008,8 +3009,9 @@ const paintBrushAt = (sx: number, sy: number) => {
   const rMm = segStore.brushRadiusMm;
   const ru = Math.max(0, Math.floor(rMm / (pitchU || 1)));
   const rv = Math.max(0, Math.floor(rMm / (pitchV || 1)));
-  const writeValue = segStore.brushMode === 'add' ? segStore.currentLabelId : 0xFFFF /* erase sentinel */;
-  const fval = writeValue === 0xFFFF ? 0 : writeValue;
+  // Brush は「既存ラベルを選択ラベルへ塗り替える」用途のみ (Add/Erase は廃止)。
+  const writeValue = segStore.currentLabelId;
+  const fval = writeValue;
   for (let dv = -rv; dv <= rv; dv++){
     for (let du = -ru; du <= ru; du++){
       const fu = ru > 0 ? du / ru : 0;
@@ -3047,13 +3049,12 @@ const paintBrushAt = (sx: number, sy: number) => {
 
 const brushMouseUp = () => {
   if (!brushStroke.value) return;
-  const mode = segStore.brushMode;
   brushStroke.value = null;
   // canonical state へ同期 + lesion 統計/component map を更新 (stroke 終了時に 1 回だけ)。
   segStore.recomputeFinalMask();
   segStore.markManualEditsChanged();
   // stroke 全体を 1 履歴エントリに確定 (何も塗られなければ commit は false で無視される)
-  segStore.commitMaskEdit(mode === 'add' ? 'Brush paint' : 'Brush erase');
+  segStore.commitMaskEdit('Brush relabel');
   show();
 };
 
@@ -3107,7 +3108,7 @@ const handlePolygonClick = (e: MouseEvent) => {
       sliceAxis,
       sliceIndexInPet,
       screenVertices: [[x, y]],
-      mode: segStore.defaultPolygonMode,
+      mode: 'add',   // Add/Erase 廃止: polygon は選択ラベルへの塗り替えのみ
       inProgress: true,
       imageBoxId: id,
     };
@@ -3153,8 +3154,8 @@ const finalizePolygon = () => {
   // 操作前状態を履歴 (undo/redo) 用に snapshot
   segStore.beginMaskEdit();
 
-  const mode = p.mode;
-  const writeValue = mode === 'add' ? segStore.currentLabelId : (0xFFFF /* erase sentinel */);
+  // Add/Erase 廃止: polygon は選択ラベルへの塗り替えのみ。
+  const writeValue = segStore.currentLabelId;
 
   fillPolygonOnSlice({
     pet: segStore.petVolumeRef,
@@ -3169,7 +3170,7 @@ const finalizePolygon = () => {
 
   segStore.recomputeFinalMask();
   segStore.markManualEditsChanged();
-  segStore.commitMaskEdit(mode === 'add' ? 'Polygon add' : 'Polygon erase');
+  segStore.commitMaskEdit('Polygon relabel');
   segStore.polygon = null;
   polygonCursor.value = null;
   show();
@@ -4015,6 +4016,82 @@ const detectModalityFromFilename = (basename: string | undefined): 'PT' | 'CT' |
 // 「描画状態が更新された」signal とし、cross-ref line など派生計算の reactivity に使う。
 const boxStateVersion = ref(0);
 
+// Sphere ROI の画面 (page) 座標。ROI 近傍に stats を浮かせる (voxel inspector と同様) 用。
+// drawAnnotationOverlays の球輪郭中心算出と同じ式で box i 上の canvas 座標を求め、page 座標へ。
+const sphereScreenInBox = (i: number): { x: number; y: number } | null => {
+  const s = segStore.sphere;
+  if (!s || !isVolumeImageBoxInfo(i)) return null;
+  const a = getVolumeImageBoxInfo(i);
+  if (a.isMip || a.isVr || !a.vecz) return null;
+  const c = s.centerWorld;
+  const po = a.centerInWorld;
+  const n = a.vecz.clone().normalize();
+  const d = (c.x - po.x) * n.x + (c.y - po.y) * n.y + (c.z - po.z) * n.z;
+  if (Math.abs(d) > s.radiusMm) return null;   // この box の断面と球が交差しない
+  const dxw = c.x - po.x - d * n.x, dyw = c.y - po.y - d * n.y, dzw = c.z - po.z - d * n.z;
+  const ax = a.vecx, ay = a.vecy;
+  const a11 = ax.x*ax.x + ax.y*ax.y + ax.z*ax.z;
+  const a22 = ay.x*ay.x + ay.y*ay.y + ay.z*ay.z;
+  const a12 = ax.x*ay.x + ax.y*ay.y + ax.z*ay.z;
+  const b1 = ax.x*dxw + ax.y*dyw + ax.z*dzw;
+  const b2 = ay.x*dxw + ay.y*dyw + ay.z*dzw;
+  const det = a11*a22 - a12*a12;
+  if (Math.abs(det) < 1e-12) return null;
+  const u = (a22*b1 - a12*b2) / det;
+  const v = (a11*b2 - a12*b1) / det;
+  const cx = u + (imageBoxW.value ?? 0)/2;
+  const cy = v + (imageBoxH.value ?? 0)/2;
+  const box = imb.value?.[i] as any;
+  const cvRaw = box?.cv1;
+  const cv: HTMLCanvasElement | null = cvRaw ? ((cvRaw.value ?? cvRaw) as HTMLCanvasElement) : null;
+  if (!cv || !(cv instanceof HTMLCanvasElement)) return null;
+  const rect = cv.getBoundingClientRect();
+  const sxr = cv.width ? rect.width / cv.width : 1;
+  const syr = cv.height ? rect.height / cv.height : 1;
+  // ROI 円の少し右外にオフセットして ROI を隠さない
+  const rPx = a11 > 0 ? (s.radiusMm / Math.sqrt(a11)) * sxr : 0;
+  return { x: rect.left + cx * sxr + rPx + 10, y: rect.top + cy * syr - 12 };
+};
+
+const sphereFloatPos = computed<{ x: number; y: number } | null>(() => {
+  void boxStateVersion.value;   // 描画のたび再評価 (pan/zoom/page 追従)
+  if (!segStore.sphere) return null;
+  const p = sphereScreenInBox(selectedImageBoxId.value);   // 選択 box を優先
+  if (p) return p;
+  for (let i = 0; i < imageBoxInfos.value.length; i++) {
+    const q = sphereScreenInBox(i);
+    if (q) return q;
+  }
+  return null;
+});
+
+// フローティングボックスのユーザドラッグ量 (ROI 追従位置に加算)。ヘッダを掴んで移動。
+const sphereFloatOffset = ref({ x: 0, y: 0 });
+const sphereFloatFinalPos = computed<{ x: number; y: number } | null>(() => {
+  const p = sphereFloatPos.value;
+  if (!p) return null;
+  return { x: p.x + sphereFloatOffset.value.x, y: p.y + sphereFloatOffset.value.y };
+});
+let sphereDrag: { sx: number; sy: number; ox: number; oy: number } | null = null;
+const onSphereFloatDragMove = (e: MouseEvent) => {
+  if (!sphereDrag) return;
+  sphereFloatOffset.value = {
+    x: sphereDrag.ox + (e.clientX - sphereDrag.sx),
+    y: sphereDrag.oy + (e.clientY - sphereDrag.sy),
+  };
+};
+const onSphereFloatDragEnd = () => {
+  sphereDrag = null;
+  window.removeEventListener('mousemove', onSphereFloatDragMove);
+  window.removeEventListener('mouseup', onSphereFloatDragEnd);
+};
+const onSphereFloatDragStart = (e: MouseEvent) => {
+  e.preventDefault();
+  sphereDrag = { sx: e.clientX, sy: e.clientY, ox: sphereFloatOffset.value.x, oy: sphereFloatOffset.value.y };
+  window.addEventListener('mousemove', onSphereFloatDragMove);
+  window.addEventListener('mouseup', onSphereFloatDragEnd);
+};
+
 const show = () => {
   if (imb.value == null) return;
   for (let i=0; i<imb.value.length; i++){
@@ -4328,7 +4405,7 @@ const drawAnnotationOverlays = (i: number) => {
     const pxPerMmX = 1 / Math.max(a.vecx.length(), 1e-6);
     const pxPerMmY = 1 / Math.max(a.vecy.length(), 1e-6);
     imb.value![i].drawBrushCursorOverlay(
-      brushCursor.value.x, brushCursor.value.y, rMm * pxPerMmX, rMm * pxPerMmY, segStore.brushMode,
+      brushCursor.value.x, brushCursor.value.y, rMm * pxPerMmX, rMm * pxPerMmY, 'add',
     );
   }
 };
@@ -6035,6 +6112,31 @@ defineExpose({
       :show="debugShow"
     />
 
+    <!-- Sphere VOI stats: 画像中の ROI 近傍に浮かせる (voxel inspector と同様)。ヘッダでドラッグ移動可。 -->
+    <div
+      v-if="sphereFloatFinalPos && segStore.sphere"
+      class="mv-sphere-float"
+      :style="{ left: sphereFloatFinalPos.x + 'px', top: sphereFloatFinalPos.y + 'px' }"
+    >
+      <div class="mv-sphere-float-hdr" @mousedown="onSphereFloatDragStart" title="Drag to move">
+        <v-icon icon="mdi-drag" size="x-small" class="mr-1" />
+        Sphere VOI
+        <v-btn
+          icon="mdi-close" size="x-small" variant="text" density="compact" class="ml-auto"
+          title="Clear sphere VOI"
+          @mousedown.stop
+          @click="segStore.clearSphere(); sphereFloatOffset = { x: 0, y: 0 }; show()"
+        />
+      </div>
+      <div class="mv-sphere-float-max">
+        <span class="lbl">SUVmax</span>
+        <span class="val">{{ segStore.sphere.suvMax.toFixed(3) }}</span>
+      </div>
+      <div class="mv-sphere-float-row"><span>SUVmean</span><span class="mono">{{ segStore.sphere.suvMean.toFixed(3) }}</span></div>
+      <div class="mv-sphere-float-row"><span>radius</span><span class="mono">{{ segStore.sphere.radiusMm.toFixed(1) }} mm</span></div>
+      <div class="mv-sphere-float-row"><span>voxels</span><span class="mono">{{ segStore.sphere.voxelCount }}</span></div>
+    </div>
+
     <!-- Debug: indicator badge (画面右下) -->
     <div v-if="debugMode" class="mv-debug-badge">
       <v-icon icon="mdi-bug" size="x-small" />
@@ -6196,6 +6298,66 @@ defineExpose({
 /* drawer 内のテキストが上端で見切れないよう */
 :deep(.v-navigation-drawer__content) {
   padding-top: 0;
+}
+
+.mv-sphere-float {
+  position: fixed;
+  z-index: 9997;
+  min-width: 130px;
+  padding: 5px 8px 6px;
+  background: rgba(15, 20, 25, 0.94);
+  border: 1px solid var(--mv-accent-dim, #1f6f5f);
+  border-radius: 5px;
+  color: var(--mv-text);
+  font-size: 11px;
+  box-shadow: var(--mv-shadow, 0 4px 16px rgba(0,0,0,0.4));
+  backdrop-filter: blur(3px);
+  pointer-events: auto;
+}
+.mv-sphere-float-hdr {
+  display: flex;
+  align-items: center;
+  color: var(--mv-accent);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 3px;
+  cursor: move;
+  user-select: none;
+}
+.mv-sphere-float-max {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid var(--mv-border);
+  padding-bottom: 3px;
+  margin-bottom: 3px;
+}
+.mv-sphere-float-max .lbl {
+  font-size: 11px;
+  color: var(--mv-text-muted);
+  letter-spacing: 0.02em;
+}
+.mv-sphere-float-max .val {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--mv-accent);
+  line-height: 1;
+}
+.mv-sphere-float-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--mv-text-muted);
+  line-height: 1.5;
+}
+.mv-sphere-float-row .mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--mv-text);
 }
 
 .mv-debug-badge {

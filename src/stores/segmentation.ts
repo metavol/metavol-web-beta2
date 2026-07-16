@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import type { Volume } from '../components/Volume';
 import { connectedComponents26, floodFillAssignLabel, extractCtBodyMask, sphereStatsInPet } from '../components/segmentation/maskOps';
 import { writeNiftiUint16, triggerDownload } from '../components/segmentation/niftiWriter';
+import { evictVolumeTexture } from '../components/webgpu/volumeCache';
 
 export interface LabelEntry {
     id: number;
@@ -465,6 +466,38 @@ export const useSegmentationStore = defineStore('segmentation', {
         // Polygon 確定後など外部から手動編集が入った直後に呼ぶ
         markManualEditsChanged() {
             this.invalidateComponentMap();
+        },
+
+        // SUV 減衰補正モードの切替 ('voxbase' = 整数秒/Vox-BASE 一致 / 'precise' = 小数秒)。
+        // voxel は現モードの factor 済みなので、目標 factor との定数比で PET voxel を rescale する。
+        // GPU texture を evict して再アップロードさせ、cached な SUV stats も同じ比で更新する。
+        setSuvMode(mode: 'voxbase' | 'precise') {
+            const v = this.petVolumeRef;
+            const md = v?.metadata;
+            if (!v || !md || md.suvFactorVoxBase == null || md.suvFactorPrecise == null) return;
+            if (md.suvMode === mode) return;
+            const target = mode === 'precise' ? md.suvFactorPrecise : md.suvFactorVoxBase;
+            const current = md.suvFactor ?? md.suvFactorVoxBase;
+            if (!target || !current || target <= 0 || current <= 0) return;
+            const ratio = target / current;
+            if (Number.isFinite(ratio) && Math.abs(ratio - 1) > 1e-15) {
+                const vox = v.voxel;
+                for (let i = 0; i < vox.length; i++) vox[i] *= ratio;
+                evictVolumeTexture(vox);   // GPU 3D texture を再アップロード強制
+                // 再測定不要で即反映されるよう、保持済み SUV stats も同比で rescale。
+                if (this.sphere) {
+                    this.sphere.suvMax *= ratio;
+                    this.sphere.suvMean *= ratio;
+                    this.sphere.suvStd *= ratio;
+                }
+                for (const k of ['liver', 'bloodPool'] as const) {
+                    const rs = this.referenceSpheres[k];
+                    if (rs) { rs.suvMean *= ratio; rs.suvStd *= ratio; }
+                }
+            }
+            md.suvFactor = target;
+            md.suvMode = mode;
+            this.maskVersion++;   // lesion table / histogram を再計算させる
         },
 
         // ===== 編集履歴 (undo / redo) =====

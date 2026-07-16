@@ -73,6 +73,31 @@ src/
 
 ## 重要な設計上の前提
 
+### SUV 計算と Vox-BASE 照合 (2026-07)
+- SUV factor は `dicom2volume.ts` の `getSuvFactor` で決定。BQML 経路の式:
+  `dose_at_ref = TotalDose(0018,1074) × 2^(-Δt/half-life)`, `factor = BW[kg]×1000 / dose_at_ref`,
+  `SUV = voxel[Bq/ml] × factor`。**この式自体は Vox-BASE と一致**している。
+- 減衰補正の Δt = `acq_dt − inj_dt`:
+  - `inj_dt` = `getInjectionDateTime`: **(0018,1078) RadiopharmaceuticalStartDateTime 優先**、無ければ
+    (0018,1072) StartTime + acq date。**Vox-BASE は (0018,1072) を使う**ので、両タグが食い違う DICOM では差が出る。
+  - `acq_dt` = `findEarliestAcquisitionDateTime`: 全 slice の {(0008,002a) / (0008,0022+0032) /
+    (0008,0021+0031 SeriesTime)} の**最小**。Vox-BASE は (0008,0032) AcquisitionTime を「補正時刻」に使う。
+- **Vox-BASE 照合の残差 → 整数秒切り捨てで解決 (2026-07)**: Biograph 症例で SUV が Vox-BASE 比 +0.006%
+  (喉頭 16.898 vs 16.897、膀胱 195.924 vs 195.913) 系統的に高かった。原因は **AcquisitionTime の小数秒**
+  (…56.53s)。Vox-BASE は整数秒 (Δt=3836s) で減衰計算、Metavol は小数秒 (Δt=3836.5s) を使っていた差。
+  → `tryBqmlSuvFactor` は **2 通りの factor を計算**する: `factor` (整数秒切り捨て = voxBase, 既定) と
+  `factorPrecise` (小数秒)。voxel は voxBase で bake。Δt=3836s で dose@corr=185124699.252 /
+  slope=0.000394328797 となり Vox-BASE と **12桁一致**。
+- **SUV mode トグル (voxbase / precise)**: SUVbw details パネル内に「Decay time: Vox-BASE / Precise」トグル。
+  `store.setSuvMode(mode)` が PET voxel を factor 比で rescale + `evictVolumeTexture` で GPU 再upload +
+  sphere/referenceSphere の cached SUV stats も同比で更新 + maskVersion bump (lesion table 再計算)。
+  metadata に `suvFactorVoxBase` / `suvFactorPrecise` / `suvMode` を保持。既定は voxBase (一般ユーザ向け)。
+  小数秒の差が実在する BQML 症例でのみトグル表示 (両 factor が一致するときは非表示)。
+  panel の dose@corr / decayFactor / Δt は現 `suvFactor` から逆算するので mode を反映する。
+- 検証手段: 右 Inspector の緑チェック行「SUVbw (DICOM BQML)」を**クリックで展開** → SUV details に
+  **Inj/Acq time・Δt・Decay factor・Dose@corr・SUV slope** を表示 (Vox-BASE ダイアログと直接照合可能)。
+  SUV 表示は全て小数**3桁**。SUV factor 逆算 `doseAtRefBq = BW×1000/suvFactor` は BQML 経路のみ表示。
+
 ### Volume の幾何
 - 物理座標（mm）の原点 = `imagePosition` (DICOM ImagePositionPatient)。
 - `vectorX/Y/Z` は **「voxel index 1 進むと world で何 mm 進むか」** の3Dベクトル。
@@ -203,10 +228,27 @@ Persona 1 (MTV 測定) の動線に沿って、既定は 4 ステップの一本
 - History のクリック可能タイムラインは Advanced に格納 (undo/redo は app-bar と Ctrl+Z/Ctrl+Shift+Z に常設)。
 
 使用頻度の低い機能は削除せず **Advanced トグル** (`showAdvanced` ref, localStorage 記憶) に格納:
-threshold method (PERCIST/Deauville/%max/%liver) + reference sphere、Sphere ROI、Labels 編集、
-Histogram + radiomics、Find islands、Rectangle ROI。各セクションの `<section>` に `v-if="showAdvanced"`
-(polygon/brush は `activeSegTool` との OR) を付けて出し入れする。ステップ見出しは `.mv-step-head`。
+threshold method (PERCIST/Deauville/%max/%liver) + reference sphere、Sphere ROI、Labels 編集の一部、
+Find islands、Rectangle ROI。ステップ見出しは `.mv-step-head`。
 **新セクションを足すときは「① 主要フローか / Advanced か」を必ず判断し、後者は `v-if="showAdvanced"` で畳む。**
+
+**パネルは 3 段 flex (2026-07 更新)**: `.mv-seg-panel { display:flex; flex-direction:column; height:100% }` で
+`.mv-seg-head` (常時表示: PT/SUV 状態 + Overlay mask/opacity バー、`flex:0 0 auto`) /
+`.mv-seg-body` (スクロール、`flex:1; overflow-y:auto`) / `.mv-seg-foot` (常時表示: Save NIfTI/.mvs/… メニュー) の
+sticky レイアウト。よく使う保存と mask opacity は常に見える。
+- **③ は Statistics** に改称。ラベル単位 (Labels 体積表) と病変単位 (Lesions MTV/TLG 表) の**両テーブル + Histogram** を格納。
+- **Histogram は病変単位**: Lesion table の行クリックで選択 (`selectedLesion`) → その 26-連結成分の SUV 分布
+  (`collectComponentSuv` を SUVmax voxel を seed に flood)。ラベル単位の全 voxel 分布は廃止。
+- **Add/Erase は廃止**: polygon/brush/assign は「選択ラベルへの塗り替え (既存ラベル voxel のみ)」専用。
+  voxel を消すのは Save メニューの Clear edits。brush radius は Refine の brush 選択時のみ表示 (ボタン近傍)。
+- History はデフォルト畳んだ expander (`showHistoryList`)。undo/redo は header に常時。
+- Sphere ROI: 最小半径 **5mm** (`DicomView` wheel clamp)。**stats は右サイドバーではなく画像中の ROI 近傍に
+  フローティング表示** (`.mv-sphere-float`、voxel inspector と同様)。位置は `sphereScreenInBox`/`sphereFloatPos`
+  computed が drawAnnotationOverlays の球輪郭中心と同じ式で算出 (選択 box 優先、boxStateVersion で追従)。
+  SUVmax を大きく、SUVmean/radius/voxels + Clear を表示。サイドバーの Sphere ROI(Advanced) は説明のみ。
+- Refine の編集ツール hint は常時表示せず **hover の v-tooltip** (`.mv-tool-toggle-wrap` + activator="parent")。
+- **単位は ml** (旧 cc)。lesion table MTV/ml・SUVpeak 1ml、Labels 体積 ml、CSV/PDF ヘッダも ml。
+- `jumpToWorld` は未初期化 box (centerInWorld なし) を skip する防御を追加 (lesion 行クリック時の crash 防止)。
 
 ---
 

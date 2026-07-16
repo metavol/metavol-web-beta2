@@ -634,7 +634,7 @@
               <strong>Segmentation work</strong> (mask, labels, lesion table)
             </li>
             <li v-if="closeAllSummary.hasSphere">
-              Sphere ROI
+              Sphere VOI
             </li>
           </ul>
           <p v-if="closeAllSummary.hasMask || closeAllSummary.hasSphere" class="text-warning text-caption mt-2">
@@ -800,7 +800,7 @@ const tools = [
   { value: 'pan',        icon: 'mdi-hand-back-right-outline', label: 'Pan' },
   { value: 'zoom',       icon: 'mdi-magnify-plus-outline',  label: 'Zoom' },
   { value: 'page',       icon: 'mdi-arrow-up-down',         label: 'Page' },
-  { value: 'sphereROI',  icon: 'mdi-circle-outline',        label: 'Sphere ROI' },
+  { value: 'sphereROI',  icon: 'mdi-circle-outline',        label: 'Sphere VOI' },
   { value: 'rectROI',    icon: 'mdi-rectangle-outline',     label: 'Rectangle ROI' },
   { value: 'polygonROI', icon: 'mdi-pentagon-outline',      label: 'Polygon ROI' },
   { value: 'brushROI',   icon: 'mdi-brush',                 label: 'Brush (paint/erase voxels)' },

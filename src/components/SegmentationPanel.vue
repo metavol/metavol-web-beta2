@@ -3,7 +3,8 @@ import { computed, ref, onMounted, onUnmounted } from 'vue';
 import * as THREE from 'three';
 import { useSegmentationStore } from '../stores/segmentation';
 import { readNiftiMask } from './segmentation/niftiReader';
-import { summarizeLesions, type LesionStat } from './segmentation/maskOps';
+import { summarizeLesions, collectComponentSuv, type LesionStat } from './segmentation/maskOps';
+import { worldToVoxel } from './Volume';
 import { triggerDownload } from './segmentation/niftiWriter';
 import { getSuvSanityWarnings, getSuvMetadataSummary } from './suvSanity';
 // MR-PET registration の handler は App.vue (☰ Preprocessing) に移管済みのため import 不要
@@ -137,38 +138,41 @@ const relTime = (ts: number): string => {
 // 現在ラベルの PET 値ヒストグラム。
 // finalMask 全 voxel をスキャン (maskVersion 依存) → label に該当する voxel の PET 値を bin 集計。
 const HIST_BINS = 30;
-const labelHistogram = computed(() => {
-    void store.maskVersion; // reactivity 依存
-    const id = store.currentLabelId;
+// 選択中の病変 (Lesion table の行クリックで設定)。componentId で識別。
+const selectedLesion = ref<LesionStat | null>(null);
+const selectedLesionColorCss = computed(() => {
+    const l = selectedLesion.value;
+    const lab = l ? store.labelById(l.labelId) : null;
+    return lab ? `rgb(${lab.color[0]},${lab.color[1]},${lab.color[2]})` : 'var(--mv-accent)';
+});
+const onSelectLesion = (l: LesionStat) => {
+    selectedLesion.value = l;
+    onJumpToLesion(l);   // 選択と同時に crosshair もジャンプ
+};
+
+// 選択病変 (26-連結成分) の SUV ヒストグラム。ラベル単位ではなく病変単位。
+const lesionHistogram = computed(() => {
+    void store.maskVersion;
+    const l = selectedLesion.value;
     const pet = store.petVolumeRef;
     const mask = store.finalMask;
-    if (!pet || !mask) return null;
-    const pix = pet.voxel;
+    if (!l || !pet || !mask) return null;
+    // 病変の SUVmax voxel を seed に、その連結成分の全 SUV を集める。
+    const vc = worldToVoxel(new THREE.Vector3(l.suvMaxWorld[0], l.suvMaxWorld[1], l.suvMaxWorld[2]), pet);
+    const seed = { i: Math.round(vc.x), j: Math.round(vc.y), k: Math.round(vc.z) };
+    const vals = collectComponentSuv(mask, pet.voxel, seed, pet.nx, pet.ny, pet.nz);
+    const n = vals.length;
+    if (n === 0) return { count: 0, min: 0, max: 0, mean: 0, std: 0, counts: [] as number[], lo: 0, hi: 0, binWidth: 0, peak: 0 };
 
-    let mn = Infinity, mx = -Infinity, sum = 0, sumSq = 0, n = 0;
-    for (let i = 0; i < mask.length; i++) {
-        if (mask[i] !== id) continue;
-        const v = pix[i];
-        if (v < mn) mn = v;
-        if (v > mx) mx = v;
-        sum += v;
-        sumSq += v * v;
-        n++;
-    }
-    if (n === 0) {
-        return { count: 0, min: 0, max: 0, mean: 0, std: 0, counts: [] as number[], lo: 0, hi: 0, binWidth: 0, peak: 0 };
-    }
+    let mn = Infinity, mx = -Infinity, sum = 0, sumSq = 0;
+    for (const v of vals) { if (v < mn) mn = v; if (v > mx) mx = v; sum += v; sumSq += v * v; }
     const mean = sum / n;
-    const variance = Math.max(0, sumSq / n - mean * mean);
-    const std = Math.sqrt(variance);
-
+    const std = Math.sqrt(Math.max(0, sumSq / n - mean * mean));
     const lo = 0;
     const hi = mx > lo ? mx : lo + 1;
     const binWidth = (hi - lo) / HIST_BINS;
     const counts = new Array<number>(HIST_BINS).fill(0);
-    for (let i = 0; i < mask.length; i++) {
-        if (mask[i] !== id) continue;
-        const v = pix[i];
+    for (const v of vals) {
         let bi = Math.floor((v - lo) / binWidth);
         if (bi < 0) bi = 0;
         if (bi >= HIST_BINS) bi = HIST_BINS - 1;
@@ -176,7 +180,6 @@ const labelHistogram = computed(() => {
     }
     let peak = 0;
     for (const c of counts) if (c > peak) peak = c;
-
     return { count: n, min: mn, max: mx, mean, std, counts, lo, hi, binWidth, peak };
 });
 
@@ -647,7 +650,7 @@ const onExportLesionCsv = () => {
     if (rows.length === 0) return;
     const esc = (s: string) => `"${s.replace(/"/g, '""')}"`;
     const headers = [
-        '#', 'Label', 'SUVmax', 'SUVpeak_1cc', 'SUVmean', 'MTV_cc', 'TLG',
+        '#', 'Label', 'SUVmax', 'SUVpeak_1ml', 'SUVmean', 'MTV_ml', 'TLG',
         'VoxelCount',
         'Centroid_x_mm', 'Centroid_y_mm', 'Centroid_z_mm',
         'SUVmax_x_mm', 'SUVmax_y_mm', 'SUVmax_z_mm',
@@ -793,7 +796,7 @@ const onExportRadiomicsCsv = async () => {
         }
         // CSV: 1 行 = 1 ラベル × 全 features
         const headers = [
-            'label_id', 'label_name', 'voxel_count', 'volume_cc',
+            'label_id', 'label_name', 'voxel_count', 'volume_ml',
             // first-order
             'min', 'max', 'mean', 'std', 'median',
             'p10', 'p25', 'p75', 'p90',
@@ -918,7 +921,16 @@ const suvSanityHasWarn = computed(() => suvSanityWarnings.value.some(w => w.seve
 
 // "Details" 展開トグル (主要メタ値の表示)
 const showSuvDetails = ref(false);
-const suvMetaSummary = computed(() => getSuvMetadataSummary(store.petVolumeRef));
+const suvMetaSummary = computed(() => {
+    void store.maskVersion; // SUV mode 切替 (maskVersion bump) で再評価させる
+    return getSuvMetadataSummary(store.petVolumeRef);
+});
+// SUV 減衰補正モード切替 (voxbase=Vox-BASE一致 / precise=小数秒でより正確)
+const onSuvModeChange = (m: 'voxbase' | 'precise' | null | undefined) => {
+    if (m !== 'voxbase' && m !== 'precise') return;
+    store.setSuvMode(m);
+    emit('redraw');
+};
 const fmtN = (v: number | null, dp: number = 1, suffix = ''): string => {
     if (v == null || !Number.isFinite(v)) return '—';
     return v.toFixed(dp) + suffix;
@@ -929,22 +941,13 @@ const fmtIso = (s: string | null): string => {
     return s.replace('T', ' ').replace(/\.\d+Z?$/, '');
 };
 
-const polygonModeProxy = computed({
-    get: () => store.polygon?.mode ?? store.defaultPolygonMode,
-    set: (m: 'add' | 'erase') => {
-        store.defaultPolygonMode = m;
-        if (store.polygon) store.polygon.mode = m;
-    },
-});
-
-const brushModeProxy = computed({
-    get: () => store.brushMode,
-    set: (m: 'add' | 'erase') => { store.brushMode = m; },
-});
+// Add/Erase 廃止に伴い polygonMode/brushMode proxy は撤去。brush radius のみ残す。
 const brushRadiusProxy = computed({
     get: () => store.brushRadiusMm,
     set: (r: number) => { store.brushRadiusMm = r; },
 });
+// History リストの開閉 (普段は畳む expander)。
+const showHistoryList = ref<boolean>(false);
 </script>
 
 <template>
@@ -1006,6 +1009,8 @@ const brushRadiusProxy = computed({
         </div>
 
         <template v-else>
+            <!-- ===== 常時表示ヘッダ (スクロールしない): PT/SUV 状態 + Overlay(mask/opacity) ===== -->
+            <div class="mv-seg-head">
             <!-- Linked PT info: ★4 -->
             <div v-if="store.petVolumeRef" class="mv-linked-pt">
                 <v-icon icon="mdi-link-variant" size="x-small" class="mr-1" />
@@ -1024,9 +1029,15 @@ const brushRadiusProxy = computed({
                     <span class="mv-suv-reason">Reason: {{ suvWarning.reason }}</span>
                 </div>
             </div>
-            <div v-else-if="suvOkLabel" class="mv-suv-ok" :title="`source: ${store.petVolumeRef?.metadata?.suvSource}`">
+            <div
+                v-else-if="suvOkLabel"
+                class="mv-suv-ok mv-suv-ok-clickable"
+                :title="`source: ${store.petVolumeRef?.metadata?.suvSource} — click to show/hide SUV calc details`"
+                @click="showSuvDetails = !showSuvDetails"
+            >
                 <v-icon icon="mdi-check-circle-outline" size="x-small" class="mr-1" />
                 {{ suvOkLabel }}
+                <v-icon :icon="showSuvDetails ? 'mdi-chevron-up' : 'mdi-chevron-down'" size="x-small" class="ml-auto" />
             </div>
 
             <!-- SUV metadata sanity warnings -->
@@ -1070,6 +1081,23 @@ const brushRadiusProxy = computed({
 
             <!-- SUV metadata details (always available, expanded with sanity panel) -->
             <div v-if="store.petVolumeRef?.metadata?.modality === 'PT' && showSuvDetails" class="mv-suv-details">
+                <!-- SUV 減衰補正モード切替 (BQML で 2 モードの factor が異なるときのみ) -->
+                <div v-if="suvMetaSummary.suvMode" class="mv-suv-mode-row">
+                    <span class="mv-suv-mode-label">Decay time</span>
+                    <v-btn-toggle
+                        :model-value="suvMetaSummary.suvMode"
+                        @update:model-value="onSuvModeChange"
+                        density="compact"
+                        mandatory
+                        color="primary"
+                        variant="outlined"
+                        divided
+                        class="mv-suv-mode-toggle"
+                    >
+                        <v-btn value="voxbase" size="x-small" title="整数秒に切り捨て (Vox-BASE と一致)。一般ユーザ向け既定。">Vox-BASE</v-btn>
+                        <v-btn value="precise" size="x-small" title="小数秒まで使用 (物理的により正確)。">Precise</v-btn>
+                    </v-btn-toggle>
+                </div>
                 <div class="mv-suv-details-row">
                     <span>BW</span>
                     <span class="mv-mono">{{ fmtN(suvMetaSummary.patientWeightKg, 1, ' kg') }}</span>
@@ -1083,16 +1111,24 @@ const brushRadiusProxy = computed({
                     <span class="mv-mono">{{ fmtN(suvMetaSummary.halfLifeMin, 1, ' min') }}</span>
                 </div>
                 <div class="mv-suv-details-row">
-                    <span>Uptake</span>
-                    <span class="mv-mono">{{ fmtN(suvMetaSummary.uptakeMin, 0, ' min') }}</span>
-                </div>
-                <div class="mv-suv-details-row">
                     <span>Inj. time</span>
                     <span class="mv-mono">{{ fmtIso(suvMetaSummary.injectionDateTime) }}</span>
                 </div>
                 <div class="mv-suv-details-row">
-                    <span>Acq. time</span>
+                    <span>Acq. time (corr.)</span>
                     <span class="mv-mono">{{ fmtIso(suvMetaSummary.acquisitionDateTime) }}</span>
+                </div>
+                <div class="mv-suv-details-row">
+                    <span>Δt inj→acq</span>
+                    <span class="mv-mono">{{ suvMetaSummary.uptakeSec != null ? suvMetaSummary.uptakeSec.toFixed(0) + ' s' : '—' }}</span>
+                </div>
+                <div v-if="suvMetaSummary.decayFactor != null" class="mv-suv-details-row">
+                    <span>Decay factor</span>
+                    <span class="mv-mono">{{ suvMetaSummary.decayFactor.toPrecision(9) }}</span>
+                </div>
+                <div v-if="suvMetaSummary.doseAtRefBq != null" class="mv-suv-details-row" title="Vox-BASE: 補正時刻に減衰補正した総投与量">
+                    <span>Dose @ corr.</span>
+                    <span class="mv-mono">{{ suvMetaSummary.doseAtRefBq.toFixed(1) }} Bq</span>
                 </div>
                 <div class="mv-suv-details-row">
                     <span>Decay corr.</span>
@@ -1102,9 +1138,13 @@ const brushRadiusProxy = computed({
                     <span>Units</span>
                     <span class="mv-mono">{{ suvMetaSummary.units ?? '—' }}</span>
                 </div>
+                <div class="mv-suv-details-row" title="Vox-BASE: 体重によるSUVのためのリスケール傾斜">
+                    <span>SUV slope</span>
+                    <span class="mv-mono">{{ suvMetaSummary.suvFactor != null ? suvMetaSummary.suvFactor.toPrecision(9) : '—' }}</span>
+                </div>
                 <div class="mv-suv-details-row">
-                    <span>SUV factor</span>
-                    <span class="mv-mono">{{ fmtN(suvMetaSummary.suvFactor, 6) }}</span>
+                    <span>SUV source</span>
+                    <span class="mv-mono">{{ suvMetaSummary.suvSource ?? '—' }}</span>
                 </div>
             </div>
 
@@ -1136,7 +1176,10 @@ const brushRadiusProxy = computed({
                 />
                 <span class="mv-mono mv-overlay-pct">{{ (store.overlayAlpha * 100).toFixed(0) }}%</span>
             </div>
+            </div><!-- /mv-seg-head -->
 
+            <!-- ===== スクロールする本体 ===== -->
+            <div class="mv-seg-body">
             <!-- ① Segment: 閾値でまるごと seg -->
             <div class="mv-step-head"><span class="mv-step-num">1</span>Segment</div>
             <section class="mv-section">
@@ -1202,7 +1245,7 @@ const brushRadiusProxy = computed({
                         />
                         <span class="mv-ref-label">Liver</span>
                         <span v-if="store.referenceSpheres.liver" class="mv-mono mv-ref-stats">
-                            {{ store.referenceSpheres.liver.suvMean.toFixed(2) }} ± {{ store.referenceSpheres.liver.suvStd.toFixed(2) }}
+                            {{ store.referenceSpheres.liver.suvMean.toFixed(3) }} ± {{ store.referenceSpheres.liver.suvStd.toFixed(3) }}
                         </span>
                         <v-btn
                             size="x-small"
@@ -1222,7 +1265,7 @@ const brushRadiusProxy = computed({
                         />
                         <span class="mv-ref-label">Blood pool</span>
                         <span v-if="store.referenceSpheres.bloodPool" class="mv-mono mv-ref-stats">
-                            {{ store.referenceSpheres.bloodPool.suvMean.toFixed(2) }} ± {{ store.referenceSpheres.bloodPool.suvStd.toFixed(2) }}
+                            {{ store.referenceSpheres.bloodPool.suvMean.toFixed(3) }} ± {{ store.referenceSpheres.bloodPool.suvStd.toFixed(3) }}
                         </span>
                         <v-btn
                             size="x-small"
@@ -1235,7 +1278,7 @@ const brushRadiusProxy = computed({
                         </v-btn>
                     </div>
                     <div v-if="store.referencePlacementMode" class="mv-hint mt-1" style="color: var(--mv-warning, #FFB454)">
-                        Use the Sphere ROI tool and click on the {{ store.referencePlacementMode === 'liver' ? 'right liver lobe' : 'descending aorta' }} (any Volume box).
+                        Use the Sphere VOI tool and click on the {{ store.referencePlacementMode === 'liver' ? 'right liver lobe' : 'descending aorta' }} (any Volume box).
                     </div>
                 </div>
                 </template>
@@ -1309,48 +1352,64 @@ const brushRadiusProxy = computed({
                         </v-list-item>
                     </v-list>
                 </v-menu>
-                <!-- 編集ツール: Assign / Polygon / Brush を同列に。上のラベルへ書き込む。 -->
-                <v-btn-toggle
-                    :model-value="activeSegTool"
-                    @update:model-value="onSegToolToggle"
-                    density="compact"
-                    color="primary"
-                    variant="outlined"
-                    divided
-                    class="mv-tool-toggle mt-2"
-                >
-                    <v-btn value="assignLabel" size="small">
-                        <v-icon icon="mdi-tag-outline" size="small" class="mr-1" />Assign
-                    </v-btn>
-                    <v-btn value="polygonROI" size="small">
-                        <v-icon icon="mdi-vector-polygon" size="small" class="mr-1" />Polygon
-                    </v-btn>
-                    <v-btn value="brushROI" size="small">
-                        <v-icon icon="mdi-brush" size="small" class="mr-1" />Brush
-                    </v-btn>
-                </v-btn-toggle>
-                <div class="mv-hint mt-1">
-                    <template v-if="activeSegTool === 'assignLabel'">
-                        Click a lesion on any Volume box to label its whole 3D island as {{ currentLabelName }}.
-                    </template>
-                    <template v-else-if="activeSegTool === 'polygonROI'">
-                        Left click = vertex, right / double click = finish. Fills the drawn slice as {{ currentLabelName }} (see Polygon ROI for Add / Erase).
-                    </template>
-                    <template v-else-if="activeSegTool === 'brushROI'">
-                        Drag on a Volume slice to paint {{ currentLabelName }} (see Voxel Brush for radius and Paint / Erase).
-                    </template>
-                    <template v-else>
-                        Pick a tool, then edit on any Volume box. All tools write into the label selected above.
-                    </template>
+                <!-- 編集ツール: Assign / Polygon / Brush を同列に。使い方はホバーで tooltip 表示。 -->
+                <div class="mv-tool-toggle-wrap mt-2">
+                    <v-btn-toggle
+                        :model-value="activeSegTool"
+                        @update:model-value="onSegToolToggle"
+                        density="compact"
+                        color="primary"
+                        variant="outlined"
+                        divided
+                        class="mv-tool-toggle"
+                    >
+                        <v-btn value="assignLabel" size="small">
+                            <v-icon icon="mdi-tag-outline" size="small" class="mr-1" />Assign
+                        </v-btn>
+                        <v-btn value="polygonROI" size="small">
+                            <v-icon icon="mdi-vector-polygon" size="small" class="mr-1" />Polygon
+                        </v-btn>
+                        <v-btn value="brushROI" size="small">
+                            <v-icon icon="mdi-brush" size="small" class="mr-1" />Brush
+                        </v-btn>
+                    </v-btn-toggle>
+                    <v-tooltip activator="parent" location="bottom" open-delay="250" max-width="260">
+                        <template v-if="activeSegTool === 'assignLabel'">
+                            Click a lesion on any Volume box to label its whole 3D island as {{ currentLabelName }}.
+                        </template>
+                        <template v-else-if="activeSegTool === 'polygonROI'">
+                            Left click = vertex, right / double click = finish. Relabels the drawn area to {{ currentLabelName }}.
+                        </template>
+                        <template v-else-if="activeSegTool === 'brushROI'">
+                            Drag on a Volume slice to relabel to {{ currentLabelName }}.
+                        </template>
+                        <template v-else>
+                            Pick a tool, then edit on any Volume box. Tools relabel existing mask voxels to the label above.
+                        </template>
+                    </v-tooltip>
                 </div>
+
+                <!-- Brush radius: brush ツール選択時のみ表示 (ボタン近傍に配置) -->
+                <template v-if="activeSegTool === 'brushROI'">
+                    <div class="mv-row-label mt-2">
+                        <span>Brush radius</span>
+                        <span class="mv-mono">{{ brushRadiusProxy.toFixed(0) }} mm</span>
+                    </div>
+                    <v-slider
+                        v-model="brushRadiusProxy"
+                        :min="1" :max="30" :step="1"
+                        density="compact" hide-details color="primary" track-color="surface-light"
+                    />
+                </template>
             </section>
 
-            <!-- History (undo / redo / jump) — Advanced。undo/redo は app-bar と Ctrl+Z/Ctrl+Shift+Z にも。 -->
-            <section v-if="showAdvanced" class="mv-section">
-                <div class="mv-section-title">
+            <!-- History: 普段は畳んで expander。undo/redo は header に常時表示。 -->
+            <section class="mv-section">
+                <div class="mv-section-title mv-history-head" @click="showHistoryList = !showHistoryList">
                     <v-icon icon="mdi-history" size="x-small" />
                     History
-                    <div class="mv-history-actions">
+                    <span v-if="historyTimeline.length" class="mv-section-count">{{ historyTimeline.length }}</span>
+                    <div class="mv-history-actions" @click.stop>
                         <v-btn size="x-small" variant="text" icon :disabled="!store.canUndo" @click="onUndo" title="Undo (Ctrl+Z)">
                             <v-icon icon="mdi-undo" size="small" />
                         </v-btn>
@@ -1358,137 +1417,58 @@ const brushRadiusProxy = computed({
                             <v-icon icon="mdi-redo" size="small" />
                         </v-btn>
                     </div>
+                    <v-icon :icon="showHistoryList ? 'mdi-chevron-up' : 'mdi-chevron-down'" size="x-small" class="ml-1" />
                 </div>
-                <div v-if="historyTimeline.length === 0" class="mv-hint">
-                    No edits yet. Apply threshold, paint, or assign to build history.
-                </div>
-                <div v-else class="mv-history-list">
-                    <div
-                        v-for="(h, t) in historyTimeline"
-                        :key="t"
-                        :class="['mv-history-item', { applied: h.applied, current: t === currentStep }]"
-                        @click="onJumpHistory(t)"
-                        :title="h.applied ? 'Click to undo back to here' : 'Click to redo up to here'"
-                    >
-                        <v-icon
-                            :icon="t === currentStep ? 'mdi-arrow-right-bold' : (h.applied ? 'mdi-circle-small' : 'mdi-circle-outline')"
-                            size="x-small"
-                            class="mv-history-marker"
-                        />
-                        <span class="mv-history-label">{{ h.label }}</span>
-                        <span class="mv-history-time mv-mono">{{ relTime(h.ts) }}</span>
+                <template v-if="showHistoryList">
+                    <div v-if="historyTimeline.length === 0" class="mv-hint">
+                        No edits yet. Apply threshold, paint, or assign to build history.
                     </div>
-                </div>
+                    <div v-else class="mv-history-list">
+                        <div
+                            v-for="(h, t) in historyTimeline"
+                            :key="t"
+                            :class="['mv-history-item', { applied: h.applied, current: t === currentStep }]"
+                            @click="onJumpHistory(t)"
+                            :title="h.applied ? 'Click to undo back to here' : 'Click to redo up to here'"
+                        >
+                            <v-icon
+                                :icon="t === currentStep ? 'mdi-arrow-right-bold' : (h.applied ? 'mdi-circle-small' : 'mdi-circle-outline')"
+                                size="x-small"
+                                class="mv-history-marker"
+                            />
+                            <span class="mv-history-label">{{ h.label }}</span>
+                            <span class="mv-history-time mv-mono">{{ relTime(h.ts) }}</span>
+                        </div>
+                    </div>
+                </template>
             </section>
 
             <!-- Overlay は最上部の 1 行バーへ移動済み (step 共通のため) -->
 
-            <!-- Sphere ROI (Advanced) -->
+            <!-- Sphere ROI (Advanced): stats は画像中の ROI 近傍に浮かせて表示するのでここは説明のみ -->
             <section v-if="showAdvanced" class="mv-section">
                 <div class="mv-section-title">
                     <v-icon icon="mdi-circle-outline" size="x-small" />
-                    Sphere ROI
+                    Sphere VOI
                 </div>
-                <div v-if="store.sphere" class="mv-stats">
-                    <div class="mv-stat-row">
-                        <span class="mv-stat-label">radius</span>
-                        <span class="mv-mono">{{ store.sphere.radiusMm.toFixed(1) }} mm</span>
-                    </div>
-                    <div class="mv-stat-row">
-                        <span class="mv-stat-label">SUVmax</span>
-                        <span class="mv-mono mv-accent">{{ store.sphere.suvMax.toFixed(2) }}</span>
-                    </div>
-                    <div class="mv-stat-row">
-                        <span class="mv-stat-label">SUVmean</span>
-                        <span class="mv-mono">
-                            {{ store.sphere.suvMean.toFixed(2) }}
-                            <span class="mv-stat-dim">± {{ store.sphere.suvStd.toFixed(2) }}</span>
-                        </span>
-                    </div>
-                    <div class="mv-stat-row">
-                        <span class="mv-stat-label">voxels</span>
-                        <span class="mv-mono">{{ store.sphere.voxelCount }}</span>
-                    </div>
+                <div v-if="store.sphere" class="mv-hint">
+                    Stats (SUVmax / mean / radius / voxels) are shown on the image next to the ROI.
                     <v-btn size="x-small" variant="text" class="mt-1" @click="store.clearSphere(); emit('redraw')">
                         <v-icon icon="mdi-close" size="x-small" class="mr-1" />Clear
                     </v-btn>
                 </div>
                 <div v-else class="mv-hint">
-                    Click on any registered Volume box (PT/CT/MR/Fusion) with the Sphere ROI tool.<br>
-                    Wheel inside the sphere to change radius.<br>
-                    <span class="mv-hint-grid">Stats are always sampled from the active PT volume.</span>
+                    Click on any registered Volume box (PT/CT/MR/Fusion) with the Sphere VOI tool.<br>
+                    Wheel inside the sphere to change radius (min 5 mm).<br>
+                    <span class="mv-hint-grid">Stats are sampled from the active PT volume and shown next to the ROI.</span>
                 </div>
             </section>
 
-            <!-- Polygon ROI params: polygon ツール選択時のみ (または Advanced) 表示 -->
-            <section v-if="activeSegTool === 'polygonROI' || showAdvanced" class="mv-section">
-                <div class="mv-section-title">
-                    <v-icon icon="mdi-vector-polygon" size="x-small" />
-                    Polygon ROI
-                </div>
-                <v-btn-toggle
-                    v-model="polygonModeProxy"
-                    density="compact"
-                    mandatory
-                    color="primary"
-                    variant="outlined"
-                    divided
-                >
-                    <v-btn value="add" size="small">
-                        <v-icon icon="mdi-plus" size="small" class="mr-1" />Add
-                    </v-btn>
-                    <v-btn value="erase" size="small">
-                        <v-icon icon="mdi-minus" size="small" class="mr-1" />Erase
-                    </v-btn>
-                </v-btn-toggle>
-                <div class="mv-hint mt-1">
-                    Left click = vertex / Right click or double click = finish<br>
-                    Esc = cancel / Ctrl+Z = undo<br>
-                    <span class="mv-hint-grid">Paint on any registered Volume box (PT/CT/MR/Fusion) — mask is stored on the PET grid.</span>
-                </div>
-            </section>
+            <!-- ③ Statistics: ラベル単位 (Labels) と病変単位 (Lesions) の両テーブル + 病変ヒストグラム -->
+            <div class="mv-step-head"><span class="mv-step-num">3</span>Statistics</div>
 
-            <!-- Voxel Brush params: brush ツール選択時のみ (または Advanced) 表示 -->
-            <section v-if="activeSegTool === 'brushROI' || showAdvanced" class="mv-section">
-                <div class="mv-section-title">
-                    <v-icon icon="mdi-brush" size="x-small" />
-                    Voxel Brush
-                </div>
-                <v-btn-toggle
-                    v-model="brushModeProxy"
-                    density="compact"
-                    mandatory
-                    color="primary"
-                    variant="outlined"
-                    divided
-                >
-                    <v-btn value="add" size="small">
-                        <v-icon icon="mdi-plus" size="small" class="mr-1" />Paint
-                    </v-btn>
-                    <v-btn value="erase" size="small">
-                        <v-icon icon="mdi-minus" size="small" class="mr-1" />Erase
-                    </v-btn>
-                </v-btn-toggle>
-                <div class="mv-row-label mt-2">
-                    <span>Radius</span>
-                    <span class="mv-mono">{{ brushRadiusProxy.toFixed(0) }} mm</span>
-                </div>
-                <v-slider
-                    v-model="brushRadiusProxy"
-                    :min="1" :max="30" :step="1"
-                    density="compact"
-                    hide-details
-                    color="primary"
-                    track-color="surface-light"
-                />
-                <div class="mv-hint mt-1">
-                    Drag on a Volume slice to paint/erase voxels into the current label.<br>
-                    Each stroke is one Ctrl+Z undo. Brush is circular in physical space.
-                </div>
-            </section>
-
-            <!-- Labels (Advanced): 既定 6 ラベルで足りるので通常は畳む。 -->
-            <section v-if="showAdvanced" class="mv-section">
+            <!-- Labels: ラベル単位の体積表 (+ add/remove) -->
+            <section class="mv-section">
                 <div class="mv-section-title">
                     <v-icon icon="mdi-tag-multiple-outline" size="x-small" />
                     Labels
@@ -1503,7 +1483,7 @@ const brushRadiusProxy = computed({
                     >
                         <span class="mv-color-swatch" :style="{ background: row.colorCss }" />
                         <span class="mv-label-name">{{ row.name }}</span>
-                        <span class="mv-mono mv-label-vol">{{ (row.volume_mm3 / 1000).toFixed(1) }} cc · {{ row.count }} vox</span>
+                        <span class="mv-mono mv-label-vol">{{ (row.volume_mm3 / 1000).toFixed(1) }} ml · {{ row.count }} vox</span>
                         <v-btn
                             icon="mdi-close"
                             size="x-small"
@@ -1529,24 +1509,16 @@ const brushRadiusProxy = computed({
                 </div>
             </section>
 
-            <!-- Histogram (per label) — Advanced -->
-            <section v-if="showAdvanced" class="mv-section">
+            <!-- Histogram — 選択病変 (Lesion table の行クリックで選択) の SUV 分布 -->
+            <section v-if="store.finalMask" class="mv-section">
                 <div class="mv-section-title mv-section-title-row">
                     <span>
                         <v-icon icon="mdi-chart-bar" size="x-small" />
-                        Histogram — PET ({{ store.thresholdUnit }})
-                        <span v-if="currentLabel" class="mv-hist-label-name" :style="{ color: currentLabelColorCss }">
-                            {{ currentLabel.name }}
+                        Histogram
+                        <span v-if="selectedLesion" class="mv-hist-label-name" :style="{ color: selectedLesionColorCss }">
+                            #{{ lesionRows.findIndex(r => r.componentId === selectedLesion!.componentId) + 1 }} {{ selectedLesion.labelName }}
                         </span>
                     </span>
-                    <v-btn
-                        size="x-small" variant="text" density="compact"
-                        :disabled="!store.finalMask || store.labels.length === 0"
-                        @click="onExportHistogramCsv"
-                        title="Export histograms for all labels (CSV)"
-                    >
-                        <v-icon icon="mdi-download" size="x-small" class="mr-1" />Hist
-                    </v-btn>
                     <v-btn
                         size="x-small" variant="text" density="compact"
                         :disabled="!store.finalMask || store.labels.length === 0 || radiomicsRunning"
@@ -1558,57 +1530,54 @@ const brushRadiusProxy = computed({
                     </v-btn>
                 </div>
 
-                <template v-if="labelHistogram && labelHistogram.count > 0">
+                <template v-if="lesionHistogram && lesionHistogram.count > 0">
                     <svg
                         class="mv-hist-svg"
                         :viewBox="`0 0 ${HIST_VB_W} ${HIST_VB_H}`"
                         preserveAspectRatio="none"
                     >
-                        <!-- baseline -->
                         <line :x1="0" :y1="HIST_VB_H" :x2="HIST_VB_W" :y2="HIST_VB_H"
                               stroke="var(--mv-border)" stroke-width="0.5" />
-                        <!-- mean line -->
-                        <line v-if="labelHistogram.binWidth > 0"
-                              :x1="((labelHistogram.mean - labelHistogram.lo) / (labelHistogram.hi - labelHistogram.lo)) * HIST_VB_W"
+                        <line v-if="lesionHistogram.binWidth > 0"
+                              :x1="((lesionHistogram.mean - lesionHistogram.lo) / (lesionHistogram.hi - lesionHistogram.lo)) * HIST_VB_W"
                               :y1="0"
-                              :x2="((labelHistogram.mean - labelHistogram.lo) / (labelHistogram.hi - labelHistogram.lo)) * HIST_VB_W"
+                              :x2="((lesionHistogram.mean - lesionHistogram.lo) / (lesionHistogram.hi - lesionHistogram.lo)) * HIST_VB_W"
                               :y2="HIST_VB_H"
                               stroke="var(--mv-text-muted)" stroke-width="0.6" stroke-dasharray="2 2" />
-                        <!-- bars -->
                         <rect
-                            v-for="(c, i) in labelHistogram.counts"
+                            v-for="(c, i) in lesionHistogram.counts"
                             :key="i"
-                            :x="i * (HIST_VB_W / labelHistogram.counts.length) + 0.5"
-                            :y="HIST_VB_H - (c / labelHistogram.peak) * HIST_VB_H"
-                            :width="(HIST_VB_W / labelHistogram.counts.length) - 1"
-                            :height="(c / labelHistogram.peak) * HIST_VB_H"
-                            :fill="currentLabelColorCss"
+                            :x="i * (HIST_VB_W / lesionHistogram.counts.length) + 0.5"
+                            :y="HIST_VB_H - (c / lesionHistogram.peak) * HIST_VB_H"
+                            :width="(HIST_VB_W / lesionHistogram.counts.length) - 1"
+                            :height="(c / lesionHistogram.peak) * HIST_VB_H"
+                            :fill="selectedLesionColorCss"
                         />
                     </svg>
                     <div class="mv-hist-axis">
-                        <span class="mv-mono">{{ labelHistogram.lo.toFixed(1) }}</span>
-                        <span class="mv-mono">{{ labelHistogram.hi.toFixed(1) }}</span>
+                        <span class="mv-mono">{{ lesionHistogram.lo.toFixed(1) }}</span>
+                        <span class="mv-mono">{{ lesionHistogram.hi.toFixed(1) }}</span>
                     </div>
                     <div class="mv-stats mt-1">
                         <div class="mv-stat-row">
                             <span class="mv-stat-label">min / max</span>
-                            <span class="mv-mono">{{ labelHistogram.min.toFixed(2) }} / {{ labelHistogram.max.toFixed(2) }}</span>
+                            <span class="mv-mono">{{ lesionHistogram.min.toFixed(3) }} / {{ lesionHistogram.max.toFixed(3) }}</span>
                         </div>
                         <div class="mv-stat-row">
                             <span class="mv-stat-label">mean</span>
                             <span class="mv-mono">
-                                {{ labelHistogram.mean.toFixed(2) }}
-                                <span class="mv-stat-dim">± {{ labelHistogram.std.toFixed(2) }}</span>
+                                {{ lesionHistogram.mean.toFixed(3) }}
+                                <span class="mv-stat-dim">± {{ lesionHistogram.std.toFixed(3) }}</span>
                             </span>
                         </div>
                         <div class="mv-stat-row">
                             <span class="mv-stat-label">voxels</span>
-                            <span class="mv-mono">{{ labelHistogram.count }}</span>
+                            <span class="mv-mono">{{ lesionHistogram.count }}</span>
                         </div>
                     </div>
                 </template>
                 <div v-else class="mv-hint">
-                    No voxels assigned to the current label yet
+                    Click a lesion row below to show its SUV histogram.
                 </div>
             </section>
 
@@ -1639,9 +1608,7 @@ const brushRadiusProxy = computed({
                 </v-btn>
             </section>
 
-            <!-- ③ Measure: MTV / TLG を読む -->
-            <div v-if="store.finalMask" class="mv-step-head"><span class="mv-step-num">3</span>Measure</div>
-            <!-- Lesion table -->
+            <!-- Lesion table (病変単位。行クリックで Histogram に反映) -->
             <section v-if="store.finalMask" class="mv-section">
                 <div class="mv-section-title mv-section-title-row">
                     <span>
@@ -1671,9 +1638,9 @@ const brushRadiusProxy = computed({
                                     <th>#</th>
                                     <th>Label</th>
                                     <th class="num">SUVmax</th>
-                                    <th class="num">SUVpeak<br><span class="mv-th-unit">1cc</span></th>
+                                    <th class="num">SUVpeak<br><span class="mv-th-unit">1ml</span></th>
                                     <th class="num">SUVmean</th>
-                                    <th class="num">MTV<br><span class="mv-th-unit">cc</span></th>
+                                    <th class="num">MTV<br><span class="mv-th-unit">ml</span></th>
                                     <th class="num">TLG</th>
                                 </tr>
                             </thead>
@@ -1681,17 +1648,18 @@ const brushRadiusProxy = computed({
                                 <tr
                                     v-for="(l, i) in lesionRows"
                                     :key="l.componentId"
-                                    @click="onJumpToLesion(l)"
-                                    title="Click to jump crosshair"
+                                    :class="{ 'is-selected': selectedLesion && selectedLesion.componentId === l.componentId }"
+                                    @click="onSelectLesion(l)"
+                                    title="Click: histogram + jump crosshair"
                                 >
                                     <td class="mv-mono">{{ i + 1 }}</td>
                                     <td>
                                         <span class="mv-color-swatch" :style="{ background: l.colorCss }" />
                                         <span class="mv-lesion-label-name">{{ l.labelName }}</span>
                                     </td>
-                                    <td class="num mv-mono mv-accent">{{ l.suvMax.toFixed(2) }}</td>
-                                    <td class="num mv-mono">{{ l.suvPeak.toFixed(2) }}</td>
-                                    <td class="num mv-mono">{{ l.suvMean.toFixed(2) }}</td>
+                                    <td class="num mv-mono mv-accent">{{ l.suvMax.toFixed(3) }}</td>
+                                    <td class="num mv-mono">{{ l.suvPeak.toFixed(3) }}</td>
+                                    <td class="num mv-mono">{{ l.suvMean.toFixed(3) }}</td>
                                     <td class="num mv-mono">{{ fmtMtv(l.mtvCc) }}</td>
                                     <td class="num mv-mono">{{ fmtTlg(l.tlg) }}</td>
                                 </tr>
@@ -1699,7 +1667,7 @@ const brushRadiusProxy = computed({
                             <tfoot>
                                 <tr>
                                     <td colspan="2" class="mv-tfoot-label">Total</td>
-                                    <td class="num mv-mono mv-accent">{{ lesionTotals.maxSuv.toFixed(2) }}</td>
+                                    <td class="num mv-mono mv-accent">{{ lesionTotals.maxSuv.toFixed(3) }}</td>
                                     <td class="num mv-mono">—</td>
                                     <td class="num mv-mono">—</td>
                                     <td class="num mv-mono">{{ fmtMtv(lesionTotals.totalMtv) }}</td>
@@ -1737,7 +1705,7 @@ const brushRadiusProxy = computed({
                             />
                             <span class="mv-tmtv-cutoff-label">{{ c.label }}:</span>
                             <span class="mv-mono mv-tmtv-cutoff-value">
-                                {{ c.direction === 'above' ? '>' : '<' }} {{ c.valueCc }} cc
+                                {{ c.direction === 'above' ? '>' : '<' }} {{ c.valueCc }} ml
                             </span>
                             <span class="mv-tmtv-cutoff-status">
                                 {{ c.crossed ? '⚠ crossed' : 'within' }}
@@ -1747,78 +1715,104 @@ const brushRadiusProxy = computed({
                 </template>
             </section>
 
-            <!-- ④ Save -->
-            <div class="mv-step-head"><span class="mv-step-num">4</span>Save</div>
-            <!-- Save / Load / Clean -->
-            <section class="mv-section">
-                <div class="mv-btn-row">
-                    <v-btn size="small" color="primary" variant="flat" @click="onSave">
-                        <v-icon icon="mdi-content-save" size="small" class="mr-1" />Save NIfTI
-                    </v-btn>
-                    <v-btn size="small" variant="tonal" @click="onLoadMaskClick">
-                        <v-icon icon="mdi-folder-open" size="small" class="mr-1" />Load Mask
-                    </v-btn>
-                    <v-btn size="small" variant="outlined" @click="onClearManual">Clear edits</v-btn>
-                </div>
-                <div class="mv-btn-row mt-1">
-                    <v-btn
-                        size="small"
-                        variant="tonal"
-                        color="primary"
-                        :disabled="!store.finalMask || snapshotBusy"
-                        @click="onSaveSnapshot"
-                        title="Download .mvs snapshot (mask + labels + thresholds + box layout)"
-                    >
-                        <v-icon icon="mdi-download" size="small" class="mr-1" />
-                        {{ snapshotBusy ? '…' : 'Save snapshot (.mvs)' }}
-                    </v-btn>
-                    <v-btn size="small" variant="text" @click="onLoadSnapshotClick">
-                        <v-icon icon="mdi-upload" size="small" class="mr-1" />Load .mvs
-                    </v-btn>
-                </div>
-                <div class="mv-btn-row mt-1">
-                    <v-btn
-                        size="small"
-                        variant="tonal"
-                        color="primary"
-                        :disabled="!store.hasPet || pdfBusy"
-                        @click="onExportPdf"
-                        title="Export 1-page PDF report (lesion table + screenshots + threshold rationale)"
-                    >
-                        <v-icon icon="mdi-file-pdf-box" size="small" class="mr-1" />
-                        {{ pdfBusy ? '…' : 'Export PDF report' }}
-                    </v-btn>
-                </div>
-                <input
-                    ref="loadFileInput"
-                    type="file"
-                    accept=".nii,.nii.gz,.json,application/octet-stream,application/json"
-                    multiple
-                    style="display: none"
-                    @change="onLoadMaskFiles"
-                />
-                <input
-                    ref="loadSnapshotInput"
-                    type="file"
-                    accept=".mvs,.zip"
-                    style="display: none"
-                    @change="onLoadSnapshotFile"
-                />
-            </section>
-
-            <!-- Advanced 開閉: 使用頻度の低い機能 (threshold method / reference sphere /
-                 Sphere ROI / Labels 編集 / Histogram + radiomics / Islands / Rectangle ROI) を出し入れ。 -->
+            <!-- Advanced 開閉 (本体末尾): 使用頻度の低い機能を出し入れ。 -->
             <button type="button" class="mv-advanced-toggle" @click="toggleAdvanced">
                 <v-icon :icon="showAdvanced ? 'mdi-chevron-down' : 'mdi-chevron-right'" size="small" />
                 Advanced tools
-                <span class="mv-advanced-hint">{{ showAdvanced ? 'hide' : 'method · reference SUV · sphere · labels · histogram · radiomics · islands' }}</span>
+                <span class="mv-advanced-hint">{{ showAdvanced ? 'hide' : 'method · reference SUV · sphere · labels edit · islands · rectangle ROI' }}</span>
             </button>
+            </div><!-- /mv-seg-body -->
+
+            <!-- ===== 常時表示フッター (スクロールしない): 保存など ===== -->
+            <div class="mv-seg-foot">
+                <div class="mv-btn-row">
+                    <v-btn size="small" color="primary" variant="flat" @click="onSave" title="Save NIfTI mask (+ JSON sidecar)">
+                        <v-icon icon="mdi-content-save" size="small" class="mr-1" />Save NIfTI
+                    </v-btn>
+                    <v-btn size="small" variant="tonal" color="primary" :disabled="!store.finalMask || snapshotBusy" @click="onSaveSnapshot" title="Save .mvs snapshot">
+                        <v-icon icon="mdi-download" size="small" class="mr-1" />{{ snapshotBusy ? '…' : '.mvs' }}
+                    </v-btn>
+                    <v-menu location="top end">
+                        <template #activator="{ props }">
+                            <v-btn size="small" variant="text" icon v-bind="props" title="More save / load"><v-icon icon="mdi-dots-horizontal" /></v-btn>
+                        </template>
+                        <v-list density="compact">
+                            <v-list-item @click="onLoadMaskClick"><template #prepend><v-icon icon="mdi-folder-open" size="small" /></template><v-list-item-title>Load mask (NIfTI)</v-list-item-title></v-list-item>
+                            <v-list-item @click="onLoadSnapshotClick"><template #prepend><v-icon icon="mdi-upload" size="small" /></template><v-list-item-title>Load .mvs snapshot</v-list-item-title></v-list-item>
+                            <v-list-item :disabled="!store.hasPet || pdfBusy" @click="onExportPdf"><template #prepend><v-icon icon="mdi-file-pdf-box" size="small" /></template><v-list-item-title>{{ pdfBusy ? '…' : 'Export PDF report' }}</v-list-item-title></v-list-item>
+                            <v-list-item @click="onClearManual"><template #prepend><v-icon icon="mdi-eraser" size="small" /></template><v-list-item-title>Clear edits</v-list-item-title></v-list-item>
+                        </v-list>
+                    </v-menu>
+                </div>
+                <input ref="loadFileInput" type="file" accept=".nii,.nii.gz,.json,application/octet-stream,application/json" multiple style="display: none" @change="onLoadMaskFiles" />
+                <input ref="loadSnapshotInput" type="file" accept=".mvs,.zip" style="display: none" @change="onLoadSnapshotFile" />
+            </div><!-- /mv-seg-foot -->
         </template>
     </div>
 </template>
 
 <style scoped>
 .mv-seg-panel {
+    color: var(--mv-text);
+    /* ヘッダ / 本体(スクロール) / フッターの 3 段。ドロワー高さいっぱいに広げる。 */
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    max-height: 100%;
+    overflow: hidden;
+}
+.mv-seg-head {
+    flex: 0 0 auto;
+    border-bottom: 1px solid var(--mv-border);
+    background: var(--mv-surface);
+}
+.mv-seg-body {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+.mv-seg-foot {
+    flex: 0 0 auto;
+    border-top: 1px solid var(--mv-border);
+    background: var(--mv-surface);
+    padding: 6px 12px;
+}
+.mv-seg-foot .mv-btn-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+.mv-seg-foot .mv-btn-row > .v-btn:first-child {
+    flex: 1 1 auto;
+}
+
+/* Sphere ROI SUVmax を最上段に大きく */
+.mv-sphere-suvmax {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 2px 0 4px;
+    margin-bottom: 2px;
+    border-bottom: 1px solid var(--mv-border);
+}
+.mv-sphere-suvmax-label {
+    font-size: 11px;
+    color: var(--mv-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.mv-sphere-suvmax-val {
+    font-size: 24px;
+    font-weight: 700;
+    line-height: 1.1;
+}
+
+/* History expander header はクリック可能 */
+.mv-history-head {
+    cursor: pointer;
+}
+.mv-history-head:hover {
     color: var(--mv-text);
 }
 
@@ -1881,6 +1875,13 @@ const brushRadiusProxy = computed({
     color: var(--mv-text-muted);
     border-bottom: 1px solid var(--mv-border);
 }
+.mv-suv-ok-clickable {
+    cursor: pointer;
+}
+.mv-suv-ok-clickable:hover {
+    color: var(--mv-text);
+    background: var(--mv-surface-2);
+}
 
 /* Sanity warnings (collapsible) */
 .mv-suv-sanity {
@@ -1939,6 +1940,26 @@ const brushRadiusProxy = computed({
     font-size: 11px;
     color: var(--mv-text-dim);
     background: var(--mv-surface-2);
+}
+.mv-suv-mode-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 0 6px;
+    margin-bottom: 4px;
+    border-bottom: 1px dashed var(--mv-border);
+}
+.mv-suv-mode-label {
+    color: var(--mv-text-muted);
+    flex-shrink: 0;
+}
+.mv-suv-mode-toggle {
+    margin-left: auto;
+}
+.mv-suv-mode-toggle :deep(.v-btn) {
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 10px;
 }
 .mv-suv-details-row {
     display: flex;
