@@ -108,8 +108,10 @@ const onSegToolToggle = (val: SegEditTool | null | undefined) => {
 };
 
 // ===== Advanced (詳細機能) の開閉。Persona 1 の主要フローを既定で簡潔に保つため、
-// 使用頻度の低い機能 (threshold method / reference sphere / Sphere ROI / Labels 編集 /
-// Histogram+radiomics / Islands / Rectangle ROI) は Advanced に畳んでおく。localStorage で記憶。 =====
+// 使用頻度の低い機能 (threshold method / reference sphere / Histogram+radiomics /
+// Rectangle ROI) は Advanced に畳んでおく。localStorage で記憶。
+// Labels / Islands は Advanced ではなく個別の collapsed expander (History と同様) に変更。
+// Sphere VOI のサイドバー欄は削除 (ツール + 画像中フローティング統計で完結)。 =====
 const ADV_KEY = 'mv-seg-advanced-open';
 const showAdvanced = ref<boolean>(false);
 try { showAdvanced.value = localStorage.getItem(ADV_KEY) === '1'; } catch { /* ignore */ }
@@ -946,8 +948,10 @@ const brushRadiusProxy = computed({
     get: () => store.brushRadiusMm,
     set: (r: number) => { store.brushRadiusMm = r; },
 });
-// History リストの開閉 (普段は畳む expander)。
+// History / Labels / Islands の開閉 (普段は畳む expander)。
 const showHistoryList = ref<boolean>(false);
+const showLabels = ref<boolean>(false);
+const showIslands = ref<boolean>(false);
 </script>
 
 <template>
@@ -1444,69 +1448,56 @@ const showHistoryList = ref<boolean>(false);
             </section>
 
             <!-- Overlay は最上部の 1 行バーへ移動済み (step 共通のため) -->
-
-            <!-- Sphere ROI (Advanced): stats は画像中の ROI 近傍に浮かせて表示するのでここは説明のみ -->
-            <section v-if="showAdvanced" class="mv-section">
-                <div class="mv-section-title">
-                    <v-icon icon="mdi-circle-outline" size="x-small" />
-                    Sphere VOI
-                </div>
-                <div v-if="store.sphere" class="mv-hint">
-                    Stats (SUVmax / mean / radius / voxels) are shown on the image next to the ROI.
-                    <v-btn size="x-small" variant="text" class="mt-1" @click="store.clearSphere(); emit('redraw')">
-                        <v-icon icon="mdi-close" size="x-small" class="mr-1" />Clear
-                    </v-btn>
-                </div>
-                <div v-else class="mv-hint">
-                    Click on any registered Volume box (PT/CT/MR/Fusion) with the Sphere VOI tool.<br>
-                    Wheel inside the sphere to change radius (min 5 mm).<br>
-                    <span class="mv-hint-grid">Stats are sampled from the active PT volume and shown next to the ROI.</span>
-                </div>
-            </section>
+            <!-- Sphere VOI: サイドバー欄は削除。ツール本体 (App-bar) + 画像中フローティング統計
+                 (DicomView .mv-sphere-float) + store.clearSphere で完結しており、ここは冗長だった。 -->
 
             <!-- ③ Statistics: ラベル単位 (Labels) と病変単位 (Lesions) の両テーブル + 病変ヒストグラム -->
             <div class="mv-step-head"><span class="mv-step-num">3</span>Statistics</div>
 
-            <!-- Labels: ラベル単位の体積表 (+ add/remove) -->
+            <!-- Labels: ラベル単位の体積表 (+ add/remove)。普段は畳む expander (History と同じ)。 -->
             <section class="mv-section">
-                <div class="mv-section-title">
+                <div class="mv-section-title mv-history-head" @click="showLabels = !showLabels">
                     <v-icon icon="mdi-tag-multiple-outline" size="x-small" />
                     Labels
+                    <span v-if="store.labels.length" class="mv-section-count">{{ store.labels.length }}</span>
+                    <v-icon :icon="showLabels ? 'mdi-chevron-up' : 'mdi-chevron-down'" size="x-small" class="ml-auto" />
                 </div>
-                <div class="mv-label-list">
-                    <div
-                        v-for="row in labelRows"
-                        :key="row.id"
-                        class="mv-label-item"
-                        :class="{ 'is-active': row.id === store.currentLabelId }"
-                        @click="onSelectLabel(row.id)"
-                    >
-                        <span class="mv-color-swatch" :style="{ background: row.colorCss }" />
-                        <span class="mv-label-name">{{ row.name }}</span>
-                        <span class="mv-mono mv-label-vol">{{ (row.volume_mm3 / 1000).toFixed(1) }} ml · {{ row.count }} vox</span>
-                        <v-btn
-                            icon="mdi-close"
-                            size="x-small"
-                            variant="text"
-                            density="compact"
-                            class="ml-1"
-                            @click.stop="onRemoveLabel(row.id)"
-                        />
+                <template v-if="showLabels">
+                    <div class="mv-label-list">
+                        <div
+                            v-for="row in labelRows"
+                            :key="row.id"
+                            class="mv-label-item"
+                            :class="{ 'is-active': row.id === store.currentLabelId }"
+                            @click="onSelectLabel(row.id)"
+                        >
+                            <span class="mv-color-swatch" :style="{ background: row.colorCss }" />
+                            <span class="mv-label-name">{{ row.name }}</span>
+                            <span class="mv-mono mv-label-vol">{{ (row.volume_mm3 / 1000).toFixed(1) }} ml · {{ row.count }} vox</span>
+                            <v-btn
+                                icon="mdi-close"
+                                size="x-small"
+                                variant="text"
+                                density="compact"
+                                class="ml-1"
+                                @click.stop="onRemoveLabel(row.id)"
+                            />
+                        </div>
                     </div>
-                </div>
-                <div class="mv-add-label mt-2">
-                    <v-text-field
-                        v-model="newLabelName"
-                        placeholder="Label name"
-                        density="compact"
-                        hide-details
-                        variant="outlined"
-                        @keyup.enter="onAddLabel"
-                    />
-                    <v-btn size="small" variant="tonal" @click="onAddLabel">
-                        <v-icon icon="mdi-plus" size="small" />
-                    </v-btn>
-                </div>
+                    <div class="mv-add-label mt-2">
+                        <v-text-field
+                            v-model="newLabelName"
+                            placeholder="Label name"
+                            density="compact"
+                            hide-details
+                            variant="outlined"
+                            @keyup.enter="onAddLabel"
+                        />
+                        <v-btn size="small" variant="tonal" @click="onAddLabel">
+                            <v-icon icon="mdi-plus" size="small" />
+                        </v-btn>
+                    </div>
+                </template>
             </section>
 
             <!-- Histogram — 選択病変 (Lesion table の行クリックで選択) の SUV 分布 -->
@@ -1581,31 +1572,35 @@ const showHistoryList = ref<boolean>(false);
                 </div>
             </section>
 
-            <!-- Islands (Advanced): assign が自動 flood するため通常不要 -->
-            <section v-if="showAdvanced" class="mv-section">
-                <div class="mv-section-title">
+            <!-- Islands: 普段は畳む expander (History と同じ)。assign が自動 flood するため通常不要。 -->
+            <section class="mv-section">
+                <div class="mv-section-title mv-history-head" @click="showIslands = !showIslands">
                     <v-icon icon="mdi-island" size="x-small" />
                     Islands
+                    <span v-if="store.componentMapValid" class="mv-section-count">{{ store.componentCount }}</span>
+                    <v-icon :icon="showIslands ? 'mdi-chevron-up' : 'mdi-chevron-down'" size="x-small" class="ml-auto" />
                 </div>
-                <div v-if="store.componentMapValid" class="mv-hint">
-                    <span class="mv-accent">{{ store.componentCount }}</span> components detected —
-                    click an island with the Assign Label tool
-                </div>
-                <div v-else-if="store.finalMask" class="mv-warn-text">
-                    <v-icon icon="mdi-refresh" size="x-small" class="mr-1" />
-                    Mask updated — re-run Find islands
-                </div>
-                <v-btn
-                    size="small"
-                    variant="tonal"
-                    color="primary"
-                    class="mt-1"
-                    :disabled="!store.finalMask"
-                    @click="onFindIslands"
-                >
-                    <v-icon icon="mdi-magnify" size="small" class="mr-1" />
-                    {{ store.componentMapValid ? 'Re-find' : 'Find islands' }}
-                </v-btn>
+                <template v-if="showIslands">
+                    <div v-if="store.componentMapValid" class="mv-hint">
+                        <span class="mv-accent">{{ store.componentCount }}</span> components detected —
+                        click an island with the Assign Label tool
+                    </div>
+                    <div v-else-if="store.finalMask" class="mv-warn-text">
+                        <v-icon icon="mdi-refresh" size="x-small" class="mr-1" />
+                        Mask updated — re-run Find islands
+                    </div>
+                    <v-btn
+                        size="small"
+                        variant="tonal"
+                        color="primary"
+                        class="mt-1"
+                        :disabled="!store.finalMask"
+                        @click="onFindIslands"
+                    >
+                        <v-icon icon="mdi-magnify" size="small" class="mr-1" />
+                        {{ store.componentMapValid ? 'Re-find' : 'Find islands' }}
+                    </v-btn>
+                </template>
             </section>
 
             <!-- Lesion table (病変単位。行クリックで Histogram に反映) -->
@@ -1719,7 +1714,7 @@ const showHistoryList = ref<boolean>(false);
             <button type="button" class="mv-advanced-toggle" @click="toggleAdvanced">
                 <v-icon :icon="showAdvanced ? 'mdi-chevron-down' : 'mdi-chevron-right'" size="small" />
                 Advanced tools
-                <span class="mv-advanced-hint">{{ showAdvanced ? 'hide' : 'method · reference SUV · sphere · labels edit · islands · rectangle ROI' }}</span>
+                <span class="mv-advanced-hint">{{ showAdvanced ? 'hide' : 'method · reference SUV · rectangle ROI' }}</span>
             </button>
             </div><!-- /mv-seg-body -->
 
