@@ -2,7 +2,7 @@
 // Joint histogram method (32 bins). Sample point set is fixed across iterations
 // for reproducibility (avoid noisy optimization landscape).
 
-import * as THREE from 'three';
+import * as THREE from '@/lib/threeMath';
 import type { Volume } from '../Volume';
 import { worldToVoxel } from '../Volume';
 import { makeRigidMatrix, type RigidParams } from './transform';

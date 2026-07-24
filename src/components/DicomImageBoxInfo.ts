@@ -5,8 +5,18 @@
 //
 //
 
-import * as THREE from 'three';
+import * as THREE from '@/lib/threeMath';
 import * as Volume from './Volume';
+
+// MIP / VR box の mip 既定値。同一リテラルが各所 (レイアウト setup / plane 切替 / VR demo)
+// に散在していたため集約。isSurface のみ呼び出し側で切り替える (smip 用)。
+// 毎回新しいオブジェクトを返す (box ごとに mutable なので共有オブジェクト不可)。
+export const makeMipState = (isSurface = false) => ({
+    mipAngle: 0,
+    isSurface,
+    thresholdSurfaceMip: 0.3,
+    depthSurfaceMip: 3,
+});
 
 export type ImageBoxInfoBase = {
     currentSeriesNumber: number,
@@ -61,6 +71,9 @@ export type VolumeImageBoxInfo = ImageBoxInfoBase & {
     isVr?: boolean,
     // Sampling 補間モード (slice/MPR 用)。default 'bilinear'。MIP/VR には影響しない。
     interpolation?: Interpolation,
+    // タイルグリッドで縦に何行ぶん占有するか (default 1)。2 にすると CSS grid-row span 2 +
+    // canvas を 2 行ぶんの高さにして「1 列まるごと」の背高 box を作れる (PET MIP 用)。
+    rowSpan?: number,
 }
 
 export type FusedVolumeImageBoxInfo = VolumeImageBoxInfo & {

@@ -1,7 +1,7 @@
 // Auto-register MR to PT via Mutual Information + Nelder-Mead simplex.
 // 多重解像度ピラミッド (4x → 2x → 1x) で粗→細の最適化。
 
-import * as THREE from 'three';
+import * as THREE from '@/lib/threeMath';
 import type { Volume } from '../Volume';
 import type { RigidParams } from './transform';
 import { generateFixedSamples, estimateIntensityRange, computeNegativeMI, type MIStats } from './mi';

@@ -50,16 +50,32 @@ export const getVolumeTexture = async (
 
     const bytesPerRow = nx * 4;     // r32float = 4 byte/voxel
     const rowsPerImage = ny;
+    const bytesPerSlice = bytesPerRow * ny;
     const t0 = performance.now();
-    device.queue.writeTexture(
-        { texture: tex },
-        f32.buffer,
-        { offset: f32.byteOffset, bytesPerRow, rowsPerImage },
-        [nx, ny, nz],
-    );
+
+    // writeTexture は内部で「コピー全体」サイズの staging buffer を確保する。
+    // 512²×345 CT (~362MB) のような大型 volume を 1 回で送ると、device の
+    // maxBufferSize (未指定なら default 256MB) を超えて validation error になり、
+    // texture が書かれず全ゼロ→黒画面になる (Intel iGPU 等で顕在化)。
+    // → Z 方向にスラブ分割し、1 回のコピーが上限を超えないようにする。
+    const maxBuf: number = device.limits?.maxBufferSize ?? 0x10000000; // 256MB fallback
+    const safeCap = Math.max(bytesPerSlice, Math.floor(maxBuf * 0.9));  // 余裕をみて 90%
+    const slicesPerSlab = Math.max(1, Math.floor(safeCap / bytesPerSlice));
+
+    for (let z0 = 0; z0 < nz; z0 += slicesPerSlab) {
+        const depth = Math.min(slicesPerSlab, nz - z0);
+        device.queue.writeTexture(
+            { texture: tex, origin: { x: 0, y: 0, z: z0 } },
+            f32.buffer,
+            { offset: f32.byteOffset + z0 * bytesPerSlice, bytesPerRow, rowsPerImage },
+            [nx, ny, depth],
+        );
+    }
     const ms = performance.now() - t0;
     const mb = (f32.byteLength / (1024 * 1024)).toFixed(1);
-    console.log(`[gpu] volume upload ${nx}×${ny}×${nz}: ${mb} MB in ${ms.toFixed(0)}ms`);
+    const slabs = Math.ceil(nz / slicesPerSlab);
+    console.log(`[gpu] volume upload ${nx}×${ny}×${nz}: ${mb} MB in ${ms.toFixed(0)}ms` +
+        (slabs > 1 ? ` (${slabs} slabs × ${slicesPerSlab} slices)` : ''));
 
     cache.set(voxel, { voxelRef: voxel, nx, ny, nz, texture: tex });
     return tex;

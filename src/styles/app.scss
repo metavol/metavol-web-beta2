@@ -125,6 +125,9 @@ html, body, #app {
   font-size: 17px;
   letter-spacing: 0.02em;
   color: var(--mv-text);
+  white-space: nowrap;   // "metavol-web" を必ず 1 行に (app-bar が狭くても折り返さない)
+  flex-shrink: 0;        // flex 圧縮で幅が詰められて折り返すのを防ぐ
+  line-height: 1;
 
   .mv-brand-accent {
     color: var(--mv-accent);

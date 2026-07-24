@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onUnmounted } from 'vue';
-import * as THREE from 'three';
+import * as THREE from '@/lib/threeMath';
 import { useSegmentationStore } from '../stores/segmentation';
 import { readNiftiMask } from './segmentation/niftiReader';
 import { summarizeLesions, collectComponentSuv, type LesionStat } from './segmentation/maskOps';
@@ -1288,7 +1288,7 @@ const showHistoryList = ref<boolean>(false);
                 </div>
 
                 <!-- Apply split button: メインは現在ラベルで適用、caret で Tumor/Physio を選んで即適用。 -->
-                <div class="mv-apply-row mt-2">
+                <div class="mv-apply-row mt-2" data-demo="apply-threshold">
                     <div class="mv-apply-split">
                         <v-btn
                             class="mv-apply-main"
@@ -1631,7 +1631,7 @@ const showHistoryList = ref<boolean>(false);
                     No lesions yet — Apply threshold or paint a polygon
                 </div>
                 <template v-else>
-                    <div class="mv-lesion-table-wrap">
+                    <div class="mv-lesion-table-wrap" data-demo="lesion-table">
                         <table class="mv-lesion-table">
                             <thead>
                                 <tr>
@@ -1726,7 +1726,7 @@ const showHistoryList = ref<boolean>(false);
             <!-- ===== 常時表示フッター (スクロールしない): 保存など ===== -->
             <div class="mv-seg-foot">
                 <div class="mv-btn-row">
-                    <v-btn size="small" color="primary" variant="flat" @click="onSave" title="Save NIfTI mask (+ JSON sidecar)">
+                    <v-btn size="small" color="primary" variant="flat" data-demo="save-nifti" @click="onSave" title="Save NIfTI mask (+ JSON sidecar)">
                         <v-icon icon="mdi-content-save" size="small" class="mr-1" />Save NIfTI
                     </v-btn>
                     <v-btn size="small" variant="tonal" color="primary" :disabled="!store.finalMask || snapshotBusy" @click="onSaveSnapshot" title="Save .mvs snapshot">

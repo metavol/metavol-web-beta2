@@ -25,7 +25,19 @@ export const getGpuDevice = async (): Promise<any | null> => {
                 powerPreference: 'high-performance',
             });
             if (!adapter) return null;
-            const device = await adapter.requestDevice();
+            // 大型 volume (512²×N CT 等) の texture upload では writeTexture が
+            // 「コピー全体」サイズの staging buffer を確保する。default の
+            // maxBufferSize (256MB) では 512²×345 CT (~362MB) が入らず upload が
+            // 失敗する。adapter がサポートするなら上限を引き上げておく
+            // (volumeCache 側の slab 分割と併せて二重の防御)。
+            const requiredLimits: Record<string, number> = {};
+            const adapterMaxBuf = adapter.limits?.maxBufferSize;
+            if (typeof adapterMaxBuf === 'number' && adapterMaxBuf > 0x10000000) {
+                requiredLimits.maxBufferSize = adapterMaxBuf;
+            }
+            const device = await adapter.requestDevice(
+                Object.keys(requiredLimits).length ? { requiredLimits } : undefined,
+            );
             // device lost handler — 失われたら次回再取得できるように reset
             device.lost.then((info: any) => {
                 console.warn('[gpu] device lost:', info?.reason, info?.message);

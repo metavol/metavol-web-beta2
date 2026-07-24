@@ -9,6 +9,7 @@
               icon="mdi-menu"
               variant="text"
               size="small"
+              data-demo="menu"
             />
           </template>
           <v-list density="compact">
@@ -137,6 +138,16 @@
             </v-menu>
 
             <v-divider v-if="niftiSeriesList.length > 0" />
+
+            <v-divider />
+
+            <v-list-item @click="startMtvTour">
+              <template v-slot:prepend>
+                <v-icon icon="mdi-school-outline" size="small" />
+              </template>
+              <v-list-item-title>Guided tour: measure MTV</v-list-item-title>
+              <v-list-item-subtitle>Watch a step-by-step demo on a sample PET/CT</v-list-item-subtitle>
+            </v-list-item>
 
             <v-list-item @click="browserSupportOpen = true">
               <template v-slot:prepend>
@@ -310,6 +321,7 @@
         class="mv-pet-std-btn mr-1"
         variant="flat"
         size="small"
+        data-demo="pet-standard"
         :disabled="!petCtReady"
         @click="onClickPetStandard"
       >
@@ -410,6 +422,13 @@
             </template>
             <v-list-item-title>Compare 2-up (1×2)</v-list-item-title>
             <v-list-item-subtitle>Two series side-by-side, same plane</v-list-item-subtitle>
+          </v-list-item>
+          <v-list-item @click="runLayout('petCtMipRight')">
+            <template v-slot:prepend>
+              <v-icon icon="mdi-view-grid-plus" size="small" />
+            </template>
+            <v-list-item-title>PET/CT + MIP (3×2)</v-list-item-title>
+            <v-list-item-subtitle>CT / PET / Fusion / Fusion coronal + full-height PET MIP</v-list-item-subtitle>
           </v-list-item>
         </v-list>
       </v-menu>
@@ -539,6 +558,7 @@
         class="mv-tool-btn"
         variant="text"
         size="small"
+        data-demo="inspector"
         @click="drawerRight = !drawerRight"
       >
         <v-icon icon="mdi-format-vertical-align-top" style="transform: rotate(90deg)" />
@@ -708,26 +728,27 @@
         </v-card-actions>
       </v-card>
     </v-dialog>
+
+    <DemoOverlay :demo="demo" />
   </v-app>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
 import DicomView from "./components/DicomView.vue";
 import { getWH, getTileN } from "./components/UrlParser.ts";
 import { useSegmentationStore } from "./stores/segmentation";
-import { ensureWasmCodecsReady } from "./components/wasmCodec";
 import { TRACER_PRESETS, tracerById } from "./components/tracerPresets";
 import DicomTagDialog from "./components/DicomTagDialog.vue";
+import DemoOverlay from "./components/demo/DemoOverlay.vue";
+import { useDemoPlayer } from "./components/demo/useDemoPlayer";
+import { buildDemoApi } from "./components/demo/demoApi";
+import { createMtvScenario } from "./components/demo/scenarios/mtv";
 
-// アプリ起動時に dcmjs-codecs WASM をプリウォーム (DICOM JPEG Lossless 用)。
-// ~4 MB の WASM を fetch + instantiate するので体感 0.3-1s かかる。
-// バックグラウンドで進行、失敗時は jpeg-lossless-decoder-js (純 JS) にフォールバック。
-onMounted(() => {
-  ensureWasmCodecsReady().catch(err => {
-    console.warn('[wasm-codecs] init failed (will fall back to pure JS for JPEG Lossless):', err);
-  });
-});
+// dcmjs-codecs WASM (JPEG Lossless 用) はもう起動時にプリウォームしない。
+// ~4MB の WASM を毎回起動時に fetch するのは非圧縮ケースには無駄。圧縮フレームを
+// 実際に含むケースを読み込んだとき decompressAllJpegLossless が
+// ensureWasmCodecsReady() を await するので、その時点で初回ロードされる。
 
 const segStore = useSegmentationStore();
 
@@ -856,6 +877,27 @@ const clickItem = (e: any) => {
 
 const dicomViewRef = ref<any>(null);
 
+// ===== ガイドツアー (デモ) =====
+const demo = useDemoPlayer();
+const startMtvTour = () => {
+  const api = buildDemoApi({
+    dicomView: () => dicomViewRef.value,
+    store: segStore,
+    setInspectorOpen: (open: boolean) => { drawerRight.value = open; },
+  });
+  demo.start(createMtvScenario(api));
+};
+const onDemoKeydown = (e: KeyboardEvent) => {
+  if (e.key === 'Escape' && demo.active.value) { demo.stop(); }
+};
+onMounted(() => {
+  window.addEventListener('keydown', onDemoKeydown);
+  // ?tour=mtv で起動時に自動開始 (アプリ mount 後、少し待って dicomViewRef 準備を待つ)。
+  const tour = new URLSearchParams(window.location.search).get('tour');
+  if (tour === 'mtv') setTimeout(startMtvTour, 600);
+});
+onBeforeUnmount(() => window.removeEventListener('keydown', onDemoKeydown));
+
 // PET Standard ピッカー state (PT or CT が複数あるとき開くダイアログ)
 type SeriesCandidate = { idx: number; label: string; isActive: boolean; score: number };
 const petPickerOpen = ref(false);
@@ -920,13 +962,14 @@ const runFusion = () => {
   dicomViewRef.value?.fusion?.();
 };
 
-const runLayout = (kind: 'triplanarPt' | 'triplanarFused' | 'ptOnly4up' | 'compare2up') => {
+const runLayout = (kind: 'triplanarPt' | 'triplanarFused' | 'ptOnly4up' | 'compare2up' | 'petCtMipRight') => {
   const r = dicomViewRef.value;
   if (!r) return;
   if (kind === 'triplanarPt')   r.setupTriplanarPt?.();
   if (kind === 'triplanarFused') r.setupTriplanarFused?.();
   if (kind === 'ptOnly4up')     r.setupPtOnly4up?.();
   if (kind === 'compare2up')    r.setupCompare2up?.();
+  if (kind === 'petCtMipRight') r.setupPetCtMipRight?.();
 };
 
 // Tracer preset を pull-down で適用

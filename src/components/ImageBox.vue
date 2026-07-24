@@ -7,7 +7,7 @@
 
 
 import { ref, onMounted} from 'vue';
-import * as THREE from 'three';
+import * as THREE from '@/lib/threeMath';
 import { isWebGpuAvailable } from './webgpu/gpuContext';
 import { gpuRenderMip } from './webgpu/mipPipeline';
 import { gpuRenderVr } from './webgpu/vrPipeline';

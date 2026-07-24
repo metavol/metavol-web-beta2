@@ -29,10 +29,9 @@
 
 import { ref, watch, onUnmounted } from "vue";
 import { DataSet, parseDicom } from "dicom-parser";
-import * as DicomLib from './dicomLib.ts';
 import sidebar from "./Sidebar.vue";
 import imagebox from "./ImageBox.vue";
-import { ImageBoxInfoBase, DicomSliceImageBoxInfo, VolumeImageBoxInfo, defaultInfo, pushVolume, FusedVolumeImageBoxInfo } from "./DicomImageBoxInfo";
+import { ImageBoxInfoBase, DicomSliceImageBoxInfo, VolumeImageBoxInfo, defaultInfo, pushVolume, FusedVolumeImageBoxInfo, makeMipState } from "./DicomImageBoxInfo";
 import { getAllFilesRecursive } from "./DragAndDropUtil";
 import { generateVolumeFromDicom } from './dicom2volume.ts';
 import { readDicomPixels, readDicomPixelsAsInt16, autoWindowFromPixels } from './dicomPixels.ts';
@@ -42,11 +41,11 @@ import { isPrimaryForFusion, isRgbSeries } from "./seriesClassify";
 import { loadPriorityRules, scoreSeries } from "./seriesPriorityRules";
 import { buildClutLegend, type ClutLegend } from "./clutLegend";
 import { ensureWasmCodecsReady, isWasmCodecsReady } from "./wasmCodec";
-import { Volume, voxelToWorld, worldToVoxel } from "./Volume.ts";
+import { Volume, voxelToWorld, worldToVoxel, volumeCenterWorld } from "./Volume.ts";
 import { writeNiftiFloat32, buildVolumeSidecarJson } from "./niftiVolumeWriter";
 import { triggerDownload } from "./segmentation/niftiWriter";
 import { solve } from "./linalg";
-import * as THREE from 'three';
+import * as THREE from '@/lib/threeMath';
 import {cluts, labelClut} from './Clut.ts';
 import * as nifti from 'nifti-reader-js';
 import { gunzip as fflateGunzip } from 'fflate';
@@ -103,6 +102,8 @@ const gunzipAsync = async (data: Uint8Array, filename?: string): Promise<Uint8Ar
     });
 };
 import * as Phantom from './phantom.ts';
+import { scrambleZSlices, recoverZOrder, scrambleAccuracy } from './experiments/sliceScramble';
+import { evictVolumeTexture } from './webgpu/volumeCache';
 import { useSegmentationStore } from '../stores/segmentation';
 import { usePerfStore } from '../stores/perf';
 import { isWebGpuAvailable, getGpuDeviceSync } from './webgpu/gpuContext';
@@ -116,6 +117,8 @@ import SegmentationPanel from './SegmentationPanel.vue';
 import DebugInspector from './DebugInspector.vue';
 import { computed, onMounted, nextTick, provide } from 'vue';
 import { useAutoSave } from '../composables/useAutoSave';
+import { useDebugInspector } from '../composables/useDebugInspector';
+import { useSnapshotIo, type RectRoiJson } from '../composables/useSnapshotIo';
 import { loadSession, deleteSession, type SessionPayload } from '../stores/persistence';
 
 const segStore = useSegmentationStore();
@@ -219,27 +222,9 @@ const seriesSummaries = ref<SeriesSummary[]>([]);
 // ===== デバッグ機能 =====
 // Voxel inspector (旧 debugMode) — App-bar からも toggle 可能なよう defineModel で公開
 const debugMode = defineModel<boolean>('debugMode', { default: false });
-const debugHoverRows = ref<Array<{
-  seriesIndex: number; modality: string; description: string;
-  i: number; j: number; k: number;
-  value: number | null; inBounds: boolean;
-}>>([]);
-// マスク各層 (PET 格子) の値。voxel inspector で「この画素がどのセグメントか / どの層で
-// その値が決まっているか」を可視化して assign 波及などの不具合診断に使う。
-const debugMaskInfo = ref<{
-  i: number; j: number; k: number; inBounds: boolean;
-  threshold: number | null;              // thresholdMask (閾値由来ラベル)
-  manualRaw: number | null;              // manualEdits 生値 (0xFFFF = erase sentinel)
-  manualLabel: string;                   // 人間可読の manualEdits
-  final: number | null;                  // finalMask (実表示ラベル)
-  finalLabel: string;
-  component: number | null;              // componentMap の成分 ID (無効なら null)
-  componentValid: boolean;
-  componentCount: number;
-} | null>(null);
-const debugScreenX = ref(0);
-const debugScreenY = ref(0);
-const debugShow = ref(false);
+// Voxel inspector 本体 (hover 情報収集 / マスク層読み取り / shift+click 編集) は
+// useDebugInspector composable に分離。ref 群と関数はこの下の方 (deps 定義後) で
+// 生成し、debugShow など再エクスポートする。
 
 // 「画像が画面にちょうど収まる」モード。autoFitMode=true のとき
 // drawer 開閉やウィンドウリサイズで imageBoxW/H を再計算する。
@@ -678,211 +663,6 @@ watch(tileN, async () => {
   show();
 });
 
-// DICOM slice の現スライス pixel を canvas (cx, cy) から直接読む。
-// Volume が無い / 生成前の DICOM-only シリーズでも inspector に値を出すために使う。
-// Photometric が "RGB" 以外 (Int16 grayscale) の場合のみ対応。
-//   返り値: { value, col, row }   value は intercept/slope 適用後 (DICOM 表示単位)
-const readDicomSlicePixelAt = (boxId: number, cx: number, cy: number): { value: number | null; col: number; row: number } | null => {
-  if (!isDicomSliceImageBoxInfo(boxId)) return null;
-  const info = imageBoxInfos.value[boxId] as DicomSliceImageBoxInfo;
-  const series = seriesList[info.currentSeriesNumber];
-  const ds = series?.myDicom?.[info.currentSliceNumber];
-  if (!ds) return null;
-  const cols = ds.int16('x00280011') ?? 0;
-  const rows = ds.int16('x00280010') ?? 0;
-  if (!cols || !rows) return null;
-  const canvasW = imageBoxW.value!;
-  const canvasH = imageBoxH.value!;
-  const zoom = info.zoom ?? 1;
-  // ImageBox.drawImageCvZoom と同じ canvas → 画像 pixel 変換
-  const fx = (cx - canvasW / 2) / zoom + cols / 2 + info.centerX;
-  const fy = (cy - canvasH / 2) / zoom + rows / 2 + info.centerY;
-  const col = Math.floor(fx + 0.5), row = Math.floor(fy + 0.5);
-  if (col < 0 || col >= cols || row < 0 || row >= rows) {
-    return { value: null, col, row };
-  }
-  if ((ds.string('x00280004') ?? '').toUpperCase() === 'RGB') {
-    return { value: null, col, row };  // RGB は scalar 値ではないので未対応
-  }
-  const pde = ds.elements?.x7fe00010;
-  if (!pde) return { value: null, col, row };
-  // pixel data 取得 (BitsAllocated に従って 8/16-bit を読み分け)
-  let raw: number;
-  try {
-    const info = readDicomPixels(ds);
-    raw = info.pixels[row * cols + col];
-  } catch {
-    return { value: null, col, row };
-  }
-  const intercept = Number(ds.string('x00281052') ?? '0');
-  const slope = Number(ds.string('x00281053') ?? '1');
-  return { value: raw * slope + intercept, col, row };
-};
-
-// World 座標を inspector に表示するための payload (mm 単位)。
-const debugWorld = ref<{ x: number; y: number; z: number } | null>(null);
-
-const updateDebugHover = (boxId: number, e: MouseEvent) => {
-  if (!debugMode.value) return;
-  // DICOM slice / Volume / Fusion のいずれにも対応する。
-  if (!isAnyVolumeBox(boxId) && !isDicomSliceImageBoxInfo(boxId)) {
-    debugShow.value = false;
-    return;
-  }
-  const [cx, cy] = getCanvasXY(e);
-  const w = screenToWorldAny(boxId, cx, cy);
-  if (!w) { debugShow.value = false; return; }
-  debugWorld.value = { x: w.x, y: w.y, z: w.z };
-  const rows: typeof debugHoverRows.value = [];
-
-  // DICOM slice box: その box が表示している現スライスの直接 pixel 値を 1 行追加
-  // (volume 未生成の DICOM-only シリーズでも値が見えるように)
-  if (isDicomSliceImageBoxInfo(boxId)) {
-    const info = imageBoxInfos.value[boxId] as DicomSliceImageBoxInfo;
-    const sIdx = info.currentSeriesNumber;
-    const series = seriesList[sIdx];
-    const ds = series?.myDicom?.[info.currentSliceNumber];
-    // 同じ series の volume 行と重複させないため、その series が **volume を持たない** ときだけ
-    // DICOM 直読み行を出す。volume がある場合は volume 行が後段で出る。
-    if (ds && !series.volume) {
-      const px = readDicomSlicePixelAt(boxId, cx, cy);
-      const mod = (ds.string('x00080060') ?? '').toUpperCase();
-      const desc = ds.string('x0008103e') ?? `S${sIdx}`;
-      rows.push({
-        seriesIndex: sIdx,
-        modality: mod,
-        description: `${desc} (slice ${info.currentSliceNumber + 1})`,
-        i: px?.col ?? 0,
-        j: px?.row ?? 0,
-        k: info.currentSliceNumber,
-        value: px?.value ?? null,
-        inBounds: !!px && px.value !== null,
-      });
-    }
-  }
-
-  for (let s = 0; s < seriesList.length; s++){
-    const v = seriesList[s].volume;
-    if (!v) continue;
-    const vox = worldToVoxel_(w, s);
-    // Voxel 中心 = 整数座標規約に合わせ floor(x+0.5) で nearest center を取る。
-    // (sampleNearest と一致させ、画面で見えるピクセルと inspector の値変化境界を揃える)
-    const i = Math.floor(vox.x + 0.5), j = Math.floor(vox.y + 0.5), k = Math.floor(vox.z + 0.5);
-    const inBounds = i >= 0 && i < v.nx && j >= 0 && j < v.ny && k >= 0 && k < v.nz;
-    const value = inBounds ? v.voxel[k * v.nx * v.ny + j * v.nx + i] : null;
-    rows.push({
-      seriesIndex: s,
-      modality: v.metadata?.modality ?? '-',
-      description: v.metadata?.seriesDescription ?? `S${s}`,
-      i, j, k, value, inBounds,
-    });
-  }
-  debugHoverRows.value = rows;
-
-  // ===== マスク各層 (PET 格子) の値 =====
-  // mask は PET 格子上に保持されるので、world → PET voxel に変換して層ごとに読む。
-  // overlay サンプリングと同じ nearest-center (floor(x+0.5)) で index を決める。
-  const petIdx = findPetSeriesIndex();
-  const pet = segStore.petVolumeRef;
-  if (petIdx >= 0 && pet) {
-    const vox = worldToVoxel_(w, petIdx);
-    const mi = Math.floor(vox.x + 0.5), mj = Math.floor(vox.y + 0.5), mk = Math.floor(vox.z + 0.5);
-    const inB = mi >= 0 && mi < pet.nx && mj >= 0 && mj < pet.ny && mk >= 0 && mk < pet.nz;
-    if (inB) {
-      const idx = mk * pet.nx * pet.ny + mj * pet.nx + mi;
-      const th = segStore.thresholdMask ? segStore.thresholdMask[idx] : null;
-      const meRaw = segStore.manualEdits ? segStore.manualEdits[idx] : null;
-      const fin = segStore.finalMask ? segStore.finalMask[idx] : null;
-      const comp = (segStore.componentMapValid && segStore.componentMap) ? segStore.componentMap[idx] : null;
-      const labelName = (v: number | null): string => {
-        if (v == null || v === 0) return '-';
-        return segStore.labelById(v)?.name ?? `#${v}`;
-      };
-      debugMaskInfo.value = {
-        i: mi, j: mj, k: mk, inBounds: true,
-        threshold: th,
-        manualRaw: meRaw,
-        manualLabel: meRaw == null ? '-'
-          : meRaw === 0xFFFF ? 'erase'
-          : meRaw === 0 ? '-'
-          : labelName(meRaw),
-        final: fin,
-        finalLabel: labelName(fin),
-        component: comp,
-        componentValid: segStore.componentMapValid,
-        componentCount: segStore.componentCount,
-      };
-    } else {
-      debugMaskInfo.value = {
-        i: mi, j: mj, k: mk, inBounds: false,
-        threshold: null, manualRaw: null, manualLabel: '-',
-        final: null, finalLabel: '-', component: null,
-        componentValid: segStore.componentMapValid, componentCount: segStore.componentCount,
-      };
-    }
-  } else {
-    debugMaskInfo.value = null;
-  }
-
-  debugScreenX.value = e.clientX;
-  debugScreenY.value = e.clientY;
-  debugShow.value = true;
-};
-
-const handleDebugEditClick = (boxId: number, e: MouseEvent) => {
-  if (!debugMode.value) return false;
-  if (!e.shiftKey) return false;
-  if (!isAnyVolumeBox(boxId) && !isDicomSliceImageBoxInfo(boxId)) return false;
-  const [cx, cy] = getCanvasXY(e);
-  const w = screenToWorldAny(boxId, cx, cy);
-  if (!w) return false;
-
-  // 編集対象シリーズを選択（Volume が複数なら一覧から選ばせる）
-  const candidates: Array<{ idx: number; v: any; descr: string }> = [];
-  for (let s = 0; s < seriesList.length; s++){
-    const v = seriesList[s].volume;
-    if (!v) continue;
-    const vox = worldToVoxel_(w, s);
-    const i = Math.floor(vox.x + 0.5), j = Math.floor(vox.y + 0.5), k = Math.floor(vox.z + 0.5);
-    if (i < 0 || i >= v.nx || j < 0 || j >= v.ny || k < 0 || k >= v.nz) continue;
-    candidates.push({
-      idx: s,
-      v,
-      descr: `[${s}] ${v.metadata?.modality ?? '-'} ${v.metadata?.seriesDescription ?? ''} → cur=${v.voxel[k*v.nx*v.ny + j*v.nx + i].toFixed(4)} @(${i},${j},${k})`,
-    });
-  }
-  if (candidates.length === 0){
-    console.log('[debug edit] no in-bounds volume at this position');
-    return true;
-  }
-
-  let chosenIdx = candidates[0].idx;
-  if (candidates.length > 1){
-    const list = candidates.map((c, n) => `${n}: ${c.descr}`).join('\n');
-    const resp = prompt(`Edit which series?\n${list}\n\nEnter index (0..${candidates.length-1}):`, '0');
-    if (resp == null) return true;
-    const n = Number(resp);
-    if (!Number.isFinite(n) || n < 0 || n >= candidates.length) return true;
-    chosenIdx = candidates[n].idx;
-  }
-
-  const target = seriesList[chosenIdx].volume!;
-  const vox = worldToVoxel_(w, chosenIdx);
-  const i = Math.floor(vox.x + 0.5), j = Math.floor(vox.y + 0.5), k = Math.floor(vox.z + 0.5);
-  const idx = k * target.nx * target.ny + j * target.nx + i;
-  const cur = target.voxel[idx];
-  const resp = prompt(`Edit voxel value\n  series ${chosenIdx} (${target.metadata?.modality ?? '-'}) at (${i},${j},${k})\n  current: ${cur}\n\nNew value:`, String(cur));
-  if (resp == null) return true;
-  const newVal = Number(resp);
-  if (!Number.isFinite(newVal)){
-    console.warn('[debug edit] invalid value:', resp);
-    return true;
-  }
-  target.voxel[idx] = newVal;
-  console.log(`[debug edit] series ${chosenIdx} (${i},${j},${k}): ${cur} → ${newVal}`);
-  show();
-  return true;
-};
 
 const imageBoxInfos = ref<ImageBoxInfoBase[]>([]);
 const getDicomSliceImageBoxInfo = (index: number) => imageBoxInfos.value[index] as DicomSliceImageBoxInfo;
@@ -1366,7 +1146,7 @@ const setPlaneOnBox = (i: number, plane: 'axi' | 'cor' | 'sag' | 'mip' | 'smip' 
     d.isMip = true;
     d.isVr = false;
     if (d.mip == null) {
-      d.mip = { mipAngle: 0, isSurface: plane === 'smip', thresholdSurfaceMip: 0.3, depthSurfaceMip: 3 };
+      d.mip = makeMipState(plane === 'smip');
     } else {
       d.mip.isSurface = (plane === 'smip');
     }
@@ -1386,7 +1166,7 @@ const setPlaneOnBox = (i: number, plane: 'axi' | 'cor' | 'sag' | 'mip' | 'smip' 
     d.isMip = false;
     d.isVr = true;
     if (d.mip == null) {
-      d.mip = { mipAngle: 0, isSurface: false, thresholdSurfaceMip: 0.3, depthSurfaceMip: 3 };
+      d.mip = makeMipState();
     }
     const vol = seriesList[d.currentSeriesNumber]?.volume;
     if (vol) {
@@ -1663,256 +1443,6 @@ const onSetVrShading = (
   showImage(i);
 };
 
-// ===== View state URL (B9: ?state=...) =====
-// 現在の layout を SerializedViewState に圧縮 → URL 用 base64 を返す。
-// 「Copy share URL」ボタン経由で呼ばれる想定。
-const serializeCurrentViewState = (): SerializedViewState => {
-  const bs: SerializedBoxState[] = [];
-  for (let i = 0; i < (tileN.value ?? 0); i++) {
-    const info = imageBoxInfos.value[i] as any;
-    if (!info) continue;
-    const isDicom = isDicomSliceImageBoxInfo(i);
-    const isFusion = isFusedImageBoxInfo(i);
-    const isMip = !isDicom && info.isMip;
-    const k = isDicom ? 'd' : isFusion ? 'f' : isMip ? 'm' : 'v';
-    const b: SerializedBoxState = {
-      k,
-      s: info.currentSeriesNumber ?? 0,
-      wc: info.myWC ?? undefined,
-      ww: info.myWW ?? undefined,
-      c: info.clut,
-    };
-    if (!isDicom) b.p = getBoxCurrentPlane(i) ?? undefined;
-    if (info.interpolation) b.in = info.interpolation === 'nearest' ? 'n' : 'b';
-    if (isFusion) {
-      b.s1 = info.currentSeriesNumber1;
-      b.wc1 = info.myWC1 ?? undefined;
-      b.ww1 = info.myWW1 ?? undefined;
-      b.c1 = info.clut1;
-      b.oa = info.overlayAlpha;
-      if (info.interpolation1) b.in1 = info.interpolation1 === 'nearest' ? 'n' : 'b';
-    }
-    if (info.mip) {
-      if (info.mip.mipAngle) b.mipAngle = info.mip.mipAngle;
-      if (info.mip.thresholdSurfaceMip != null) b.surfThresh = info.mip.thresholdSurfaceMip;
-      if (info.mip.depthSurfaceMip != null) b.surfDepth = info.mip.depthSurfaceMip;
-      if (info.mip.alphaScale != null) b.alphaScale = info.mip.alphaScale;
-      if (info.mip.vrOpacityPresetId) b.vrPreset = info.mip.vrOpacityPresetId;
-    }
-    bs.push(b);
-  }
-  return { v: 1, t: tileN.value ?? 0, sync: !!syncImageBox.value, bs };
-};
-
-// ===== Snapshot file (B-replacement-of-share-URL) =====
-// 「View status を JSON にして download / 別セッションで読み込み」用。
-// View 状態 + (有効なら) PET segmentation 状態を 1 ファイルにまとめる。
-// 注意: voxel データは含めない。ロード時、対応する画像が同じ seriesUID で再ロードされている前提。
-//
-// File format (JSON):
-//   { schema: 'metavol-snapshot', v: 1, ts: <epoch>, view: SerializedViewState,
-//     segmentation?: { seriesUID, dims, threshold, thresholdUnit, labels, ... ,
-//                      finalMask_b64?, thresholdMask_b64?, manualEdits_b64? } }
-
-// 矩形 ROI 1 件の JSON 表現 (snapshot / ROI export 共通)。voxel 座標。
-interface RectRoiJson {
-  id: number;
-  label: string | null;
-  seriesIndex: number;
-  seriesUID: string | null;
-  topLeft: { x: number; y: number; z: number };
-  bottomRight: { x: number; y: number; z: number };
-}
-
-interface MetavolSnapshotFile {
-  schema: 'metavol-snapshot';
-  v: 1;
-  ts: number;
-  view: SerializedViewState;
-  segmentation: {
-    seriesUID: string;
-    seriesDescription?: string;
-    dims: [number, number, number];
-    threshold: number;
-    thresholdUnit: 'SUV' | 'CNTS';
-    labels: Array<{ id: number; name: string; color: [number, number, number] }>;
-    currentLabelId: number;
-    sphere: { centerWorld: [number, number, number]; radiusMm: number } | null;
-    finalMask_b64?: string;
-    thresholdMask_b64?: string;
-    manualEdits_b64?: string;
-  } | null;
-  // 矩形 ROI は PET volume 非依存 (DX 1 枚画像でも置ける) ため top-level に持つ。
-  rectRois?: RectRoiJson[];
-}
-
-const ab2b64 = (buf: ArrayBuffer | undefined): string | undefined => {
-  if (!buf) return undefined;
-  const u8 = new Uint8Array(buf);
-  // chunked btoa to avoid stack overflow on large buffers
-  let s = '';
-  const CH = 0x8000;
-  for (let i = 0; i < u8.length; i += CH) {
-    s += String.fromCharCode.apply(null, Array.from(u8.subarray(i, i + CH)) as number[]);
-  }
-  return btoa(s);
-};
-const b642ab = (s: string | undefined): ArrayBuffer | undefined => {
-  if (!s) return undefined;
-  const bin = atob(s);
-  const u8 = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-  return u8.buffer;
-};
-
-const buildSnapshotJson = (): string => {
-  const view = serializeCurrentViewState();
-  const segPayload = segStore.serializeForPersistence();
-  let segmentation: MetavolSnapshotFile['segmentation'] = null;
-  if (segPayload) {
-    segmentation = {
-      seriesUID: segPayload.seriesUID,
-      seriesDescription: segPayload.seriesDescription,
-      dims: segPayload.dims,
-      threshold: segPayload.threshold,
-      thresholdUnit: segPayload.thresholdUnit,
-      labels: segPayload.labels.map(l => ({ id: l.id, name: l.name, color: [l.color[0], l.color[1], l.color[2]] as [number, number, number] })),
-      currentLabelId: segPayload.currentLabelId,
-      sphere: segPayload.sphere,
-      finalMask_b64: ab2b64(segPayload.finalMask),
-      thresholdMask_b64: ab2b64(segPayload.thresholdMask),
-      manualEdits_b64: ab2b64(segPayload.manualEdits),
-    };
-  }
-  const file: MetavolSnapshotFile = {
-    schema: 'metavol-snapshot',
-    v: 1,
-    ts: Date.now(),
-    view,
-    segmentation,
-    // 矩形 ROI は PET 非依存なので segmentation とは別に保存
-    rectRois: segStore.rectRois.map(rectRoiToJson),
-  };
-  return JSON.stringify(file);
-};
-
-// 結果: { ok, info: '...applied summary...' } / { ok: false, reason }
-const applySnapshotJson = (jsonText: string): { ok: true; info: string } | { ok: false; reason: string } => {
-  let parsed: any;
-  try { parsed = JSON.parse(jsonText); } catch (e) {
-    return { ok: false, reason: 'Invalid JSON: ' + ((e as Error)?.message ?? e) };
-  }
-  if (!parsed || parsed.schema !== 'metavol-snapshot') {
-    return { ok: false, reason: 'Not a metavol-snapshot file.' };
-  }
-  if (parsed.v !== 1) {
-    return { ok: false, reason: `Unsupported snapshot version: ${parsed.v}` };
-  }
-  const view = parsed.view as SerializedViewState | undefined;
-  if (!view || !Array.isArray(view.bs)) {
-    return { ok: false, reason: 'Snapshot has no view state.' };
-  }
-  // 注意: voxel data は含まれていないので、対応する image が seriesList に
-  // 既にロードされている前提。currentSeriesNumber が範囲外のときは applyViewState
-  // 内で defensive にスキップされる (info.currentSeriesNumber を直接代入するだけ)。
-  applyViewState(view);
-
-  let segMsg = '';
-  if (parsed.segmentation) {
-    const s = parsed.segmentation;
-    const r = segStore.restoreFromPersistence({
-      thresholdMask: b642ab(s.thresholdMask_b64),
-      manualEdits: b642ab(s.manualEdits_b64),
-      finalMask: b642ab(s.finalMask_b64),
-      dims: s.dims,
-      threshold: s.threshold,
-      thresholdUnit: s.thresholdUnit,
-      labels: s.labels,
-      currentLabelId: s.currentLabelId,
-      sphere: s.sphere,
-      savedAt: parsed.ts,
-    });
-    if (r.ok) segMsg = ' + segmentation';
-    else segMsg = ` (segmentation skipped: ${r.reason})`;
-  }
-
-  // 矩形 ROI の復元 (top-level、segmentation 非依存)
-  let rectMsg = '';
-  if (Array.isArray(parsed.rectRois)) {
-    segStore.clearRectRois();
-    const nr = importRectRoisFromJson(parsed.rectRois);
-    if (nr > 0) rectMsg = ` + ${nr} rect ROI(s)`;
-  }
-
-  show();
-  return { ok: true, info: `${view.t} box(es) restored${segMsg}${rectMsg}` };
-};
-
-// File として download / 受け取り。
-const downloadSnapshotFile = () => {
-  const json = buildSnapshotJson();
-  const blob = new Blob([json], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
-  a.href = url;
-  a.download = `metavol-snapshot_${ts}.json`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-};
-
-const loadSnapshotFile = async (file: File): Promise<{ ok: true; info: string } | { ok: false; reason: string }> => {
-  try {
-    const text = await file.text();
-    return applySnapshotJson(text);
-  } catch (e) {
-    return { ok: false, reason: 'Read failed: ' + ((e as Error)?.message ?? e) };
-  }
-};
-
-const applyViewState = (state: SerializedViewState) => {
-  if (!state || state.bs.length === 0) return;
-  // tileN を合わせる
-  const newTileN = Math.min(state.t, state.bs.length);
-  for (let i = 0; i < newTileN; i++) {
-    const sb = state.bs[i];
-    const info = imageBoxInfos.value[i] as any;
-    if (!info) continue;
-    if (sb.s != null) info.currentSeriesNumber = sb.s;
-    if (sb.wc != null) info.myWC = sb.wc;
-    if (sb.ww != null) info.myWW = sb.ww;
-    if (sb.c != null) info.clut = sb.c;
-    if (sb.in) info.interpolation = sb.in === 'n' ? 'nearest' : 'bilinear';
-    // Fusion 化が必要な場合 (clut1 を持つ box への変換) は MVP では未対応 — 保存元と同 layout 前提
-    if (sb.s1 != null) info.currentSeriesNumber1 = sb.s1;
-    if (sb.wc1 != null) info.myWC1 = sb.wc1;
-    if (sb.ww1 != null) info.myWW1 = sb.ww1;
-    if (sb.c1 != null) info.clut1 = sb.c1;
-    if (sb.oa != null) info.overlayAlpha = sb.oa;
-    if (sb.in1) info.interpolation1 = sb.in1 === 'n' ? 'nearest' : 'bilinear';
-    // plane 切替
-    if (sb.p && isAnyVolumeBox(i)) {
-      setPlaneOnBox(i, sb.p as any);
-    }
-    // MIP/VR params
-    if (info.mip) {
-      if (sb.mipAngle != null) info.mip.mipAngle = sb.mipAngle;
-      if (sb.surfThresh != null) info.mip.thresholdSurfaceMip = sb.surfThresh;
-      if (sb.surfDepth != null) info.mip.depthSurfaceMip = sb.surfDepth;
-      if (sb.alphaScale != null) info.mip.alphaScale = sb.alphaScale;
-      if (sb.vrPreset) {
-        info.mip.vrOpacityPresetId = sb.vrPreset;
-        const preset = TF_PRESETS.find(pp => pp.id === sb.vrPreset);
-        if (preset) info.mip.vrOpacityTF = preset.tf.map(p => ({ ...p }));
-      }
-    }
-  }
-  if (state.sync != null) syncImageBox.value = state.sync;
-  show();
-  console.log(`[state] applied view state: ${newTileN} boxes`);
-};
 
 // ===== VR auto demo =====
 // VrDemo は box 単位でしか持たないので、現在再生中の box id と controller 1 つ。
@@ -4637,6 +4167,56 @@ const findPetSeriesIndex = (): number => {
   return -1;
 };
 
+// ===== デバッグ機能 (Voxel inspector) の生成 =====
+// 実体は useDebugInspector composable に分離。deps (screenToWorldAny / worldToVoxel_ /
+// findPetSeriesIndex 等) がすべて定義済みのこの位置で生成する。seriesList は reassign される
+// let なので必ず getter 経由で最新を渡す。返却された ref/関数は template・イベントハンドラから
+// 参照されるため、そのまま同名で分割代入する。
+const {
+  debugHoverRows,
+  debugMaskInfo,
+  debugScreenX,
+  debugScreenY,
+  debugShow,
+  debugWorld,
+  updateDebugHover,
+  handleDebugEditClick,
+} = useDebugInspector({
+  debugMode,
+  imageBoxInfos,
+  imageBoxW,
+  imageBoxH,
+  getSeriesList: () => seriesList,
+  isDicomSliceImageBoxInfo,
+  isAnyVolumeBox,
+  getCanvasXY,
+  screenToWorldAny,
+  worldToVoxel_,
+  findPetSeriesIndex,
+  show,
+});
+
+// ===== View state URL / Snapshot file (session save/load) の生成 =====
+// 実体は useSnapshotIo composable に分離。rectRoiToJson / importRectRoisFromJson は rect ROI
+// export とも共有するため DicomView 側に残し、getter として渡す。downloadSnapshotFile /
+// loadSnapshotFile は defineExpose 経由で App.vue から呼ばれる。
+const {
+  downloadSnapshotFile,
+  loadSnapshotFile,
+} = useSnapshotIo({
+  tileN,
+  imageBoxInfos,
+  syncImageBox,
+  isDicomSliceImageBoxInfo,
+  isFusedImageBoxInfo,
+  isAnyVolumeBox,
+  getBoxCurrentPlane,
+  setPlaneOnBox,
+  show,
+  rectRoiToJson,
+  importRectRoisFromJson,
+});
+
 // 描画パイプラインが使う labelClut を store の各ラベル色から動的生成する。
 // index = label id で参照される (CPU: labelClut[lid % len], GPU: lid % len)。
 // 静的 labelClut (Clut.ts) は palette index であり label.color と一致しないため
@@ -5293,19 +4873,37 @@ const switchToSMip = (doShow: boolean) => {
   }
 }
 
+// 生成した単一 Volume phantom を「メインビューアーで開く」共通処理。
+// 起動直後は tileN=0 (box 0 個) なので、そのまま imageBoxInfos に書いても何も描画
+// されなかった (phantom が開かない不具合の原因)。fusion() と同じく tileN と書き込み先
+// box を確保してから showImage する。
+const openVolumePhantomInMainView = (
+  c: VolumeImageBoxInfo,
+  opts: { wc: number; ww: number; clut: number; description: string },
+) => {
+  c.myWC = opts.wc;
+  c.myWW = opts.ww;
+  c.clut = opts.clut;
+  c.description = opts.description;
+
+  // tileN=0 (起動直後 / Close all 後) なら 1 box 出して target を確保
+  if ((tileN.value ?? 0) <= 0) tileN.value = 1;
+  const sel = selectedImageBoxId.value;
+  const tgt = (sel >= 0 && sel < imageBoxInfos.value.length) ? sel : 0;
+  selectedImageBoxId.value = tgt;
+
+  imageBoxInfos.value[tgt] = c;
+  refreshSegStoreVolumeRefs();
+  rebuildSeriesSummaries();
+  showImage(tgt);
+}
+
 const phantomNema = () => {
   const P = Phantom.generatePhantomNema();
   const c = pushVolume(seriesList, P);
   // PT phantom: SUV-aware default window (0..16 → wc=8, ww=16 covers warm + hot spheres),
   // hot CLUT for visibility, sensible description.
-  c.myWC = 8;
-  c.myWW = 16;
-  c.clut = 1;
-  c.description = 'NEMA IEC Body Phantom';
-  imageBoxInfos.value[selectedImageBoxId.value] = c;
-  refreshSegStoreVolumeRefs();
-  rebuildSeriesSummaries();
-  show();
+  openVolumePhantomInMainView(c, { wc: 8, ww: 16, clut: 1, description: 'NEMA IEC Body Phantom' });
 }
 
 const phantomWholeBody = () => {
@@ -5313,15 +4911,91 @@ const phantomWholeBody = () => {
   const c = pushVolume(seriesList, P);
   // Whole-body PET: bladder is hottest (~18). Default window 0..15 catches mets +
   // most organs but leaves bladder saturated (which is realistic).
-  c.myWC = 7.5;
-  c.myWW = 15;
-  c.clut = 1;
-  c.description = 'Whole-body PET (synthetic)';
-  imageBoxInfos.value[selectedImageBoxId.value] = c;
+  openVolumePhantomInMainView(c, { wc: 7.5, ww: 15, clut: 1, description: 'Whole-body PET (synthetic)' });
+}
+
+// Whole-body PET/CT digital phantom: sample-data の cervicalca に幾何を似せた
+// 合成 CT + PET のペア (同一 world 座標なので fusion が揃う)。生成後は PET Standard
+// (CT axi / PET axi / Fusion / MIP) をそのままメインビューアーに開く。
+const phantomWholeBodyPetCt = async () => {
+  const { ct, pet } = Phantom.generatePhantomWholeBodyPetCt();
+  pushVolume(seriesList, ct);
+  pushVolume(seriesList, pet);
   refreshSegStoreVolumeRefs();
   rebuildSeriesSummaries();
-  show();
+
+  // PET Standard は 2x2。tileN を確保してから setupPetStandardView に任せる
+  // (PT/CT は metadata.modality から自動判別される)。
+  tileN.value = 4;
+  await nextTick();
+  await setupPetStandardView();
 }
+
+// ===== 実験: z スライスのスクランブル & 類似度による復元 =====
+// スクランブルの ground truth (どの series をどう並べ替えたか) を保持し、recover 後に
+// 復元精度をレポートする。scramble は coronal / MIP で見るとぐちゃぐちゃが分かる。
+const scrambleTruth = ref<{ seriesIdx: number; perm: number[] } | null>(null);
+
+// 現在選択中の box が指す series の volume を返す (無ければ PET → series 0)。
+const volumeForExperiment = (): { idx: number; vol: Volume } | null => {
+  const cand: number[] = [];
+  const sel = imageBoxInfos.value[selectedImageBoxId.value] as VolumeImageBoxInfo | undefined;
+  if (sel && typeof sel.currentSeriesNumber === 'number') cand.push(sel.currentSeriesNumber);
+  const pet = findPetSeriesIndex();
+  if (pet >= 0) cand.push(pet);
+  cand.push(0);
+  for (const i of cand) {
+    if (i >= 0 && i < seriesList.length && seriesList[i]?.volume) {
+      return { idx: i, vol: seriesList[i].volume! };
+    }
+  }
+  return null;
+};
+
+const scrambleSlices = () => {
+  const target = volumeForExperiment();
+  if (!target) { alert('Load or reconstruct a volume first (e.g. a phantom or PET Standard).'); return; }
+  const { idx, vol } = target;
+  const t0 = performance.now();
+  const { voxel, perm } = scrambleZSlices(vol);
+  const old = vol.voxel;
+  vol.voxel = voxel;
+  evictVolumeTexture(old);           // 旧 texture を解放 (GPU cache は voxel 参照 key)
+  scrambleTruth.value = { seriesIdx: idx, perm };
+  const desc = seriesSummaries.value[idx]?.description ?? `series ${idx}`;
+  console.log(`[scramble] shuffled ${vol.nz} z-slices of "${desc}" in ${(performance.now() - t0).toFixed(0)}ms`);
+  show();
+};
+
+const recoverSlices = () => {
+  const target = volumeForExperiment();
+  if (!target) { alert('Nothing to recover.'); return; }
+  const { idx, vol } = target;
+  const t0 = performance.now();
+  const { voxel, order } = recoverZOrder(vol);
+  const old = vol.voxel;
+  vol.voxel = voxel;
+  evictVolumeTexture(old);
+  const ms = performance.now() - t0;
+
+  let msg = `Recovered ${vol.nz} slices in ${ms.toFixed(0)}ms`;
+  // ground truth があれば精度をレポート (同じ series をスクランブルしていた場合のみ)
+  const truth = scrambleTruth.value;
+  if (truth && truth.seriesIdx === idx && truth.perm.length === vol.nz) {
+    const acc = scrambleAccuracy(truth.perm, order);
+    const pct = (acc.adjacency * 100).toFixed(1);
+    const rho = acc.spearmanAbs.toFixed(3);
+    msg = `Recovery: adjacency ${pct}%, |Spearman| ${rho}${acc.reversed ? ' (reversed)' : ''} — ${ms.toFixed(0)}ms`;
+    console.log(`[recover] adjacency=${pct}% spearmanAbs=${rho} reversed=${acc.reversed} n=${acc.n} (${ms.toFixed(0)}ms)`);
+    // recover は現在のスクランブル状態を「元に戻した」ので truth は無効化
+    // (recovered 順に voxel を並べ直したため perm はもう対応しない)。
+    scrambleTruth.value = null;
+  } else {
+    console.log(`[recover] reordered ${vol.nz} slices (no ground truth to score) in ${ms.toFixed(0)}ms`);
+  }
+  alert(msg);
+  show();
+};
 
 const runDebugger = () => {
   console.log(innerWidth);
@@ -5345,6 +5019,28 @@ const gridStyle = computed(() => {
   const cols = gridCols(tileN.value ?? 1);
   return { gridTemplateColumns: `repeat(${cols}, max-content)` };
 });
+
+// box が縦に占有する行数 (rowSpan)。default 1。
+const boxRowSpan = (i: number): number => {
+  const span = (imageBoxInfos.value[i] as VolumeImageBoxInfo | undefined)?.rowSpan ?? 1;
+  return span >= 2 ? Math.floor(span) : 1;
+};
+
+// rowSpan=2 の box は canvas を 2 行ぶんの高さにする。1 行の box 全体 = titlebar + canvas
+// なので、span 行ぶんの canvas 高さ = h*span + (titlebar + gap)*(span-1) で 2 行にピタリ収まる。
+const boxRenderHeight = (i: number): number => {
+  const h = imageBoxH.value ?? 0;
+  const span = boxRowSpan(i);
+  if (span <= 1) return h;
+  const gap = noGapMode.value ? 0 : GAP_PX;
+  return h * span + (TITLEBAR_H + gap) * (span - 1);
+};
+
+// grid セルに row span を効かせる style。
+const boxCellStyle = (i: number): Record<string, string> => {
+  const span = boxRowSpan(i);
+  return span >= 2 ? { gridRow: `span ${span}` } : {};
+};
 
 // 画像エリアのサイズから cols x rows がちょうど収まる box サイズを算出。
 // 正方形に固執せず、横と縦を独立に最大化して隙間を埋める。
@@ -5485,16 +5181,8 @@ const setupPetStandardView = async (overridePetIdx?: number, overrideCtIdx?: num
   const ct  = seriesList[ctIdx].volume!;
 
   // 各 Box の中心は CT の中心を基準に揃える（同じ世界座標を表示）
-  const ctCenter = (() => {
-    const p0 = voxelToWorld_(new THREE.Vector3(0,0,0), ctIdx);
-    const p1 = voxelToWorld_(new THREE.Vector3(ct.nx, ct.ny, ct.nz), ctIdx);
-    return p0.add(p1).divideScalar(2);
-  })();
-  const petCenter = (() => {
-    const p0 = voxelToWorld_(new THREE.Vector3(0,0,0), petIdx);
-    const p1 = voxelToWorld_(new THREE.Vector3(pet.nx, pet.ny, pet.nz), petIdx);
-    return p0.add(p1).divideScalar(2);
-  })();
+  const ctCenter = volumeCenterWorld(ct);
+  const petCenter = volumeCenterWorld(pet);
 
   // CT axial: black2white
   imageBoxInfos.value[0] = {
@@ -5551,7 +5239,7 @@ const setupPetStandardView = async (overridePetIdx?: number, overrideCtIdx?: num
     vecy: headUpVecy(pet.vectorZ.clone().normalize().multiplyScalar(ctStepX)),
     vecz: pet.vectorY.clone(),
     isMip: true,
-    mip: { mipAngle: 0, isSurface: false, thresholdSurfaceMip: 0.3, depthSurfaceMip: 3 },
+    mip: makeMipState(),
   } as VolumeImageBoxInfo;
 
   // store の参照を更新
@@ -5607,7 +5295,7 @@ const makeVolumeBoxForPlane = (
     clut, myWC: wcWw.wc, myWW: wcWw.ww, description,
     currentSeriesNumber: volIdx, centerInWorld: center,
     vecx, vecy, vecz, isMip,
-    mip: isMip ? { mipAngle: 0, isSurface: false, thresholdSurfaceMip: 0.3, depthSurfaceMip: 3 } : null,
+    mip: isMip ? makeMipState() : null,
   } as VolumeImageBoxInfo;
 };
 
@@ -5718,7 +5406,7 @@ const setupPtOnly4up = async () => {
     vecy: headUpVecy(pet.vectorZ.clone().normalize().multiplyScalar(pet.vectorX.length())),
     vecz: pet.vectorY.clone(),
     isMip: true,
-    mip: { mipAngle: 0, isSurface: false, thresholdSurfaceMip: 0.3, depthSurfaceMip: 3 },
+    mip: makeMipState(),
   } as VolumeImageBoxInfo;
   tileN.value = 4;
   refreshSegStoreVolumeRefs();
@@ -5769,6 +5457,91 @@ const setupCompare2up = async () => {
   imageBoxInfos.value[0] = makeVolumeBoxForPlane(leftIdx,  'axi', leftDesc,  leftClut,  wcL);
   imageBoxInfos.value[1] = makeVolumeBoxForPlane(rightIdx, 'axi', rightDesc, rightClut, wcR);
   tileN.value = 2;
+  refreshSegStoreVolumeRefs();
+  autoFitMode.value = true;
+  applyAutoFit();
+  syncImageBox.value = true;
+  await nextTick();
+  if (imb.value) for (const a of imb.value) a.init();
+  show();
+};
+
+// L5 PET/CT + tall MIP: 3×2 でいちばん右の列を全高 PET MIP にする。
+//   [ CT axial ][ PET axial      ][ PET MIP ]
+//   [ Fusion   ][ Fusion coronal ][  (span) ]
+// 右列の MIP は rowSpan=2 で 2 行ぶんの背高 box (setupPetCtMipRight → box2)。
+const setupPetCtMipRight = async () => {
+  const { petIdx, ctIdx } = resolvePetCtIndices();
+  if (petIdx < 0 || ctIdx < 0) { alert('Both a PT and a CT series are required.'); return; }
+  if (!seriesList[petIdx].volume && seriesList[petIdx].myDicom) mpr_(petIdx);
+  if (!seriesList[ctIdx].volume && seriesList[ctIdx].myDicom) mpr_(ctIdx);
+  if (!seriesList[petIdx].volume || !seriesList[ctIdx].volume) return;
+  const pet = seriesList[petIdx].volume!;
+  const ct  = seriesList[ctIdx].volume!;
+
+  const ctCenter = (() => {
+    const p0 = voxelToWorld_(new THREE.Vector3(0, 0, 0), ctIdx);
+    const p1 = voxelToWorld_(new THREE.Vector3(ct.nx, ct.ny, ct.nz), ctIdx);
+    return p0.add(p1).divideScalar(2);
+  })();
+
+  // box0: CT axial
+  imageBoxInfos.value[0] = makeVolumeBoxForPlane(ctIdx, 'axi', 'CT axial', 0, { wc: 40, ww: 400 });
+
+  // box1: PET axial (CT と同じ mm/px・中心に揃える)
+  const petMagX = ct.vectorX.length() / pet.vectorX.length();
+  const petMagY = ct.vectorY.length() / pet.vectorY.length();
+  imageBoxInfos.value[1] = {
+    clut: 1, myWC: 3, myWW: 6, description: 'PET axial',
+    currentSeriesNumber: petIdx,
+    centerInWorld: ctCenter.clone(),
+    vecx: pet.vectorX.clone().multiplyScalar(petMagX),
+    vecy: pet.vectorY.clone().multiplyScalar(petMagY),
+    vecz: pet.vectorZ.clone(),
+    isMip: false, mip: null,
+  } as VolumeImageBoxInfo;
+
+  // box2: PET MIP (右列・全高)。coronal 視軸で MIP、CT の mm/px に揃える。
+  const petCenter = (() => {
+    const p0 = voxelToWorld_(new THREE.Vector3(0, 0, 0), petIdx);
+    const p1 = voxelToWorld_(new THREE.Vector3(pet.nx, pet.ny, pet.nz), petIdx);
+    return p0.add(p1).divideScalar(2);
+  })();
+  const ctStepX = ct.vectorX.length();
+  imageBoxInfos.value[2] = {
+    clut: 1, myWC: 3, myWW: 6, description: 'PET MIP',
+    currentSeriesNumber: petIdx,
+    centerInWorld: petCenter.clone(),
+    vecx: pet.vectorX.clone().normalize().multiplyScalar(ctStepX),
+    vecy: headUpVecy(pet.vectorZ.clone().normalize().multiplyScalar(ctStepX)),
+    vecz: pet.vectorY.clone(),
+    isMip: true,
+    mip: makeMipState(),
+    rowSpan: 2,
+  } as VolumeImageBoxInfo;
+
+  // box3/box4: Fusion axial + coronal (CT base + PET rainbow overlay)
+  const makeFused = (plane: 'axi' | 'cor', desc: string): FusedVolumeImageBoxInfo => {
+    let vecx: THREE.Vector3, vecy: THREE.Vector3, vecz: THREE.Vector3;
+    if (plane === 'cor') {
+      vecx = ct.vectorX.clone();
+      vecy = headUpVecy(ct.vectorZ.clone().normalize().multiplyScalar(ct.vectorX.length()));
+      vecz = ct.vectorY.clone();
+    } else {
+      vecx = ct.vectorX.clone(); vecy = ct.vectorY.clone(); vecz = ct.vectorZ.clone();
+    }
+    return {
+      centerInWorld: ctCenter.clone(), vecx, vecy, vecz,
+      clut: 0, clut1: 2,
+      currentSeriesNumber: ctIdx, currentSeriesNumber1: petIdx,
+      description: desc, myWC: 40, myWW: 400, myWC1: 3, myWW1: 6,
+    } as FusedVolumeImageBoxInfo;
+  };
+  imageBoxInfos.value[3] = makeFused('axi', 'Fusion axial');
+  imageBoxInfos.value[4] = makeFused('cor', 'Fusion coronal');
+
+  tileN.value = 5;
+  selectedImageBoxId.value = 0;
   refreshSegStoreVolumeRefs();
   autoFitMode.value = true;
   applyAutoFit();
@@ -5886,7 +5659,12 @@ defineExpose({
   setupTriplanarFused,
   setupPtOnly4up,
   setupCompare2up,
+  setupPetCtMipRight,
+  scrambleSlices,
+  recoverSlices,
   loadTestDicom,
+  // ガイドツアー (デモ) 用: 合成 PET/CT ファントムを読み込む
+  phantomWholeBodyPetCt,
   // ハンバーガーメニューの "Load files…" から呼ぶための公開エントリ
   loadFiles,
   disableAutoFit,
@@ -5951,6 +5729,9 @@ defineExpose({
       @viewHeader="(p: { index: number }) => onViewNiftiHeader(p.index)"
       @phantomNema="phantomNema"
       @phantomWholeBody="phantomWholeBody"
+      @phantomWholeBodyPetCt="phantomWholeBodyPetCt"
+      @scrambleSlices="scrambleSlices"
+      @recoverSlices="recoverSlices"
       @redraw="show"
     />
   </v-navigation-drawer>
@@ -6024,10 +5805,11 @@ defineExpose({
         v-for="i in tileN"
         :key="i"
         :class="['mv-imagebox-cell', { 'is-selected': i-1 === selectedImageBoxId, 'cursor-grab': leftButtonFunction==='pan', 'mv-cursor-cross': leftButtonFunction==='brushROI' || leftButtonFunction==='polygonROI' }]"
+        :style="boxCellStyle(i-1)"
         ref="imb"
         :imageBoxId="i-1"
         :width="imageBoxW"
-        :height="imageBoxH"
+        :height="boxRenderHeight(i-1)"
         @wheel.prevent="wheel"
         @click="imageBoxClicked"
         @mousemove="mouseMove"

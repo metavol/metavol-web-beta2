@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import * as THREE from 'three';
+import * as THREE from '@/lib/threeMath';
 import type { Volume } from '../components/Volume';
 import { connectedComponents26, floodFillAssignLabel, extractCtBodyMask, sphereStatsInPet } from '../components/segmentation/maskOps';
 import { writeNiftiUint16, triggerDownload } from '../components/segmentation/niftiWriter';
@@ -296,6 +296,10 @@ export const useSegmentationStore = defineStore('segmentation', {
             return v.vectorX.length() * v.vectorY.length() * v.vectorZ.length();
         },
         volumesByLabel(state): Map<number, number> {
+            // finalMask は recomputeFinalMask / assign で **in-place 変更** される (配列参照は不変) ので、
+            // finalMask だけを dep にすると Vue が再計算せず Labels 表が stale になる (assign しても 0 のまま)。
+            // lesionRows と同様に maskVersion を dep に含めて、マスク編集ごとに再計算させる。
+            void state.maskVersion;
             const out = new Map<number, number>();
             const m = state.finalMask;
             if (!m || !state.petVolumeRef) return out;
@@ -313,6 +317,8 @@ export const useSegmentationStore = defineStore('segmentation', {
         },
         // ラベルごとの voxel 数 (Labels テーブルの "個数" 表示用)。
         voxelCountsByLabel(state): Map<number, number> {
+            // 同上: finalMask は in-place 変更されるため maskVersion を dep にして再計算させる。
+            void state.maskVersion;
             const out = new Map<number, number>();
             const m = state.finalMask;
             if (!m) return out;

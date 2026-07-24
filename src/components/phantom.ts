@@ -1,5 +1,5 @@
 import { Volume } from "./Volume.ts";
-import * as THREE from 'three';
+import * as THREE from '@/lib/threeMath';
 
 // NEMA IEC Body Phantom — 6 hot spheres of decreasing diameter inside a warm
 // elliptical body cylinder, with a cold central lung insert. The standard PET
@@ -241,4 +241,237 @@ export const generatePhantomWholeBody = (): Volume => {
       suvSource: 'units_already_SUV',
     },
   };
+};
+
+// ===========================================================================
+// Whole-body PET/CT digital phantom — paired CT + PET built from geometric
+// primitives (ellipsoids / cylinders / spheres), with a geometry deliberately
+// matched to the sample-data `cervicalca` case so it behaves like a real
+// whole-body FDG PET/CT (head→thigh) in the viewer. CT and PET are sampled on
+// their own grids but from the SAME world-space anatomy, so Fusion aligns.
+//
+// Grids (mirroring cervicalca):
+//   CT : 512×512×345 @ 0.98×0.98×5.0 mm, origin (-249.5,-420.5,-23.5), z↓
+//   PET: 168×168×849 @ 4.07×4.07×2.03 mm, origin (-338.1,-513.1,-24.4), z↓
+// The head vertex is at world z ≈ -23.5 (slice 0); z decreases toward the feet.
+//
+// Tissue labels → (CT HU, PET SUV). Distributions are geometric shapes only.
+type Tissue =
+  | 'air' | 'soft' | 'fat' | 'lung' | 'bone' | 'marrow'
+  | 'brain' | 'heart' | 'liver' | 'spleen' | 'kidney' | 'bladder'
+  | 'tumor' | 'node';
+
+const TISSUE_HU: Record<Tissue, number> = {
+  air: -1000, soft: 40, fat: -95, lung: -780, bone: 700, marrow: 180,
+  brain: 35, heart: 45, liver: 55, spleen: 48, kidney: 32, bladder: 8,
+  tumor: 42, node: 38,
+};
+const TISSUE_SUV: Record<Tissue, number> = {
+  air: 0, soft: 0.9, fat: 0.4, lung: 0.45, bone: 0.6, marrow: 1.6,
+  brain: 8, heart: 3.5, liver: 2.2, spleen: 1.9, kidney: 4.5, bladder: 22,
+  tumor: 14, node: 8,
+};
+
+// Anatomy is a pure function of world (mm). Head vertex at HEAD_TOP_Z; the body
+// is centred at (BCX,BCY) in-plane. All landmarks are given as "distance below
+// the head vertex" (dHead, mm) and converted to world z on the fly.
+const HEAD_TOP_Z = -23.5;
+const BCX = 0.9;
+const BCY = -170;
+const cz = (dHead: number): number => HEAD_TOP_Z - dHead;   // world z at a landmark
+
+const ellip = (dx: number, dy: number, dz: number, rx: number, ry: number, rz: number): number =>
+  (dx * dx) / (rx * rx) + (dy * dy) / (ry * ry) + (dz * dz) / (rz * rz);
+
+// Return the tissue at a world point. Precedence: lesions > bone > organs > fat > soft.
+const tissueAtWorld = (wx: number, wy: number, wz: number): Tissue => {
+  const dHead = HEAD_TOP_Z - wz;                 // 0 at vertex, +ve toward feet
+  if (dHead < 0 || dHead > 1720) return 'air';
+  const x = wx - BCX;
+  const y = wy - BCY;
+
+  // ---- Body envelope (varies head→pelvis; legs are two thigh cylinders) ----
+  let inBody = false;
+  let ax = 0, ay = 0;
+  let inLeg = false;
+  if (dHead < 210)      { ax = 78;  ay = 98; }   // head
+  else if (dHead < 275) { ax = 62;  ay = 72; }   // neck
+  else if (dHead < 300) { ax = 132; ay = 102; }  // shoulders
+  else if (dHead < 520) { ax = 156; ay = 112; }  // thorax
+  else if (dHead < 760) { ax = 146; ay = 110; }  // abdomen
+  else if (dHead < 955) { ax = 150; ay = 112; }  // pelvis
+  else {
+    // Legs: two thighs tapering toward the knees
+    const legR = 60 - (dHead - 955) * 0.02;
+    const dl = (x + 62) * (x + 62) + y * y;
+    const dr = (x - 62) * (x - 62) + y * y;
+    if (dl <= legR * legR || dr <= legR * legR) inLeg = true;
+    else return 'air';
+    // Femur shaft: a bone cylinder inside each thigh, marrow core
+    const fdl = (x + 62) * (x + 62) + y * y;
+    const fdr = (x - 62) * (x - 62) + y * y;
+    const fem = Math.min(fdl, fdr);
+    if (fem <= 9 * 9) return 'marrow';
+    if (fem <= 16 * 16) return 'bone';
+    // subcutaneous fat rim on the thigh
+    const rimR = legR - 8;
+    if (dl > rimR * rimR && dr > rimR * rimR) return 'fat';
+    return 'soft';
+  }
+
+  if (!inLeg) {
+    const e = (x * x) / (ax * ax) + (y * y) / (ay * ay);
+    if (e > 1) return 'air';
+    inBody = true;
+  }
+  if (!inBody) return 'air';
+
+  // ---- Lesions (highest precedence) ----
+  // Cervical-cancer primary: hot midline mass low in the pelvis.
+  // 膀胱 (cz(820)±42) より十分下 (cz(910)) に置き、SUV 閾値マスクで独立した
+  // 連結成分になるようにする (デモの assign で腫瘍だけを Tumor に振り分けられる)。
+  if (ellip(x, y - 28, wz - cz(910), 24, 22, 24) <= 1) return 'tumor';
+  // Nodal metastases (spheres): para-aortic + left external-iliac.
+  if (ellip(x - 4, y + 40, wz - cz(650), 10, 10, 10) <= 1) return 'node';
+  if (ellip(x + 46, y + 38, wz - cz(806), 9, 9, 9) <= 1) return 'node';
+
+  // ---- Bone (overrides organs where it passes through) ----
+  // Spine: posterior cylinder (cortical shell + marrow core), neck→sacrum.
+  if (dHead > 235 && dHead < 905) {
+    const sr = (x) * (x) + (y - 58) * (y - 58);
+    if (sr <= 9 * 9) return 'marrow';
+    if (sr <= 15 * 15) return 'bone';
+  }
+  // Iliac bones: two blocks in the pelvis.
+  if (ellip(x - 92, y + 30, wz - cz(838), 34, 46, 55) <= 1) return 'bone';
+  if (ellip(x + 92, y + 30, wz - cz(838), 34, 46, 55) <= 1) return 'bone';
+
+  // ---- Organs (first match wins) ----
+  if (ellip(x, y, wz - cz(120), 60, 74, 82) <= 1) return 'brain';
+  if (ellip(x - 30, y - 12, wz - cz(372), 46, 40, 58) <= 1) return 'heart';
+  // Lungs (two cold ellipsoids); heart already claimed the central region.
+  if (ellip(x - 66, y - 6, wz - cz(400), 58, 82, 130) <= 1) return 'lung';
+  if (ellip(x + 66, y - 6, wz - cz(400), 58, 82, 130) <= 1) return 'lung';
+  if (ellip(x + 56, y + 4, wz - cz(580), 96, 74, 82) <= 1) return 'liver';
+  if (ellip(x - 82, y + 8, wz - cz(560), 40, 34, 56) <= 1) return 'spleen';
+  if (ellip(x - 62, y + 44, wz - cz(632), 28, 22, 46) <= 1) return 'kidney';
+  if (ellip(x + 62, y + 44, wz - cz(632), 28, 22, 46) <= 1) return 'kidney';
+  if (ellip(x, y + 24, wz - cz(820), 40, 34, 42) <= 1) return 'bladder';
+
+  // ---- Fat rim then soft-tissue default ----
+  const e = (x * x) / (ax * ax) + (y * y) / (ay * ay);
+  if (e > 0.86) return 'fat';
+  return 'soft';
+};
+
+const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+// 腫瘍の primary の world 中心 (デモの assign 用に export)。
+export const PHANTOM_PETCT_TUMOR_WORLD: [number, number, number] = [BCX, BCY + 28, cz(910)];
+
+// CT の値 (HU): tissue ごとに一様。
+const ctHuAtWorld = (wx: number, wy: number, wz: number): number =>
+  TISSUE_HU[tissueAtWorld(wx, wy, wz)];
+
+// PET の値 (SUV): tissue の base に「病変内グラデーション」と「臓器/背景の弱いテクスチャ」を
+// 掛けて、実画像のように不均一にする (均一なフラット SUV を避ける)。
+const petSuvAtWorld = (wx: number, wy: number, wz: number): number => {
+  const t = tissueAtWorld(wx, wy, wz);
+  const base = TISSUE_SUV[t];
+  if (base === 0) return 0;
+  const x = wx - BCX, y = wy - BCY;
+  if (t === 'tumor') {
+    // 中心ほど高集積 → 辺縁は低下 (0=中心 .. 1=辺縁の ellip 値を使う)。内部リップルで不均一に。
+    const e = ellip(x, y - 28, wz - cz(910), 24, 22, 24);
+    const core = clamp01(1 - e);
+    const ripple = 1 + 0.10 * Math.sin(wx * 0.55) * Math.sin(wz * 0.42);
+    return Math.max(0, base * (0.42 + 0.58 * core) * ripple);
+  }
+  if (t === 'node') {
+    const e = Math.min(
+      ellip(x - 4, y + 40, wz - cz(650), 10, 10, 10),
+      ellip(x + 46, y + 38, wz - cz(806), 9, 9, 9),
+    );
+    return Math.max(0, base * (0.5 + 0.5 * clamp01(1 - e)));
+  }
+  // 臓器 / 背景: 低周波の空間テクスチャ (±~8%) を掛けてフラットさを崩す。
+  const tex = 1
+    + 0.06 * Math.sin(wx * 0.09) * Math.cos(wy * 0.08)
+    + 0.04 * Math.sin(wz * 0.06);
+  return Math.max(0, base * tex);
+};
+
+// Fill an axis-aligned grid by sampling a per-voxel value function.
+const fillGrid = (
+  nx: number, ny: number, nz: number,
+  ox: number, oy: number, oz: number,
+  px: number, py: number, pz: number,   // pz already signed (z decreases downward)
+  valueAt: (wx: number, wy: number, wz: number) => number,
+): Float32Array => {
+  const voxel = new Float32Array(nx * ny * nz);
+  for (let z = 0; z < nz; z++) {
+    const wz = oz + z * pz;
+    const zBase = z * nx * ny;
+    for (let y = 0; y < ny; y++) {
+      const wy = oy + y * py;
+      const rowBase = zBase + y * nx;
+      for (let x = 0; x < nx; x++) {
+        const wx = ox + x * px;
+        voxel[rowBase + x] = valueAt(wx, wy, wz);
+      }
+    }
+  }
+  return voxel;
+};
+
+export interface PetCtPhantom {
+  ct: Volume;
+  pet: Volume;
+}
+
+export const generatePhantomWholeBodyPetCt = (): PetCtPhantom => {
+  // CT grid (mirrors cervicalca Fusion CT)
+  const ctNx = 512, ctNy = 512, ctNz = 345;
+  const ctPx = 0.98, ctPy = 0.98, ctPz = -5.0;
+  const ctOx = -249.5, ctOy = -420.5, ctOz = -23.5;
+  const t0 = performance.now();
+  const ctVoxel = fillGrid(ctNx, ctNy, ctNz, ctOx, ctOy, ctOz, ctPx, ctPy, ctPz, ctHuAtWorld);
+
+  // PET grid (mirrors cervicalca PET WB)
+  const ptNx = 168, ptNy = 168, ptNz = 849;
+  const ptPx = 4.07, ptPy = 4.07, ptPz = -2.03;
+  const ptOx = -338.1, ptOy = -513.1, ptOz = -24.4;
+  const petVoxel = fillGrid(ptNx, ptNy, ptNz, ptOx, ptOy, ptOz, ptPx, ptPy, ptPz, petSuvAtWorld);
+  console.log(`[phantom] WB PET/CT generated in ${(performance.now() - t0).toFixed(0)}ms`);
+
+  const ct: Volume = {
+    voxel: ctVoxel,
+    nx: ctNx, ny: ctNy, nz: ctNz,
+    imagePosition: new THREE.Vector3(ctOx, ctOy, ctOz),
+    vectorX: new THREE.Vector3(ctPx, 0, 0),
+    vectorY: new THREE.Vector3(0, ctPy, 0),
+    vectorZ: new THREE.Vector3(0, 0, ctPz),
+    metadata: {
+      modality: 'CT',
+      seriesDescription: 'Whole-body CT (synthetic phantom)',
+    },
+  };
+
+  const pet: Volume = {
+    voxel: petVoxel,
+    nx: ptNx, ny: ptNy, nz: ptNz,
+    imagePosition: new THREE.Vector3(ptOx, ptOy, ptOz),
+    vectorX: new THREE.Vector3(ptPx, 0, 0),
+    vectorY: new THREE.Vector3(0, ptPy, 0),
+    vectorZ: new THREE.Vector3(0, 0, ptPz),
+    metadata: {
+      modality: 'PT',
+      seriesDescription: 'Whole-body PET (synthetic phantom)',
+      suvOk: true,
+      suvFactor: 1,
+      suvSource: 'units_already_SUV',
+    },
+  };
+
+  return { ct, pet };
 };

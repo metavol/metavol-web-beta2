@@ -13,8 +13,8 @@
 //   - 単独 VR (volume): yaw + TF preset cycle + alphaScale 振り + shading on/off
 //   - Fusion VR     : yaw + overlayAlpha 振り (CT ↔ PET) + pitch 揺れ
 
-import * as THREE from 'three';
-import type { VolumeImageBoxInfo, FusedVolumeImageBoxInfo } from './DicomImageBoxInfo';
+import * as THREE from '@/lib/threeMath';
+import { type VolumeImageBoxInfo, type FusedVolumeImageBoxInfo, makeMipState } from './DicomImageBoxInfo';
 
 export interface VrDemoCallbacks {
     /** box info を変更したあと呼ぶ。`showImage(i)` をトリガする。 */
@@ -179,7 +179,7 @@ export class VrDemo {
     start(opt: StartDemoOptions) {
         if (this.rafId !== null) return;     // already running
         const info = opt.info;
-        if (!info.mip) info.mip = { mipAngle: 0, isSurface: false, thresholdSurfaceMip: 0.3, depthSurfaceMip: 3 };
+        if (!info.mip) info.mip = makeMipState();
         // snapshot for restore on stop
         this.restoreInfo = info;
         this.snapshot = {

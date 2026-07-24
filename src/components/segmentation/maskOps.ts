@@ -1,4 +1,4 @@
-import * as THREE from 'three';
+import * as THREE from '@/lib/threeMath';
 import { Volume, voxelToWorld, worldToVoxel } from '../Volume';
 
 export const allocateMaskForPet = (pet: Volume): Uint16Array => {

@@ -37,6 +37,9 @@ const emit = defineEmits([
   "changeSlice",
   "phantomNema",
   "phantomWholeBody",
+  "phantomWholeBodyPetCt",
+  "scrambleSlices",
+  "recoverSlices",
   "redraw",
   "setModality",
   "setActiveForSeg",
@@ -267,10 +270,30 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
           <v-btn size="x-small" variant="tonal" @click="emit('phantomWholeBody')">
             Whole-body PET
           </v-btn>
+          <v-btn size="x-small" variant="tonal" @click="emit('phantomWholeBodyPetCt')">
+            Whole-body PET/CT
+          </v-btn>
         </div>
         <div class="text-caption text-disabled mt-1">
           NEMA IEC: 6 hot spheres in a warm body, cold lung insert.<br />
-          Whole-body: synthetic FDG-PET with brain, heart, liver, kidneys, bladder, and 8 metastases.
+          Whole-body PET: synthetic FDG-PET with brain, heart, liver, kidneys, bladder, and 8 metastases.<br />
+          Whole-body PET/CT: paired synthetic CT + PET (cervical-cancer-like geometry) built from
+          geometric shapes; opens as PET Standard.
+        </div>
+
+        <div class="mv-section-title mt-3">Experiments</div>
+        <div class="mv-btn-row">
+          <v-btn size="x-small" variant="tonal" @click="emit('scrambleSlices')">
+            Scramble Z
+          </v-btn>
+          <v-btn size="x-small" variant="tonal" @click="emit('recoverSlices')">
+            Recover Z
+          </v-btn>
+        </div>
+        <div class="text-caption text-disabled mt-1">
+          Scramble Z: randomly shuffles the selected volume's z-slices (view coronal/MIP to see it).<br />
+          Recover Z: reorders slices by slice-to-slice similarity (SSD) and reports how well the
+          original order was recovered.
         </div>
 
         <!-- PET Standard 候補スコアリングルール (ATTN > NAC、WB > Lung 等) -->

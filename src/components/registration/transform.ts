@@ -1,7 +1,7 @@
 // Rigid 6-DOF transform helpers for image registration.
 // 6 parameters: (tx, ty, tz, rx, ry, rz) — translation in mm, rotation in radians.
 
-import * as THREE from 'three';
+import * as THREE from '@/lib/threeMath';
 import type { Volume } from '../Volume';
 
 export type RigidParams = readonly [number, number, number, number, number, number];

@@ -3,7 +3,7 @@
 // homework: MyDataSet is dupulicated with DicomView.vue
 
 import { DataSet } from "dicom-parser";
-import * as THREE from 'three';
+import * as THREE from '@/lib/threeMath';
 import { Volume } from "./Volume";
 import type { VolumeMetadata, Modality, SuvSource } from "../types/VolumeMetadata";
 import * as DecompressJpegLossless from "./decompressJpegLossless";
