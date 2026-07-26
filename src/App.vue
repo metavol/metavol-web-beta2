@@ -10,7 +10,12 @@
               variant="text"
               size="small"
               data-demo="menu"
-            />
+            >
+              <v-icon icon="mdi-menu" />
+              <v-tooltip activator="parent" location="bottom">
+                Main menu — load / save / export, snapshots, preprocessing, help
+              </v-tooltip>
+            </v-btn>
           </template>
           <v-list density="compact">
             <v-list-item @click="onClickLoadFromMenu">
@@ -28,6 +33,46 @@
               style="display: none"
               @change="onAppBarLoadInputChange"
             />
+
+            <v-divider />
+
+            <!-- Save / export (Segmentation footer + Snapshot menu を集約) -->
+            <v-list-item :disabled="!segStore.finalMask" data-demo="save-nifti" @click="onSaveNiftiMask">
+              <template v-slot:prepend><v-icon icon="mdi-content-save" size="small" /></template>
+              <v-list-item-title>Save NIfTI mask</v-list-item-title>
+              <v-list-item-subtitle>.nii + .json sidecar (multi-label mask)</v-list-item-subtitle>
+            </v-list-item>
+            <v-list-item :disabled="!segStore.hasPet" @click="onExportPdfFromMenu">
+              <template v-slot:prepend><v-icon icon="mdi-file-pdf-box" size="small" /></template>
+              <v-list-item-title>Export PDF report…</v-list-item-title>
+            </v-list-item>
+            <v-list-item @click="onExportRois">
+              <template v-slot:prepend><v-icon icon="mdi-vector-rectangle" size="small" /></template>
+              <v-list-item-title>Export ROIs…</v-list-item-title>
+            </v-list-item>
+
+            <v-divider />
+
+            <v-list-item @click="onLoadSnapshot">
+              <template v-slot:prepend><v-icon icon="mdi-tray-arrow-up" size="small" /></template>
+              <v-list-item-title>Load snapshot…</v-list-item-title>
+              <v-list-item-subtitle>Restore a saved .json session (load images first)</v-list-item-subtitle>
+            </v-list-item>
+            <v-list-item @click="onLoadMaskFromMenu">
+              <template v-slot:prepend><v-icon icon="mdi-folder-open" size="small" /></template>
+              <v-list-item-title>Load mask (NIfTI)…</v-list-item-title>
+            </v-list-item>
+            <v-list-item @click="onImportRois">
+              <template v-slot:prepend><v-icon icon="mdi-vector-rectangle" size="small" /></template>
+              <v-list-item-title>Import ROIs…</v-list-item-title>
+            </v-list-item>
+
+            <v-divider />
+
+            <v-list-item :disabled="!segStore.finalMask" @click="onClearEditsFromMenu">
+              <template v-slot:prepend><v-icon icon="mdi-eraser" size="small" /></template>
+              <v-list-item-title>Clear edits</v-list-item-title>
+            </v-list-item>
 
             <v-divider />
 
@@ -157,60 +202,39 @@
             </v-list-item>
           </v-list>
         </v-menu>
+
+        <!-- 左サイドバー開閉。ハンバーガーの「右隣」に置く: 最左はアプリメニュー (慣習) を保ち、
+             その次に、制御対象である左ドロワーの真上に来る位置。右端の右サイドバートグルと左右対称。 -->
+        <v-btn
+          :class="['mv-tool-btn', { 'is-active': drawerLeft }]"
+          variant="text"
+          size="small"
+          @click="drawerLeft = !drawerLeft"
+        >
+          <v-icon icon="mdi-dock-left" />
+          <v-tooltip activator="parent" location="bottom">
+            {{ drawerLeft ? 'Hide left sidebar (series list & view settings)' : 'Show left sidebar (series list & view settings)' }}
+          </v-tooltip>
+        </v-btn>
       </template>
 
       <div class="mv-brand ml-1">
         meta<span class="mv-brand-accent">vol</span>-web
       </div>
 
-      <!-- Snapshot save/load: viewer status を JSON にして download / 別セッションで読み込み -->
-      <v-menu location="bottom">
-        <template v-slot:activator="{ props: act }">
-          <v-btn
-            v-bind="act"
-            :class="['mv-tool-btn', 'ml-2', { 'is-active': !!snapshotMsg }]"
-            variant="text"
-            size="small"
-          >
-            <v-icon :icon="snapshotMsg ? 'mdi-check' : 'mdi-camera-outline'" />
-            <v-tooltip activator="parent" location="bottom">
-              <template v-if="snapshotMsg">{{ snapshotMsg }}</template>
-              <template v-else>Snapshot — save / load viewer status</template>
-            </v-tooltip>
-          </v-btn>
-        </template>
-        <v-list density="compact">
-          <v-list-item @click="onSaveSnapshot">
-            <template v-slot:prepend>
-              <v-icon icon="mdi-tray-arrow-down" size="small" />
-            </template>
-            <v-list-item-title>Save snapshot…</v-list-item-title>
-            <v-list-item-subtitle>Download .json with layout + segmentation</v-list-item-subtitle>
-          </v-list-item>
-          <v-list-item @click="onLoadSnapshot">
-            <template v-slot:prepend>
-              <v-icon icon="mdi-tray-arrow-up" size="small" />
-            </template>
-            <v-list-item-title>Load snapshot…</v-list-item-title>
-            <v-list-item-subtitle>Pick a previously saved .json (load images first)</v-list-item-subtitle>
-          </v-list-item>
-          <v-divider />
-          <v-list-item @click="onExportRois">
-            <template v-slot:prepend>
-              <v-icon icon="mdi-vector-rectangle" size="small" />
-            </template>
-            <v-list-item-title>Export ROIs…</v-list-item-title>
-            <v-list-item-subtitle>Download .json with rectangle ROIs (voxel coordinates)</v-list-item-subtitle>
-          </v-list-item>
-          <v-list-item @click="onImportRois">
-            <template v-slot:prepend>
-              <v-icon icon="mdi-vector-rectangle" size="small" />
-            </template>
-            <v-list-item-title>Import ROIs…</v-list-item-title>
-            <v-list-item-subtitle>Load a previously exported metavol-roi .json</v-list-item-subtitle>
-          </v-list-item>
-        </v-list>
-      </v-menu>
+      <!-- Snapshot: ワンクリックでフルセッション (.json) を保存。Load / ROI 系はハンバーガーへ移設。 -->
+      <v-btn
+        :class="['mv-tool-btn', 'ml-2', { 'is-active': !!snapshotMsg }]"
+        variant="text"
+        size="small"
+        @click="onSaveSnapshot"
+      >
+        <v-icon :icon="snapshotMsg ? 'mdi-check' : 'mdi-camera-outline'" />
+        <v-tooltip activator="parent" location="bottom">
+          <template v-if="snapshotMsg">{{ snapshotMsg }}</template>
+          <template v-else>Save snapshot (full session: layout + mask + labels + ROIs)</template>
+        </v-tooltip>
+      </v-btn>
       <input
         ref="snapshotLoadInput"
         type="file"
@@ -317,20 +341,7 @@
         />
       </div>
 
-      <v-btn
-        class="mv-pet-std-btn mr-1"
-        variant="flat"
-        size="small"
-        data-demo="pet-standard"
-        :disabled="!petCtReady"
-        @click="onClickPetStandard"
-      >
-        <v-icon icon="mdi-view-grid" class="mr-1" size="small" />
-        PET Standard
-        <v-tooltip activator="parent" location="bottom">
-          {{ petStandardTooltip }}
-        </v-tooltip>
-      </v-btn>
+      <!-- PET Standard は Layouts メニュー内「PET/CT/Fusion」に移設 (単独ボタン廃止)。 -->
 
       <!-- PET Standard ピッカー (PT or CT が複数あるときだけ開く) -->
       <v-dialog
@@ -375,8 +386,14 @@
           </div>
 
           <div class="d-flex justify-end mt-5" style="gap: 8px">
-            <v-btn variant="text" @click="petPickerOpen = false">Cancel</v-btn>
-            <v-btn color="primary" variant="flat" @click="confirmPetPicker">Build</v-btn>
+            <v-btn variant="text" @click="petPickerOpen = false">
+              Cancel
+              <v-tooltip activator="parent" location="top">Close without building the layout</v-tooltip>
+            </v-btn>
+            <v-btn color="primary" variant="flat" @click="confirmPetPicker">
+              Build
+              <v-tooltip activator="parent" location="top">Build the PET/CT/Fusion layout from the selected PT and CT</v-tooltip>
+            </v-btn>
           </div>
         </v-card>
       </v-dialog>
@@ -388,13 +405,22 @@
             class="mv-tool-btn mv-tool-btn--wide mr-1"
             variant="text"
             size="small"
+            data-demo="pet-standard"
           >
             <v-icon icon="mdi-view-dashboard-outline" />
             <span class="mv-tool-label">Layouts</span>
-            <v-tooltip activator="parent" location="bottom">More layout presets</v-tooltip>
+            <v-tooltip activator="parent" location="bottom">Layout presets</v-tooltip>
           </v-btn>
         </template>
-        <v-list density="compact">
+        <v-list density="compact" class="mv-layouts-menu">
+          <v-list-item :disabled="!petCtReady" @click="onClickPetStandard">
+            <template v-slot:prepend>
+              <v-icon icon="mdi-view-grid" size="small" />
+            </template>
+            <v-list-item-title>PET/CT/Fusion</v-list-item-title>
+            <v-list-item-subtitle>{{ petStandardTooltip }}</v-list-item-subtitle>
+          </v-list-item>
+          <v-divider />
           <v-list-item @click="runLayout('triplanarPt')">
             <template v-slot:prepend>
               <v-icon icon="mdi-view-week-outline" size="small" />
@@ -433,54 +459,7 @@
         </v-list>
       </v-menu>
 
-      <v-menu>
-        <template v-slot:activator="{ props: act }">
-          <v-btn
-            v-bind="act"
-            :class="['mv-tool-btn', 'mv-tool-btn--wide', 'mr-1', { 'is-active': !!activeTracer }]"
-            variant="text"
-            size="small"
-          >
-            <v-icon icon="mdi-flask-outline" />
-            <span class="mv-tool-label">{{ activeTracer ? activeTracer.name : 'Tracer' }}</span>
-            <v-tooltip activator="parent" location="bottom">
-              {{ activeTracer
-                ? `Active: ${activeTracer.name} — click to switch`
-                : 'Pick a tracer preset (SUV threshold + window + labels)' }}
-            </v-tooltip>
-          </v-btn>
-        </template>
-        <v-list density="compact">
-          <v-list-item
-            v-for="t in tracerPresets"
-            :key="t.id"
-            :active="segStore.activeTracerId === t.id"
-            @click="onTracerSelected(t.id)"
-          >
-            <template v-slot:prepend>
-              <v-icon icon="mdi-radioactive" size="small" />
-            </template>
-            <v-list-item-title>{{ t.name }}</v-list-item-title>
-            <v-list-item-subtitle class="mv-tracer-sub">
-              SUV {{ t.suvThreshold }} · 0–{{ (t.suvWindow.wc + t.suvWindow.ww / 2).toFixed(0) }} · {{ t.labels.length }} labels
-            </v-list-item-subtitle>
-          </v-list-item>
-        </v-list>
-      </v-menu>
-
-      <v-btn
-        class="mv-tool-btn mv-tool-btn--wide mr-2"
-        variant="text"
-        size="small"
-        :disabled="!petCtReady"
-        @click="runFusion"
-      >
-        <v-icon icon="mdi-circle-multiple-outline" />
-        <span class="mv-tool-label">Fusion</span>
-        <v-tooltip activator="parent" location="bottom">
-          {{ petCtReady ? 'Fuse CT (base) + PET (overlay) into the active box' : 'Load both PET and CT first' }}
-        </v-tooltip>
-      </v-btn>
+      <!-- Tracer ボタン廃止 (不要)。Fusion ボタンも廃止 → drag&drop fusion に一本化。 -->
 
       <v-divider vertical class="mx-2" />
 
@@ -544,7 +523,9 @@
           <v-btn class="mv-tool-btn mv-tool-btn--wide" variant="text" size="small" v-bind="props">
             <v-icon icon="mdi-view-grid-outline" />
             <span class="mv-tool-label">{{ tileN }}</span>
-            <v-tooltip activator="parent" location="bottom">Tile count</v-tooltip>
+            <v-tooltip activator="parent" location="bottom">
+              Tile count — number of image boxes on screen (currently {{ tileN }})
+            </v-tooltip>
           </v-btn>
         </template>
         <v-list density="compact" @click:select="clickItem">
@@ -554,26 +535,14 @@
         </v-list>
       </v-menu>
 
-      <v-btn
-        class="mv-tool-btn"
-        variant="text"
-        size="small"
-        data-demo="inspector"
-        @click="drawerRight = !drawerRight"
-      >
-        <v-icon icon="mdi-format-vertical-align-top" style="transform: rotate(90deg)" />
-        <v-tooltip activator="parent" location="bottom">{{ drawerRight ? 'Hide inspector' : 'Show inspector' }}</v-tooltip>
-      </v-btn>
-
       <v-divider vertical class="mx-1" />
 
       <!-- Renderer (CPU/GPU) トグル + perf 集計表示 -->
       <v-menu :close-on-content-click="false">
         <template v-slot:activator="{ props: act }">
-          <v-btn class="mv-tool-btn mv-tool-btn--wide" variant="text" size="small" v-bind="act">
+          <v-btn class="mv-tool-btn" variant="text" size="small" v-bind="act">
             <v-icon :icon="rendererModeIcon" />
-            <span class="mv-tool-label">{{ rendererModeLabel }}</span>
-            <v-tooltip activator="parent" location="bottom">Renderer (CPU/GPU) and perf stats</v-tooltip>
+            <v-tooltip activator="parent" location="bottom">{{ rendererModeTooltip }}</v-tooltip>
           </v-btn>
         </template>
         <v-list density="compact" min-width="280">
@@ -637,7 +606,23 @@
         @click="onCloseAll"
       >
         <v-icon icon="mdi-trash-can-outline" />
-        <v-tooltip activator="parent" location="bottom">Close all</v-tooltip>
+        <v-tooltip activator="parent" location="bottom">
+          Close all images and clear the session (asks for confirmation)
+        </v-tooltip>
+      </v-btn>
+
+      <!-- 右サイドバー開閉。制御対象の右ドロワーに接するよう app-bar の最右端に置く。 -->
+      <v-btn
+        :class="['mv-tool-btn', { 'is-active': drawerRight }]"
+        variant="text"
+        size="small"
+        data-demo="inspector"
+        @click="drawerRight = !drawerRight"
+      >
+        <v-icon icon="mdi-dock-right" />
+        <v-tooltip activator="parent" location="bottom">
+          {{ drawerRight ? 'Hide right sidebar (Segmentation panel)' : 'Show right sidebar (Segmentation panel)' }}
+        </v-tooltip>
       </v-btn>
     </v-app-bar>
 
@@ -666,8 +651,14 @@
         </v-card-text>
         <v-card-actions>
           <v-spacer />
-          <v-btn variant="text" @click="closeAllDialogOpen = false">Cancel</v-btn>
-          <v-btn color="error" variant="flat" @click="confirmCloseAll">Close all</v-btn>
+          <v-btn variant="text" @click="closeAllDialogOpen = false">
+            Cancel
+            <v-tooltip activator="parent" location="top">Keep the current session</v-tooltip>
+          </v-btn>
+          <v-btn color="error" variant="flat" @click="confirmCloseAll">
+            Close all
+            <v-tooltip activator="parent" location="top">Discard all images and segmentation work — cannot be undone</v-tooltip>
+          </v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -724,7 +715,10 @@
         </v-card-text>
         <v-card-actions>
           <v-spacer />
-          <v-btn @click="browserSupportOpen = false">Close</v-btn>
+          <v-btn @click="browserSupportOpen = false">
+          Close
+          <v-tooltip activator="parent" location="top">Close this dialog</v-tooltip>
+        </v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -738,7 +732,6 @@ import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
 import DicomView from "./components/DicomView.vue";
 import { getWH, getTileN } from "./components/UrlParser.ts";
 import { useSegmentationStore } from "./stores/segmentation";
-import { TRACER_PRESETS, tracerById } from "./components/tracerPresets";
 import DicomTagDialog from "./components/DicomTagDialog.vue";
 import DemoOverlay from "./components/demo/DemoOverlay.vue";
 import { useDemoPlayer } from "./components/demo/useDemoPlayer";
@@ -759,15 +752,19 @@ const setRendererMode = (m: RendererMode) => {
   perfStore.setMode(m);
   redraw();   // 全 box 再描画 (新 mode で)
 };
-const rendererModeLabel = computed(() => {
-  if (perfStore.rendererMode === 'cpu') return 'CPU';
-  if (perfStore.rendererMode === 'gpu') return 'GPU';
-  return 'Auto';
-});
+// A / G / C の 1 文字アイコンで現在のモードを示す (Auto / GPU / CPU)。
+// 以前は "Auto" 等のラベル文字を併記していたが意味が伝わらないため文字は廃止し、
+// 意味は hover tooltip (rendererModeTooltip) に寄せた。
 const rendererModeIcon = computed(() => {
-  if (perfStore.rendererMode === 'cpu') return 'mdi-cpu-64-bit';
-  if (perfStore.rendererMode === 'gpu') return 'mdi-expansion-card-variant';
-  return 'mdi-auto-fix';
+  if (perfStore.rendererMode === 'cpu') return 'mdi-alpha-c-box-outline';
+  if (perfStore.rendererMode === 'gpu') return 'mdi-alpha-g-box-outline';
+  return 'mdi-alpha-a-box-outline';
+});
+
+const rendererModeTooltip = computed(() => {
+  if (perfStore.rendererMode === 'cpu') return 'Renderer: C = forced CPU — click for renderer modes and perf stats';
+  if (perfStore.rendererMode === 'gpu') return 'Renderer: G = forced GPU (no CPU fallback) — click for renderer modes and perf stats';
+  return 'Renderer: A = Auto (GPU when available, else CPU) — click for renderer modes and perf stats';
 });
 const perfKinds: { kind: DrawKind; label: string }[] = [
   { kind: 'mpr',         label: 'MPR' },
@@ -799,7 +796,9 @@ const petCtReady = computed(() => {
   return hasPt && hasCt;
 });
 
-const drawerLeft = ref(true);
+// 起動時は左サイドバーも隠す (右 Inspector と同じ方針)。空状態では series も設定も無く、
+// 「Drop files here」だけを見せたいため。ロード完了時に DicomView が true にする。
+const drawerLeft = ref(false);
 // Inspector (右ドロワ) は初期表示 — ROI リスト等をすぐ見せる
 const drawerRight = ref(true);
 const leftButtonFunction = ref<string | null>(null);
@@ -958,11 +957,7 @@ const petStandardTooltip = computed(() => {
   return `Build PET Standard with PT: ${pt}  /  CT: ${ct}`;
 });
 
-const runFusion = () => {
-  dicomViewRef.value?.fusion?.();
-};
-
-const runLayout = (kind: 'triplanarPt' | 'triplanarFused' | 'ptOnly4up' | 'compare2up' | 'petCtMipRight') => {
+const runLayout =(kind: 'triplanarPt' | 'triplanarFused' | 'ptOnly4up' | 'compare2up' | 'petCtMipRight') => {
   const r = dicomViewRef.value;
   if (!r) return;
   if (kind === 'triplanarPt')   r.setupTriplanarPt?.();
@@ -970,16 +965,6 @@ const runLayout = (kind: 'triplanarPt' | 'triplanarFused' | 'ptOnly4up' | 'compa
   if (kind === 'ptOnly4up')     r.setupPtOnly4up?.();
   if (kind === 'compare2up')    r.setupCompare2up?.();
   if (kind === 'petCtMipRight') r.setupPetCtMipRight?.();
-};
-
-// Tracer preset を pull-down で適用
-const tracerPresets = TRACER_PRESETS;
-const activeTracer = computed(() => {
-  const id = segStore.activeTracerId;
-  return id ? tracerById(id) : null;
-});
-const onTracerSelected = (id: string) => {
-  dicomViewRef.value?.applyTracerById?.(id);
 };
 
 // DICOM tag viewer (non-modal). 開いている間 paging に追従して中身が更新される。
@@ -1051,6 +1036,14 @@ const snapshotLoadInput = ref<HTMLInputElement | null>(null);
 const onLoadSnapshot = () => {
   snapshotLoadInput.value?.click();
 };
+
+// Segmentation の save/load をハンバーガーから (旧フッターから移設)。
+// Save NIfTI / Clear edits は store action 直呼び、Load mask / Export PDF は
+// DicomView 経由で SegmentationPanel のハンドラをパススルー。
+const onSaveNiftiMask = () => { segStore.saveMaskAsNifti(); };
+const onClearEditsFromMenu = () => { segStore.clearManualEdits(); dicomViewRef.value?.redraw?.(); };
+const onLoadMaskFromMenu = () => { dicomViewRef.value?.segLoadMask?.(); };
+const onExportPdfFromMenu = () => { dicomViewRef.value?.segExportPdf?.(); };
 const onExportRois = () => {
   try {
     dicomViewRef.value?.exportRoisAsJson?.();
@@ -1187,6 +1180,17 @@ const onInspectNiftiRaw = (idx: number) => {
 </script>
 
 <style scoped>
+/* Layouts メニューは固定幅。長い項目名 (PET/CT/Fusion 等の可変長) は省略記号で切る。 */
+.mv-layouts-menu {
+  width: 300px;
+  max-width: 300px;
+}
+.mv-layouts-menu :deep(.v-list-item-title),
+.mv-layouts-menu :deep(.v-list-item-subtitle) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .mv-tools {
   display: flex;
   gap: 2px;

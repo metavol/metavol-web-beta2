@@ -212,6 +212,17 @@ Volume 単独 / Fusion 両方をハンドル（`isVolumeImageBoxInfo` は `clut1
   - 同名 `.json` : ラベル一覧、SUV閾値、PET metadata、voxel size、dims
 - NIfTI ヘッダは自前実装（348B + 4B magic + raw voxel）。`niftiWriter.ts` を参照。
 
+### レポート出力 (④ Save → Others)
+
+- **PDF** (`pdfReport.ts`, jsPDF): 病変テーブル **全行** + 画像。詳細な記録用。
+- **PPTX** (`pptReport.ts`, pptxgenjs, 2026-07 追加): **画像メイン**。1 スライド 2 図で大きく敷き、
+  病変テーブルは **全身サマリーのみ** (件数 / total MTV / total TLG / 最高 SUVmax / threshold /
+  Deauville)。per-lesion 行は出さない (カンファ発表用というユーザ指定)。
+- 入力は両者とも `PdfReportInput` で共通。**panel の `buildReportInput()` が唯一の組み立て箇所**なので、
+  項目を足すときはここと両 renderer を揃える (数値が食い違わないように)。
+- どちらも動的 import (`await import(...)`) で別チャンクに切る。pptxgenjs は ~370KB あるため
+  静的 import にしないこと。
+
 ---
 
 ## 右 Inspector (SegmentationPanel) レイアウト — Persona 1 ワークフロー順 (2026-07)
@@ -271,6 +282,10 @@ DicomView.vue は god component（6,000 行超）。**挙動を変えずに**行
 
 ## テスト DICOM ロード（File System Access API）
 
+- **ロード後は plain viewer のまま** (2026-07 変更)。以前は PT+CT が揃うと自動で
+  `setupPetStandardView()` に飛んでいたが、「DICOM を読み込んだ直後は plain viewer」という
+  ユーザ指定の原則 (drag&drop / `autoLayoutAfterLoad` と同じ) に揃えて廃止した。
+  Volume 表示は Layouts / PET Standard ボタンから明示的に起動する。
 - app-bar の **Test** ボタンで `window.showDirectoryPicker()` を呼びフォルダ選択
 - 選択したディレクトリハンドルを `cachedTestDirHandle` にキャッシュ（**メモリのみ、リロードで消える**）
 - 同セッション中は再選択不要、ボタン1クリックで再ロード
@@ -352,6 +367,43 @@ Sidebar の Advanced → Phantom セクションのボタンから生成。`Side
 - **注意 (将来の変更時)**: assign の領域単位 = 「同一ラベルの 26-連結成分」。
   `findIslands`/`summarizeLesions` の島 = 「非ゼロの 26-連結成分」で定義が異なる (こちらは病変単位)。
   voxel inspector (Ctrl+Shift+D) で mask 各層 (threshold / manual / final / component) を hover 確認できる。
+
+### 2.5. `isVolumeImageBoxInfo` は plain DICOM box にも true を返す（重要な罠、2026-07 判明）
+
+- **`defaultInfo()` (`DicomImageBoxInfo.ts`) は plain DICOM box なのに `clut: 0` を持つ。**
+  一方 `isVolumeImageBoxInfo(i)` は `("clut" in info) && !("clut1" in info)` で判定するため、
+  **生スライス box でも true** になる (`isAnyVolumeBox` も同様に true)。
+  ソース中の「この方法では、プロパティ名を変更したときにバグった」というコメントどおりの罠。
+- 実測 (実 PET/CT DICOM 778 files ロード後): 全 box が `clut:true` / `currentSliceNumber:true` /
+  `centerInWorld:false`。つまり plain viewer なのに `isAnyVolumeBox` は全部 true を返す。
+- **これが原因で「plain viewer なのに右 Inspector が開く」不具合が出た。**
+- **「本当に Volume/Fusion box か」を判定したいときは `'centerInWorld' in info` を使うこと**
+  (`VolumeImageBoxInfo` / `FusedVolumeImageBoxInfo` だけが持つ 3D 幾何。box 生成箇所 16 個すべてが
+  `centerInWorld` を持つことを確認済み)。DicomView の `isVolumeLikeBox()` がその実装。
+- `isAnyVolumeBox` 自体は Ctrl+wheel ズーム等の既存経路が依存しているため変更していない
+  (これらは先に `isDicomSliceImageBoxInfo` で分岐するので実害が出ていない)。触るときは要注意。
+
+### 2.7. タイルが画像エリアから溢れて右サイドバーに潜り込む (解決済み 2026-07)
+
+**症状**: 「PET/CT + MIP (3×2)」で box が右サイドバーに重なる。実測 (実 PET/CT):
+`.mv-imagearea` clientWidth=672 に対し scrollWidth=**1376**、box 右端が 1321 (サイドバー左端 952) まで到達。
+
+**原因は 2 つ重なっていた**:
+1. **titlebar が box の intrinsic 幅を決めていた**。grid は `repeat(cols, max-content)` なので、
+   `.mv-titlebar-actions { flex-shrink: 0 }` のボタン列 (500px 超) が max-content を支配し、
+   canvas 幅 (218px) を無視して box が 509px になっていた。
+   → `.mv-titlebar { width: 0; min-width: 100%; overflow: hidden }` で titlebar を intrinsic 幅計算から
+   外し、actions は `flex-shrink: 1; min-width: 0; overflow-x: auto` で横スクロールに逃がす。
+   **titlebar にボタンを足すときはこの前提を壊さないこと。**
+2. **fit が 1 ステップ古い幅で計算されていた**。`watch([drawer, inspector, tileN])` は即時に
+   `applyAutoFit()` を呼ぶが、drawer は CSS transition (~0.2s) なのでその時点の
+   `.mv-imagearea` はまだ変化前の幅を返す。補正役だった **ResizeObserver はこの要素では発火しない**
+   (v-main の padding 変化では呼ばれない。プローブ RO を貼って 0 回発火を実測)。
+   → `scheduleAutoFit()` = 即時 + 280ms 後の再 fit に変更。
+   **drawer 開閉に連動して寸法を決めるコードは「transition 後にもう一度測る」こと。**
+
+`BOX_BORDER_PX = 1` も追加 (noGapMode では SAFETY_PX=0 になるため border 分で数 px 溢れていた)。
+検証は実データで `scrollWidth - clientWidth === 0` と「box 右端 < drawer 左端」を確認する。
 
 ### 3. `setPetVolume(v)` が呼ばれるたびに mask が破棄される
 - `setPetVolume` は `thresholdMask`/`manualEdits`/`finalMask`/`undoStack`/`sphere`/`polygon` を全 null 化する。

@@ -642,9 +642,28 @@ const onRecoverSkip = () => {
   showRecoveryDialog.value = false;
 };
 
-// drawer / inspector / tileN の変化に追従して fit
+// drawer / inspector / tileN の変化に追従して fit。
+//
+// **即時 applyAutoFit だけでは足りない**: drawer 開閉には CSS transition があり、
+// フラグが変わった直後の .mv-imagearea はまだ変化前の幅を返す。そのため即時計算だと
+// 常に「1 ステップ古い幅」で box サイズが決まり、サイドバーを開いたときに box が
+// 広すぎて画像エリアから溢れ、右サイドバーに潜り込む (PET/CT+MIP 3x2 で顕在化)。
+// ResizeObserver で拾う設計だったが、この要素では発火しないことを実測で確認したため
+// (v-main の padding 変化では RO が呼ばれない)、transition 完了後に再 fit する。
+let autoFitTimer: any = null;
+const scheduleAutoFit = () => {
+  if (!autoFitMode.value) return;
+  applyAutoFit();                       // 即時 (粗い。tileN 変化はこれで足りる)
+  if (autoFitTimer) clearTimeout(autoFitTimer);
+  autoFitTimer = setTimeout(() => {     // transition 完了後 (Vuetify drawer は ~0.2s)
+    autoFitTimer = null;
+    applyAutoFit();
+  }, 280);
+};
+onUnmounted(() => { if (autoFitTimer) { clearTimeout(autoFitTimer); autoFitTimer = null; } });
+
 watch([drawer, inspector, tileN], () => {
-  if (autoFitMode.value) applyAutoFit();
+  scheduleAutoFit();
 });
 
 // 「全体化」モード切替時は autoFit を有効にして即時 fit を走らせる
@@ -1704,6 +1723,74 @@ const changeSlice_ = (add_number: number) => {
     }
   }
 }
+
+// スライダ上端を「解剖学的に固定」するための反転フラグ。
+//
+// **なぜ必要か**: paging index は volume ごとの voxel 添字なので、添字が増える向きが
+// 頭側か足側かは撮像/ソート順に依存する。PET と CT でスライス順が逆の症例では、
+// 同じ解剖に対して 2 つのスライダが逆向きに動いて不自然になる (ユーザ報告)。
+// そこで index ではなく **world 方向** で上端を決め、どの box でも一致させる。
+//   through-plane が Z (体軸)  → 上端 = 頭側 (world +Z)
+//   through-plane が Y (LPS: +Y=背側) → 上端 = 腹側 (world -Y)
+//   through-plane が X (LPS: +X=左)   → 上端 = 右   (world -X)
+// 引数は「voxel index が 1 増えたとき world で動く向き」(volume の軸ベクトル)。
+// 戻り値 true = 「スライダ上端は index の最大側」。
+const pagingInvertFor = (axisVec: THREE.Vector3): boolean => {
+  const ax = maxAxis(axisVec);
+  const comp = [axisVec.x, axisVec.y, axisVec.z][ax];
+  const topSign = (ax === 2) ? 1 : -1;   // 上端に来る world 方向の符号
+  return comp * topSign > 0;
+};
+
+// 画像右端の縦 paging スライダ用: 現在 index と範囲を返す。
+// MIP / VR は wheel が角度回転に割り当てられており「スライス」の概念が無いので null。
+const getBoxPaging = (i: number): { index: number; min: number; max: number; invert: boolean } | null => {
+  if (i < 0 || i >= imageBoxInfos.value.length) return null;
+  if (isDicomSliceImageBoxInfo(i)) {
+    const info = getDicomSliceImageBoxInfo(i);
+    const s = seriesList[info.currentSeriesNumber];
+    const dlist = s?.myDicom;
+    if (!dlist || dlist.length <= 1) return null;
+    // 生スライス box も、volume が既にあればその vectorZ で向きを揃える
+    // (無い場合は従来どおり「先頭スライスが上」)。
+    const vz = s?.volume?.vectorZ;
+    return {
+      index: info.currentSliceNumber, min: 0, max: dlist.length - 1,
+      invert: vz ? pagingInvertFor(vz) : false,
+    };
+  }
+  if (!isAnyVolumeBox(i)) return null;
+  const a = getVolumeImageBoxInfo(i);
+  if (a.isMip || a.isVr) return null;
+  const seriesIdx = a.currentSeriesNumber;
+  const vol = seriesList[seriesIdx]?.volume;
+  if (!vol || !a.vecz || !a.centerInWorld) return null;
+  // through-plane 軸 = vecz が最も強く向いている voxel 軸 (brush/polygon と同じ規則)
+  const axis = maxAxis(a.vecz);
+  const dim = [vol.nx, vol.ny, vol.nz][axis];
+  if (!dim || dim <= 1) return null;
+  const vc = worldToVoxel_(a.centerInWorld, seriesIdx);
+  const cur = Math.round([vc.x, vc.y, vc.z][axis]);
+  // index は voxel 座標なので、向きを決めるのは **volume の軸ベクトル** (index→world の対応)。
+  // box の vecz (paging ステップ) ではない点に注意 (現行レイアウトでは一致するが意味が違う)。
+  const axisVec = [vol.vectorX, vol.vectorY, vol.vectorZ][axis];
+  return {
+    index: Math.min(dim - 1, Math.max(0, cur)), min: 0, max: dim - 1,
+    invert: axisVec ? pagingInvertFor(axisVec) : false,
+  };
+};
+
+// スライダで絶対 index を指定 → 現在位置との差分を wheel と同じ経路 (applySyncPaging) に流す。
+// こうすることで sync 中の他 box への追従も wheel paging と完全に同じ挙動になる。
+const onSetPagingIndex = (i: number, target: number) => {
+  const p = getBoxPaging(i);
+  if (!p) return;
+  const clamped = Math.min(p.max, Math.max(p.min, Math.round(target)));
+  const delta = clamped - p.index;
+  if (delta === 0) return;
+  selectedImageBoxId.value = i;
+  applySyncPaging(i, delta);
+};
 
 const changeSlice = (index: number, add_number: number) => {
   if (isDicomSliceImageBoxInfo(index)){
@@ -3302,6 +3389,10 @@ const loadFiles = (files: FileList | File[]) => {
         //   - NIfTI volume-only は Volume Box に昇格 (myDicom 必須の DicomSlice では描画不可)
         autoLayoutAfterLoad();
       }
+      // series が入ったら左サイドバー (series 一覧 / 表示設定) を出す。
+      // 起動直後は空なので隠してあり、drag&drop や Load files で初めて意味を持つ。
+      // append 時も新しい series が増えるので同様に開く。
+      if (seriesList.length > 0) drawer.value = true;
       show();
       isLoading.value = false;
       // 背景で全 JPEG Lossless frame を decompress。完了後にサムネ再生成 + 再描画。
@@ -3396,6 +3487,12 @@ const autoLayoutAfterLoad = () => {
   // image area を埋め切る (tileN 未変化や single-series ロード時にも fit)
   autoFitMode.value = true;
   nextTick().then(() => applyAutoFit());
+
+  // plain DICOM viewer のみ (volume box 無し) なら右 Inspector は不要 → 隠す。
+  // volume box を含むレイアウト (NIfTI-only 昇格など) なら表示。
+  // watch(anyVolumeBoxPresent) だけだと「plain のまま手動で開いた sidebar」を閉じないので
+  // ロード直後にここで明示的に同期する。
+  inspector.value = anyVolumeBoxPresent.value;
 };
 
 // 既存 box[boxId] を seriesIdx の Volume を表示する VolumeImageBoxInfo に置換する。
@@ -4224,15 +4321,19 @@ const {
 // ここで label.color を単一の真実として color を引けるようにする。
 // computed なので labels の色/数が変わらない限り同一配列参照を返し、
 // GPU 側の clutBufCache (WeakMap keyed by array identity) が正しくヒットする。
+// 各 entry は [r, g, b, visibility]。visibility (0/1) は overlay で eye アイコン非表示の
+// ラベルを描かないための係数 (CPU: alpha *= c[3], GPU shader: alpha *= labelClut[cidx].a)。
 const labelClutDynamic = computed<number[][]>(() => {
   const maxId = segStore.labels.reduce((m, l) => Math.max(m, l.id), 0);
-  const arr: number[][] = [[0, 0, 0]];  // index 0 = background
+  const arr: number[][] = [[0, 0, 0, 1]];  // index 0 = background
   for (let id = 1; id <= maxId; id++) {
     const lbl = segStore.labels.find(l => l.id === id);
+    const vis = lbl ? (lbl.visible === false ? 0 : 1) : 1;
     // ラベルが存在すればその明示色。欠番 id は静的 palette にフォールバック。
-    arr[id] = lbl
+    const base = lbl
       ? [lbl.color[0], lbl.color[1], lbl.color[2]]
       : labelClut[id % labelClut.length];
+    arr[id] = [base[0], base[1], base[2], vis];
   }
   return arr;
 });
@@ -5051,6 +5152,7 @@ const boxCellStyle = (i: number): Record<string, string> => {
 const TITLEBAR_H = 22;
 const GAP_PX = 6;             // .mv-tile-grid の gap
 const SAFETY_PX = 4;          // 各方向のクリッピング保険 (border 1px + 余裕)
+const BOX_BORDER_PX = 1;      // .mv-box の border 合計 (canvas 幅 + これが box の実寸)
 
 const computeFitBoxSize = (cols: number, rows: number): { w: number; h: number } => {
   const ia = document.querySelector('.mv-imagearea') as HTMLElement | null;
@@ -5073,9 +5175,11 @@ const computeFitBoxSize = (cols: number, rows: number): { w: number; h: number }
   const gapH = gap * Math.max(0, cols - 1);
   const gapV = gap * Math.max(0, rows - 1);
 
-  // 各 cell に title bar (1 行 26px) と border (約 2px) と保険 SAFETY_PX を引く
-  const w = Math.max(120, Math.floor((availW - gapH - cols * safe) / cols));
-  const h = Math.max(120, Math.floor((availH - gapV - rows * (TITLEBAR_H + safe)) / rows));
+  // 各 cell に title bar (1 行 26px) と border (約 2px) と保険 SAFETY_PX を引く。
+  // noGapMode では safe=0 になるので、box の border 分 (BOX_BORDER_PX) は別途必ず引く。
+  // これを引かないと cols * (canvas + border) が availW を数 px 超えて横スクロールが出る。
+  const w = Math.max(120, Math.floor((availW - gapH - cols * (safe + BOX_BORDER_PX)) / cols));
+  const h = Math.max(120, Math.floor((availH - gapV - rows * (TITLEBAR_H + safe + BOX_BORDER_PX)) / rows));
   return { w, h };
 }
 
@@ -5588,24 +5692,9 @@ const loadTestDicom = async () => {
       isLoading.value = false;
       return;
     }
-    // ロード完了 → 自動で PET Standard へ。loadFiles は非同期（FileReader ベース）なので
-    // doSort 完了を待ってから setupPetStandardView を実行する。
-    // loadFiles の poll callback が isLoading を false にするので、それを watch で検知。
-    const stopWatch = watch(isLoading, async (v) => {
-      if (v === false){
-        stopWatch();
-        await nextTick();
-        // PET/CT が揃っていれば自動で標準ビューへ
-        const list = seriesSummaries.value;
-        const hasPt = list.some(s => s.modality === 'PT' || s.modality === 'PET');
-        const hasCt = list.some(s => s.modality === 'CT');
-        if (hasPt && hasCt){
-          tileN.value = 4;
-          await nextTick();
-          await setupPetStandardView();
-        }
-      }
-    });
+    // ロード後は drag&drop と同じく **plain viewer のまま** にする (auto PET Standard はしない)。
+    // 「DICOM を読み込んだ直後は plain viewer」がユーザ指定の原則で、autoLayoutAfterLoad
+    // (loadFiles 内) の方針とも揃える。Volume 表示は Layouts / PET Standard から明示的に。
     loadFiles(files);
   } catch (err){
     console.warn('loadTestDicom canceled or failed', err);
@@ -5637,8 +5726,34 @@ provide('getSliceCount', (seriesIdx: number): number => {
   return 0;
 });
 
+// SegmentationPanel への ref。App-bar ハンバーガーから panel の save/load を呼ぶための
+// パススルーに使う (Load mask / Export PDF は file I/O・病変集計が panel 側にあるため)。
+const segPanelRef = ref<any>(null);
+
+// 右 Inspector (Segmentation) は volume viewer のときだけ出す。
+// plain DICOM viewer (生スライス box のみ) や空状態では隠す (segmentation は volume 前提)。
+//
+// **isAnyVolumeBox は使えない**: isVolumeImageBoxInfo は `"clut" in info` で判定するが、
+// defaultInfo() (plain DICOM box) も stray な `clut: 0` を持つため plain box でも true に
+// なる (ソース内の「プロパティ名を変更したときにバグった」警告どおりの罠)。
+// ここは 3D 幾何 centerInWorld の有無で判定する — VolumeImageBoxInfo /
+// FusedVolumeImageBoxInfo だけが持ち、DicomSliceImageBoxInfo は持たない。
+const isVolumeLikeBox = (i: number): boolean => {
+  const info = imageBoxInfos.value[i] as any;
+  return !!info && ('centerInWorld' in info);
+};
+const anyVolumeBoxPresent = computed(() => {
+  const n = Math.min(tileN.value ?? 0, imageBoxInfos.value.length);
+  for (let i = 0; i < n; i++) { if (isVolumeLikeBox(i)) return true; }
+  return false;
+});
+watch(anyVolumeBoxPresent, (has) => { inspector.value = has; }, { immediate: true });
+
 defineExpose({
   setupPetStandardView,
+  // App-bar ハンバーガー用: Segmentation panel の save/load パススルー
+  segLoadMask: () => segPanelRef.value?.loadMask?.(),
+  segExportPdf: () => segPanelRef.value?.exportPdf?.(),
   // NIfTI raw byte view (Persona 2 デバッグ用)
   inspectNiftiRaw,
   getNiftiSeriesList,
@@ -5748,16 +5863,21 @@ defineExpose({
       <span class="mv-section-title">Segmentation</span>
       <v-spacer />
       <v-btn
-        icon="mdi-close"
+        icon
         size="x-small"
         variant="text"
         @click="inspector = false"
-      />
+      >
+        <v-icon icon="mdi-close" />
+        <v-tooltip activator="parent" location="bottom">Hide right sidebar (Segmentation panel)</v-tooltip>
+      </v-btn>
     </div>
     <SegmentationPanel
+      ref="segPanelRef"
       @redraw="show"
       @jump="jumpToWorld"
       @set-tool="onPanelSetTool"
+      @save-snapshot="downloadSnapshotFile"
       :active-tool="leftButtonFunction"
     />
   </v-navigation-drawer>
@@ -5778,7 +5898,10 @@ defineExpose({
           size="small"
           prepend-icon="mdi-folder-open-outline"
           @click="onClickLoad"
-        >Load files…</v-btn>
+        >
+          Load files…
+          <v-tooltip activator="parent" location="bottom">Choose DICOM or NIfTI files to open (or drop them anywhere here)</v-tooltip>
+        </v-btn>
         <input
           ref="hiddenLoadInput"
           type="file"
@@ -5880,6 +6003,8 @@ defineExpose({
         @toggle-vr-demo="onToggleVrDemo(i-1)"
         :can-revert-to-dicom="getCanRevertToDicom(i-1)"
         @back-to-dicom="onBackToDicom(i-1)"
+        :paging="getBoxPaging(i-1)"
+        @set-paging-index="(idx: number) => onSetPagingIndex(i-1, idx)"
       />
     </div>
 
@@ -5951,10 +6076,19 @@ defineExpose({
         </div>
       </v-card-text>
       <v-card-actions>
-        <v-btn variant="text" @click="onRecoverDiscard">Discard saved</v-btn>
+        <v-btn variant="text" @click="onRecoverDiscard">
+          Discard saved
+          <v-tooltip activator="parent" location="top">Delete the auto-saved mask so this prompt stops appearing</v-tooltip>
+        </v-btn>
         <v-spacer />
-        <v-btn variant="text" @click="onRecoverSkip">Skip</v-btn>
-        <v-btn variant="flat" color="primary" @click="onRecoverYes">Recover</v-btn>
+        <v-btn variant="text" @click="onRecoverSkip">
+          Skip
+          <v-tooltip activator="parent" location="top">Keep the saved mask on disk but do not load it now</v-tooltip>
+        </v-btn>
+        <v-btn variant="flat" color="primary" @click="onRecoverYes">
+          Recover
+          <v-tooltip activator="parent" location="top">Load the auto-saved mask, replacing the current segmentation</v-tooltip>
+        </v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>
@@ -5969,7 +6103,10 @@ defineExpose({
           {{ niftiHeaderDialog.filename }}
         </span>
         <v-spacer />
-        <v-btn icon="mdi-close" variant="text" size="small" @click="niftiHeaderDialog.open = false" />
+        <v-btn icon variant="text" size="small" @click="niftiHeaderDialog.open = false">
+          <v-icon icon="mdi-close" />
+          <v-tooltip activator="parent" location="bottom">Close the NIfTI header viewer</v-tooltip>
+        </v-btn>
       </v-card-title>
       <v-card-text style="max-height: 70vh; overflow: auto;">
         <div class="text-caption text-disabled mb-2">

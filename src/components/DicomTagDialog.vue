@@ -164,7 +164,10 @@ const fontPlus  = () => { fontSize.value = Math.min(20, fontSize.value + 1); };
                 <span class="mv-tag-stats mv-mono">
                     {{ lineStats.shown }} / {{ lineStats.all }}
                 </span>
-                <v-btn icon="mdi-close" variant="text" size="x-small" @click="onClose" @mousedown.stop />
+                <v-btn variant="text" size="x-small" icon @click="onClose" @mousedown.stop>
+                    <v-icon icon="mdi-close" />
+                    <v-tooltip activator="parent" location="bottom">Close the DICOM tag viewer</v-tooltip>
+                </v-btn>
             </div>
 
             <div class="mv-tag-controls" @mousedown.stop>

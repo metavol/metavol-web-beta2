@@ -268,16 +268,20 @@ const sliceLabelFor = (s: { index: number }): string | null => {
                 </div>
                 <div v-if="s.hasVolume && isUnknownModality(s.modality)" class="row5">
                     <span class="hint">Set as:</span>
-                    <button class="set-mod" @click="(e) => setModality(e, s.index, 'PT')">PT</button>
-                    <button class="set-mod" @click="(e) => setModality(e, s.index, 'CT')">CT</button>
-                    <button class="set-mod" @click="(e) => setModality(e, s.index, 'MR')">MR</button>
+                    <button class="set-mod" title="Register this series as PET — enables SUV and segmentation" @click="(e) => setModality(e, s.index, 'PT')">PT</button>
+                    <button class="set-mod" title="Register this series as CT — used as the fusion base layer" @click="(e) => setModality(e, s.index, 'CT')">CT</button>
+                    <button class="set-mod" title="Register this series as MR — used as the fusion base layer" @click="(e) => setModality(e, s.index, 'MR')">MR</button>
                 </div>
             </div>
         </div>
 
         <!-- Other (MIP / RGB / DERIVED) — デフォルト非表示、トグルで展開 -->
         <div v-if="otherSeries.length > 0" class="other-section">
-            <button class="other-toggle" @click="showOthers = !showOthers">
+            <button
+                class="other-toggle"
+                :title="showOthers ? 'Hide secondary series (MIP / RGB / derived)' : 'Show secondary series (MIP / RGB / derived)'"
+                @click="showOthers = !showOthers"
+            >
                 <v-icon
                     :icon="showOthers ? 'mdi-chevron-down' : 'mdi-chevron-right'"
                     size="small"

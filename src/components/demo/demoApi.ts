@@ -47,7 +47,7 @@ export const buildDemoApi = (deps: DemoApiDeps): DemoApi => {
         },
         applyPhysiologicalThreshold: (suv: number) => {
             const store = deps.store;
-            const physio = labelIdByName(store, 'Physiological');
+            const physio = labelIdByName(store, 'Non-tumor');
             if (physio != null) store.currentLabelId = physio;
             store.applyThreshold(suv);   // ensureMaskAllocated + beginMaskEdit を内部で行う
             store.findIslands?.();       // panel の Apply と同じく島 (連結成分) を更新

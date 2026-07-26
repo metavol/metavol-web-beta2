@@ -34,6 +34,7 @@ const emit = defineEmits<{
     (e: 'redraw'): void;
     (e: 'jump', p: THREE.Vector3): void;
     (e: 'set-tool', tool: string): void;
+    (e: 'save-snapshot'): void;   // ④ Save の「Full」→ DicomView の downloadSnapshotFile
 }>();
 
 // 現在アクティブなツール (App.vue の leftButtonFunction)。Assign label ボタンの
@@ -83,18 +84,26 @@ const labelRows = computed(() => {
     }));
 });
 
-// ===== Apply / Assign 対象ラベルのクイック選択 (#5, #8) =====
-// Persona 1 の運用では Apply する集積を Tumor か Physiological に振り分けたい。
-// currentLabelId を切り替えることで Apply / Brush / Polygon / Assign すべてに反映される。
-const quickLabels = computed(() => {
-    const byName = (n: string) => store.labels.find(l => l.name.toLowerCase() === n.toLowerCase());
-    const picks = [byName('Tumor'), byName('Physiological')].filter(Boolean) as typeof store.labels;
-    // 見つからなければ先頭 2 つで代替
-    const list = picks.length >= 1 ? picks : store.labels.slice(0, 2);
-    return list.map(l => ({ id: l.id, name: l.name, colorCss: `rgb(${l.color[0]},${l.color[1]},${l.color[2]})` }));
-});
+// 対象ラベルは body 上部の統一ラベルチップ行で選ぶ (currentLabelId を Apply / Assign /
+// Brush / Polygon / Labels すべてが共有)。個別のクイックピッカーは廃止。
 const currentLabelName = computed(() => store.labelById(store.currentLabelId)?.name ?? '(none)');
 // currentLabelColorCss は既存 (histogram 用) を再利用する。
+
+// ラベルの overlay 表示 on/off (eye アイコン)。undefined は表示扱い (後方互換)。
+const isLabelVisible = (l: { visible?: boolean }) => l.visible !== false;
+const onToggleLabelVisible = (id: number) => {
+    store.toggleLabelVisible(id);
+    emit('redraw');   // labelClut の visibility 成分が変わったので再描画
+};
+
+// overlay バー先頭の master eye: 全ラベルの一括表示/非表示。
+const anyLabelVisible = computed(() => store.labels.some(l => l.visible !== false));
+const onToggleAllLabels = () => {
+    // 1 つでも見えていれば全消し、全部消えていれば全表示。
+    store.setAllLabelsVisible(!anyLabelVisible.value);
+    store.overlayEnabled = true;   // overlay 自体は常に有効化 (表示制御は per-label に一本化)
+    emit('redraw');
+};
 // ===== 編集ツール選択 (assign / polygon / brush を同列に) =====
 // いずれのツールも上の Tumor / Physiological (currentLabelId) を共有して使う。
 type SegEditTool = 'assignLabel' | 'polygonROI' | 'brushROI';
@@ -107,18 +116,8 @@ const onSegToolToggle = (val: SegEditTool | null | undefined) => {
     emit('set-tool', val ?? 'window');
 };
 
-// ===== Advanced (詳細機能) の開閉。Persona 1 の主要フローを既定で簡潔に保つため、
-// 使用頻度の低い機能 (threshold method / reference sphere / Histogram+radiomics /
-// Rectangle ROI) は Advanced に畳んでおく。localStorage で記憶。
-// Labels / Islands は Advanced ではなく個別の collapsed expander (History と同様) に変更。
-// Sphere VOI のサイドバー欄は削除 (ツール + 画像中フローティング統計で完結)。 =====
-const ADV_KEY = 'mv-seg-advanced-open';
-const showAdvanced = ref<boolean>(false);
-try { showAdvanced.value = localStorage.getItem(ADV_KEY) === '1'; } catch { /* ignore */ }
-const toggleAdvanced = () => {
-    showAdvanced.value = !showAdvanced.value;
-    try { localStorage.setItem(ADV_KEY, showAdvanced.value ? '1' : '0'); } catch { /* ignore */ }
-};
+// Advanced tools トグルは廃止。method / reference sphere / rectangle ROI / histogram は
+// 常時表示 (Histogram は Lesions expander 内)。Labels / Lesions / History は個別 expander。
 
 // ===== 編集履歴 (undo / redo / jump) =====
 const historyTimeline = computed(() => store.historyTimeline);
@@ -197,11 +196,12 @@ const HIST_VB_W = 220;
 const HIST_VB_H = 60;
 
 // Threshold method 選択肢 (UI label と内部 id 対応)
+// Fixed SUV 以外はまだ工事中 (v-select で disabled + "under construction" 表記)。
 const thresholdMethodItems = [
-    { title: 'Fixed SUV (preset / manual)',          value: 'fixed' },
-    { title: '% of VOI / volume SUVmax',             value: 'pctMax' },
-    { title: 'PERCIST (1.5×liver + 2σ)',             value: 'liverPercist' },
-    { title: '% of liver SUVmean',                   value: 'liverPct' },
+    { title: 'Fixed SUV (preset / manual)',                value: 'fixed' },
+    { title: '% of VOI / volume SUVmax — under construction', value: 'pctMax' },
+    { title: 'PERCIST (1.5×liver + 2σ) — under construction', value: 'liverPercist' },
+    { title: '% of liver SUVmean — under construction',       value: 'liverPct' },
 ];
 // liver reference sphere が必要な method か
 const needsLiverReference = computed(() =>
@@ -244,12 +244,6 @@ const deauvilleSummary = computed(() => {
     const distribution = `1=${counts[1]} 2=${counts[2]} 3=${counts[3]} 4=${counts[4]} 5=${counts[5]}`;
     return { highest, label: highestLabel, distribution };
 });
-// resolveEffectiveThreshold の current 値 (UI hint 表示用)
-const resolvedThresholdHint = computed<string | null>(() => {
-    void store.maskVersion; void store.referenceSpheres.liver?.suvMean;
-    const r = store.resolveEffectiveThreshold();
-    return r ? r.rationale : null;
-});
 const canApplyThreshold = computed<boolean>(() => {
     return store.resolveEffectiveThreshold() != null;
 });
@@ -266,31 +260,32 @@ const onApplyThreshold = () => {
 };
 
 const onClearThreshold = () => {
+    // Clear は破壊的なので yes/no 確認 (誤爆防止)。
+    if (!window.confirm('Clear the whole-body threshold mask? Manual edits are kept.')) return;
     store.clearThresholdMask();
     emit('redraw');
 };
 
-// Apply split-button: caret メニューで対象ラベル (Tumor/Physio) を選んで即適用。
-const onApplyAs = (id: number) => {
-    store.currentLabelId = id;
-    onApplyThreshold();
-};
-// Edit tool (assign/polygon/brush) 共通のラベルピッカー用。全ラベルから選べる。
-const labelPickItems = computed(() => store.labels.map(l => ({
-    id: l.id, name: l.name, colorCss: `rgb(${l.color[0]},${l.color[1]},${l.color[2]})`,
-})));
-const onPickLabel = (id: number) => { store.currentLabelId = id; };
 
-const onClearManual = () => {
-    store.clearManualEdits();
-    emit('redraw');
-};
 
 const onAddLabel = () => {
     const name = newLabelName.value.trim() || `lesion${store.labels.length + 1}`;
     const e = store.addLabel(name);
     store.currentLabelId = e.id;
     newLabelName.value = '';
+};
+
+// ラベルリスト上端 (統一リスト) からの追加。既定ラベルを 3 つに絞ったぶん、
+// ここから素早く足せるようにする。空入力ではラベルを作らない (誤爆防止)。
+const showInlineAddLabel = ref(false);
+const onOpenInlineAdd = () => {
+    newLabelName.value = '';
+    showInlineAddLabel.value = true;
+};
+const onAddLabelInline = () => {
+    if (!newLabelName.value.trim()) { showInlineAddLabel.value = false; return; }
+    onAddLabel();
+    showInlineAddLabel.value = false;
 };
 
 const onSelectLabel = (id: number) => {
@@ -341,11 +336,6 @@ const onRectDragEnd = () => {
     dragRectIndex.value = null;
 };
 
-const onToggleOverlay = (val: boolean) => {
-    store.overlayEnabled = val;
-    emit('redraw');
-};
-
 const onAlphaChange = (val: number) => {
     store.overlayAlpha = val;
     emit('redraw');
@@ -359,131 +349,23 @@ const onFindIslands = () => {
 // MR-PET registration / CT bed removal の handler は App.vue (☰ Preprocessing) に移管。
 // formatMm / formatDeg は他で使われなくなったため削除。
 
-const onSave = () => {
-    store.saveMaskAsNifti();
-};
 
 const loadFileInput = ref<HTMLInputElement | null>(null);
-const loadSnapshotInput = ref<HTMLInputElement | null>(null);
 
 const onLoadMaskClick = () => {
     loadFileInput.value?.click();
 };
-const onLoadSnapshotClick = () => {
-    loadSnapshotInput.value?.click();
-};
 
-// .mvs snapshot save/load
-const snapshotBusy = ref(false);
-const onSaveSnapshot = async () => {
-    const pet = store.petVolumeRef;
-    const mask = store.finalMask;
-    if (!pet || !mask) {
-        alert('No PT volume or mask to save.');
-        return;
-    }
-    snapshotBusy.value = true;
-    try {
-        const { buildSnapshotZip } = await import('./segmentation/snapshot');
-        // Box state は親 (DicomView) しか持っていないので、emit で取得依頼
-        // ここでは現状空配列で保存。将来 DicomView 経由で boxState を埋める
-        const blob = await buildSnapshotZip({
-            pet,
-            mask,
-            labels: store.labels,
-            threshold: store.threshold,
-            thresholdUnit: store.thresholdUnit,
-            thresholdMethod: store.thresholdMethod,
-            thresholdPct: store.thresholdPct,
-            referenceSpheres: store.referenceSpheres,
-            boxState: [],   // TODO: DicomView から imageBoxInfos のシリアライズを受け取る
-            tileN: 0,
-            activeTracerId: store.activeTracerId,
-        });
-        const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
-        const sid = pet.metadata?.seriesUID
-            ? pet.metadata.seriesUID.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 32)
-            : 'snapshot';
-        triggerDownload(blob, `${sid}_${ts}.mvs`);
-    } catch (err: any) {
-        alert(`Failed to save snapshot: ${err?.message ?? err}`);
-    } finally {
-        snapshotBusy.value = false;
-    }
-};
-
-const onLoadSnapshotFile = async (e: Event) => {
-    const input = e.target as HTMLInputElement;
-    const f = input.files?.[0];
-    input.value = '';
-    if (!f) return;
-    if (!store.hasPet) {
-        alert('Load a PT volume first, then load the snapshot.');
-        return;
-    }
-    snapshotBusy.value = true;
-    try {
-        const { parseSnapshotZip, extractMaskFromSnapshot } = await import('./segmentation/snapshot');
-        const payload = await parseSnapshotZip(f);
-        if (!payload) throw new Error('Empty snapshot.');
-        const currentUid = store.petVolumeRef?.metadata?.seriesUID;
-        const snapUid = payload.manifest.petSeriesUID;
-        if (snapUid && currentUid && snapUid !== currentUid) {
-            const ok = window.confirm(
-                `This snapshot was created for PT series:\n  ${payload.manifest.petSeriesDescription ?? snapUid}\n\n` +
-                `but the currently active PT is:\n  ${store.petVolumeRef?.metadata?.seriesDescription ?? currentUid}\n\n` +
-                `Geometry may match by coincidence; mask may not align anatomically. Load anyway?`
-            );
-            if (!ok) return;
-        }
-        const { mask, dims } = extractMaskFromSnapshot(payload);
-        const sidecar = payload.sidecar ?? {};
-        const res = store.loadMaskFromNifti(mask, dims, sidecar);
-        if (!res.ok) {
-            alert(res.reason);
-            return;
-        }
-        // Threshold method / pct / reference spheres も復元
-        if (sidecar.thresholdMethod) store.thresholdMethod = sidecar.thresholdMethod;
-        if (typeof sidecar.thresholdPct === 'number') store.thresholdPct = sidecar.thresholdPct;
-        const refs = payload.referenceSpheres;
-        if (refs?.liver) {
-            store.setReferenceSphere('liver',
-                new THREE.Vector3(refs.liver.centerWorld[0], refs.liver.centerWorld[1], refs.liver.centerWorld[2]),
-                refs.liver.radiusMm,
-                { suvMean: refs.liver.suvMean, suvStd: refs.liver.suvStd, voxelCount: refs.liver.voxelCount },
-            );
-        }
-        if (refs?.bloodPool) {
-            store.setReferenceSphere('bloodPool',
-                new THREE.Vector3(refs.bloodPool.centerWorld[0], refs.bloodPool.centerWorld[1], refs.bloodPool.centerWorld[2]),
-                refs.bloodPool.radiusMm,
-                { suvMean: refs.bloodPool.suvMean, suvStd: refs.bloodPool.suvStd, voxelCount: refs.bloodPool.voxelCount },
-            );
-        }
-        if (payload.activeTracerId) store.activeTracerId = payload.activeTracerId;
-        emit('redraw');
-    } catch (err: any) {
-        alert(`Failed to load snapshot: ${err?.message ?? err}`);
-    } finally {
-        snapshotBusy.value = false;
-    }
-};
+// 旧 .mvs snapshot save/load は削除。フルセッション保存/復元 (view + mask + labels +
+// rect ROI) は App-bar のカメラアイコン「Snapshot」(useSnapshotIo, .json) に一本化した。
+// フッターは臨床エクスポート専用: Save NIfTI (マスク) / PDF / Load mask / Clear edits。
 
 // PDF lesion report. jsPDF を動的 import し pdfReport.ts (lazy chunk) で組み立て。
 const pdfBusy = ref(false);
-const onExportPdf = async () => {
-    const pet = store.petVolumeRef;
-    if (!pet) {
-        alert('Load a PT volume first.');
-        return;
-    }
-    pdfBusy.value = true;
-    try {
-        const { generateReport } = await import('./segmentation/pdfReport');
-        // 1 frame 譲って spinner を反映
-        await new Promise(r => setTimeout(r, 30));
-
+// PDF / PPTX 共通のレポート入力を組み立てる。両者で同じ数値が出るように 1 本化する。
+const buildReportInput = () => {
+    const pet = store.petVolumeRef!;
+    {
         // threshold の人間向け短文を組み立てる
         const tu = store.thresholdUnit;
         // jsPDF Helvetica は WinAnsi のみ。≥ ≤ × σ 等は Latin-1 互換代替で書く。
@@ -519,7 +401,7 @@ const onExportPdf = async () => {
             }
         }
 
-        await generateReport({
+        return {
             seriesUid: pet.metadata?.seriesUID,
             seriesDescription: pet.metadata?.seriesDescription,
             petModality: pet.metadata?.modality,
@@ -535,11 +417,37 @@ const onExportPdf = async () => {
             lesions,
             totals: lesionTotals.value,
             deauvilleHighest: highest,
-        });
+        };
+    }
+};
+
+const onExportPdf = async () => {
+    if (!store.petVolumeRef) { alert('Load a PT volume first.'); return; }
+    pdfBusy.value = true;
+    try {
+        const { generateReport } = await import('./segmentation/pdfReport');
+        await new Promise(r => setTimeout(r, 30));   // 1 frame 譲って spinner を反映
+        await generateReport(buildReportInput());
     } catch (err: any) {
         alert(`Failed to export PDF: ${err?.message ?? err}`);
     } finally {
         pdfBusy.value = false;
+    }
+};
+
+// PowerPoint (.pptx): 画像メイン + 全身サマリーのみ (per-lesion 行なし)。
+const pptBusy = ref(false);
+const onExportPpt = async () => {
+    if (!store.petVolumeRef) { alert('Load a PT volume first.'); return; }
+    pptBusy.value = true;
+    try {
+        const { generatePptReport } = await import('./segmentation/pptReport');
+        await new Promise(r => setTimeout(r, 30));
+        await generatePptReport(buildReportInput());
+    } catch (err: any) {
+        alert(`Failed to export PowerPoint: ${err?.message ?? err}`);
+    } finally {
+        pptBusy.value = false;
     }
 };
 
@@ -951,7 +859,14 @@ const brushRadiusProxy = computed({
 // History / Labels / Islands の開閉 (普段は畳む expander)。
 const showHistoryList = ref<boolean>(false);
 const showLabels = ref<boolean>(false);
-const showIslands = ref<boolean>(false);
+const showLesions = ref<boolean>(false);
+
+// App-bar のハンバーガーから呼べるように、file I/O / 病変集計を伴う save/load を公開。
+// (Save NIfTI / Clear edits は store action 直呼びで足りるので App 側で処理する。)
+defineExpose({
+    loadMask: onLoadMaskClick,
+    exportPdf: onExportPdf,
+});
 </script>
 
 <template>
@@ -959,7 +874,7 @@ const showIslands = ref<boolean>(false);
         <!-- Rectangle ROI: PET volume 非依存 (2D DICOM slice box でも使える)。
              Persona 1 の初期表示では不要なので、ROI が 1 つ以上あるときだけ表示する。
              新規作成はツールバーの Rectangle ROI ツールから行う。 -->
-        <section v-if="store.rectRois.length && showAdvanced" class="mv-section">
+        <section v-if="store.rectRois.length" class="mv-section">
             <div class="mv-section-title">
                 <v-icon icon="mdi-rectangle-outline" size="x-small" />
                 Rectangle ROI
@@ -999,6 +914,7 @@ const showIslands = ref<boolean>(false);
                 </div>
                 <v-btn size="x-small" variant="text" class="mt-1" @click="store.clearRectRois(); emit('redraw')">
                     <v-icon icon="mdi-close" size="x-small" class="mr-1" />Clear all
+                    <v-tooltip activator="parent" location="bottom">Delete every rectangle ROI (does not touch the mask)</v-tooltip>
                 </v-btn>
             </div>
             <div v-else class="mv-hint">
@@ -1152,22 +1068,18 @@ const showIslands = ref<boolean>(false);
                 </div>
             </div>
 
-            <!-- Auto-save status -->
-            <div v-if="store.lastAutoSavedAt" class="mv-autosave-line">
-                <v-icon icon="mdi-cloud-check-outline" size="x-small" class="mr-1" />
-                Auto-saved {{ autoSavedRel }}
-            </div>
+            <!-- Auto-save status は ④ Save グループ (最下部) へ移動した。 -->
 
             <!-- MR-PET Registration と CT bed removal は app-bar の ☰ Preprocessing メニューに移動 (2026-05) -->
 
             <!-- Overlay: step ①〜④ すべてに関わるので最上部に 1 行で。mask 表示切替 + 不透明度。 -->
             <div class="mv-overlay-bar">
                 <v-btn
-                    :icon="store.overlayEnabled ? 'mdi-eye' : 'mdi-eye-off'"
+                    :icon="anyLabelVisible ? 'mdi-eye' : 'mdi-eye-off'"
                     size="x-small" variant="text" density="compact"
-                    :color="store.overlayEnabled ? 'primary' : undefined"
-                    @click="onToggleOverlay(!store.overlayEnabled)"
-                    :title="store.overlayEnabled ? 'Hide mask' : 'Show mask'"
+                    :color="anyLabelVisible ? 'primary' : undefined"
+                    @click="onToggleAllLabels"
+                    :title="anyLabelVisible ? 'Hide all labels' : 'Show all labels'"
                 />
                 <span class="mv-overlay-label">Mask</span>
                 <v-slider
@@ -1175,7 +1087,7 @@ const showIslands = ref<boolean>(false);
                     :min="0.05" :max="1" :step="0.05"
                     density="compact" hide-details color="primary" track-color="surface-light"
                     class="mv-overlay-slider"
-                    :disabled="!store.overlayEnabled"
+                    :disabled="!anyLabelVisible"
                     @update:model-value="onAlphaChange($event as number)"
                 />
                 <span class="mv-mono mv-overlay-pct">{{ (store.overlayAlpha * 100).toFixed(0) }}%</span>
@@ -1184,230 +1096,81 @@ const showIslands = ref<boolean>(false);
 
             <!-- ===== スクロールする本体 ===== -->
             <div class="mv-seg-body">
-            <!-- ① Segment: 閾値でまるごと seg -->
-            <div class="mv-step-head"><span class="mv-step-num">1</span>Segment</div>
-            <section class="mv-section">
-                <!-- method=fixed の SUV preset (Persona 1 の主用途)。method 選択は Advanced。 -->
-                <v-select
-                    v-if="store.thresholdMethod === 'fixed'"
-                    :model-value="thresholdSelection"
-                    @update:model-value="onThresholdSelectionChange($event)"
-                    :items="THRESHOLD_PRESETS"
-                    density="compact"
-                    hide-details
-                    variant="outlined"
-                    label="Threshold (SUV)"
-                />
-                <v-text-field
-                    v-if="store.thresholdMethod === 'fixed' && thresholdSelection === 'manual'"
-                    v-model.number="store.threshold"
-                    type="number"
-                    step="0.1"
-                    density="compact"
-                    hide-details
-                    variant="outlined"
-                    label="SUV value"
-                    class="mt-1"
-                />
-                <div v-if="store.thresholdMethod !== 'fixed'" class="mv-hint">
-                    Method: {{ store.thresholdMethod }} — configure in Advanced
-                </div>
-
-                <!-- Threshold method selector + method 別 input + reference sphere は Advanced -->
-                <template v-if="showAdvanced">
-                    <v-select
-                        :model-value="store.thresholdMethod"
-                        @update:model-value="(v: any) => store.thresholdMethod = v"
-                        :items="thresholdMethodItems"
-                        density="compact"
-                        hide-details
-                        variant="outlined"
-                        label="Method"
-                        class="mt-1"
+            <!-- 統一ラベルリスト (縦 1 列)。各行: eye=overlay 表示切替 (複数可) /
+                 swatch+名前 / pencil=編集に使うラベル (Threshold・Assign・Polygon・Brush が共有)。 -->
+            <div class="mv-label-list">
+                <div
+                    v-for="l in store.labels"
+                    :key="l.id"
+                    class="mv-label-row"
+                    :class="{ 'is-edit': l.id === store.currentLabelId }"
+                >
+                    <v-btn
+                        :icon="isLabelVisible(l) ? 'mdi-eye-outline' : 'mdi-eye-off-outline'"
+                        size="x-small"
+                        variant="text"
+                        density="comfortable"
+                        class="mv-label-eye"
+                        :class="{ 'is-hidden': !isLabelVisible(l) }"
+                        :title="isLabelVisible(l) ? 'Hide this label on the image' : 'Show this label on the image'"
+                        @click="onToggleLabelVisible(l.id)"
                     />
-                    <v-text-field
-                        v-if="store.thresholdMethod === 'pctMax' || store.thresholdMethod === 'liverPct'"
-                        :model-value="(store.thresholdPct * 100).toFixed(0)"
-                        @update:model-value="(v: string) => store.thresholdPct = Math.max(0.01, Math.min(2, Number(v) / 100))"
-                        type="number"
-                        step="1"
-                        density="compact"
-                        hide-details
-                        variant="outlined"
-                        :label="store.thresholdMethod === 'pctMax' ? '% of SUVmax' : '% of liver SUVmean'"
-                        suffix="%"
-                        class="mt-1"
+                    <span class="mv-color-swatch" :style="{ background: `rgb(${l.color[0]},${l.color[1]},${l.color[2]})` }" />
+                    <button
+                        type="button"
+                        class="mv-label-row-name"
+                        :title="`Use ${l.name} for editing`"
+                        @click="store.currentLabelId = l.id"
+                    >{{ l.name }}</button>
+                    <v-btn
+                        icon="mdi-pencil"
+                        size="x-small"
+                        variant="text"
+                        density="comfortable"
+                        class="mv-label-pencil"
+                        :class="{ 'is-active': l.id === store.currentLabelId }"
+                        :title="l.id === store.currentLabelId ? 'Editing with this label' : `Use ${l.name} for editing`"
+                        @click="store.currentLabelId = l.id"
                     />
-
-                <!-- Reference sphere placement (liver / bloodPool) — PERCIST / Deauville 用 -->
-                <div v-if="needsLiverReference || showRefSpheres" class="mv-ref-spheres mt-2">
-                    <div class="mv-ref-row">
-                        <v-icon
-                            :icon="store.referenceSpheres.liver ? 'mdi-check-circle' : 'mdi-circle-outline'"
-                            :color="store.referenceSpheres.liver ? 'primary' : undefined"
-                            size="x-small"
-                        />
-                        <span class="mv-ref-label">Liver</span>
-                        <span v-if="store.referenceSpheres.liver" class="mv-mono mv-ref-stats">
-                            {{ store.referenceSpheres.liver.suvMean.toFixed(3) }} ± {{ store.referenceSpheres.liver.suvStd.toFixed(3) }}
-                        </span>
-                        <v-btn
-                            size="x-small"
-                            :variant="store.referencePlacementMode === 'liver' ? 'flat' : 'tonal'"
-                            :color="store.referencePlacementMode === 'liver' ? 'primary' : undefined"
-                            @click="store.setReferencePlacementMode(store.referencePlacementMode === 'liver' ? null : 'liver')"
-                            class="ml-auto"
-                        >
-                            {{ store.referencePlacementMode === 'liver' ? 'Click on liver…' : 'Place' }}
-                        </v-btn>
-                    </div>
-                    <div class="mv-ref-row mt-1">
-                        <v-icon
-                            :icon="store.referenceSpheres.bloodPool ? 'mdi-check-circle' : 'mdi-circle-outline'"
-                            :color="store.referenceSpheres.bloodPool ? 'primary' : undefined"
-                            size="x-small"
-                        />
-                        <span class="mv-ref-label">Blood pool</span>
-                        <span v-if="store.referenceSpheres.bloodPool" class="mv-mono mv-ref-stats">
-                            {{ store.referenceSpheres.bloodPool.suvMean.toFixed(3) }} ± {{ store.referenceSpheres.bloodPool.suvStd.toFixed(3) }}
-                        </span>
-                        <v-btn
-                            size="x-small"
-                            :variant="store.referencePlacementMode === 'bloodPool' ? 'flat' : 'tonal'"
-                            :color="store.referencePlacementMode === 'bloodPool' ? 'primary' : undefined"
-                            @click="store.setReferencePlacementMode(store.referencePlacementMode === 'bloodPool' ? null : 'bloodPool')"
-                            class="ml-auto"
-                        >
-                            {{ store.referencePlacementMode === 'bloodPool' ? 'Click on aorta…' : 'Place' }}
-                        </v-btn>
-                    </div>
-                    <div v-if="store.referencePlacementMode" class="mv-hint mt-1" style="color: var(--mv-warning, #FFB454)">
-                        Use the Sphere VOI tool and click on the {{ store.referencePlacementMode === 'liver' ? 'right liver lobe' : 'descending aorta' }} (any Volume box).
-                    </div>
-                </div>
-                </template>
-
-                <div v-if="resolvedThresholdHint" class="mv-hint mt-1">
-                    → {{ resolvedThresholdHint }}
                 </div>
 
-                <!-- Apply split button: メインは現在ラベルで適用、caret で Tumor/Physio を選んで即適用。 -->
-                <div class="mv-apply-row mt-2" data-demo="apply-threshold">
-                    <div class="mv-apply-split">
-                        <v-btn
-                            class="mv-apply-main"
-                            color="primary" variant="flat" size="small"
-                            :disabled="!canApplyThreshold"
-                            @click="onApplyThreshold"
-                        >
-                            <v-icon icon="mdi-play" size="small" class="mr-1" />Apply
-                            <span class="mv-color-swatch mx-1" :style="{ background: currentLabelColorCss }" />
-                            <span class="mv-apply-label">{{ currentLabelName }}</span>
-                        </v-btn>
-                        <v-menu location="bottom end">
-                            <template #activator="{ props }">
-                                <v-btn
-                                    class="mv-apply-caret"
-                                    color="primary" variant="flat" size="small"
-                                    :disabled="!canApplyThreshold"
-                                    v-bind="props"
-                                >
-                                    <v-icon icon="mdi-menu-down" size="small" />
-                                </v-btn>
-                            </template>
-                            <v-list density="compact">
-                                <v-list-item v-for="q in quickLabels" :key="q.id" @click="onApplyAs(q.id)">
-                                    <template #prepend>
-                                        <span class="mv-color-swatch mr-2" :style="{ background: q.colorCss }" />
-                                    </template>
-                                    <v-list-item-title>Apply as {{ q.name }}</v-list-item-title>
-                                </v-list-item>
-                            </v-list>
-                        </v-menu>
-                    </div>
-                    <v-btn size="small" variant="outlined" @click="onClearThreshold">Clear</v-btn>
-                </div>
-            </section>
-
-            <!-- ② Refine: assign / polygon / brush でラベル修正 -->
-            <div class="mv-step-head"><span class="mv-step-num">2</span>Refine</div>
-            <section class="mv-section">
-                <!-- 共通ラベルピッカー: assign / polygon / brush すべてがこのラベルへ書き込む。
-                     Tumor だけでなく Lymph node 等あらゆるラベルから選べる。 -->
-                <v-menu location="bottom">
-                    <template #activator="{ props }">
-                        <v-btn class="mv-label-picker" variant="outlined" size="small" block v-bind="props">
-                            <span class="mv-color-swatch mr-2" :style="{ background: currentLabelColorCss }" />
-                            <span class="mv-label-picker-name">{{ currentLabelName }}</span>
-                            <v-icon icon="mdi-menu-down" size="small" class="ml-auto" />
-                        </v-btn>
-                    </template>
-                    <v-list density="compact">
-                        <v-list-item
-                            v-for="l in labelPickItems"
-                            :key="l.id"
-                            :active="l.id === store.currentLabelId"
-                            @click="onPickLabel(l.id)"
-                        >
-                            <template #prepend>
-                                <span class="mv-color-swatch mr-2" :style="{ background: l.colorCss }" />
-                            </template>
-                            <v-list-item-title>{{ l.name }}</v-list-item-title>
-                        </v-list-item>
-                    </v-list>
-                </v-menu>
-                <!-- 編集ツール: Assign / Polygon / Brush を同列に。使い方はホバーで tooltip 表示。 -->
-                <div class="mv-tool-toggle-wrap mt-2">
-                    <v-btn-toggle
-                        :model-value="activeSegTool"
-                        @update:model-value="onSegToolToggle"
-                        density="compact"
-                        color="primary"
-                        variant="outlined"
-                        divided
-                        class="mv-tool-toggle"
+                <!-- 既定ラベルは 3 つだけなので、ここから手軽に足せるようにする。
+                     クリックで入力欄が開き、Enter か + で追加 → そのまま編集ラベルになる。 -->
+                <div v-if="!showInlineAddLabel" class="mv-label-add-row">
+                    <button
+                        type="button"
+                        class="mv-label-add-btn"
+                        title="Add a new label (e.g. Lymph, Bone, Lung, Liver)"
+                        @click="onOpenInlineAdd"
                     >
-                        <v-btn value="assignLabel" size="small">
-                            <v-icon icon="mdi-tag-outline" size="small" class="mr-1" />Assign
-                        </v-btn>
-                        <v-btn value="polygonROI" size="small">
-                            <v-icon icon="mdi-vector-polygon" size="small" class="mr-1" />Polygon
-                        </v-btn>
-                        <v-btn value="brushROI" size="small">
-                            <v-icon icon="mdi-brush" size="small" class="mr-1" />Brush
-                        </v-btn>
-                    </v-btn-toggle>
-                    <v-tooltip activator="parent" location="bottom" open-delay="250" max-width="260">
-                        <template v-if="activeSegTool === 'assignLabel'">
-                            Click a lesion on any Volume box to label its whole 3D island as {{ currentLabelName }}.
-                        </template>
-                        <template v-else-if="activeSegTool === 'polygonROI'">
-                            Left click = vertex, right / double click = finish. Relabels the drawn area to {{ currentLabelName }}.
-                        </template>
-                        <template v-else-if="activeSegTool === 'brushROI'">
-                            Drag on a Volume slice to relabel to {{ currentLabelName }}.
-                        </template>
-                        <template v-else>
-                            Pick a tool, then edit on any Volume box. Tools relabel existing mask voxels to the label above.
-                        </template>
-                    </v-tooltip>
+                        <v-icon icon="mdi-plus" size="x-small" class="mr-1" />Add label
+                    </button>
                 </div>
-
-                <!-- Brush radius: brush ツール選択時のみ表示 (ボタン近傍に配置) -->
-                <template v-if="activeSegTool === 'brushROI'">
-                    <div class="mv-row-label mt-2">
-                        <span>Brush radius</span>
-                        <span class="mv-mono">{{ brushRadiusProxy.toFixed(0) }} mm</span>
-                    </div>
-                    <v-slider
-                        v-model="brushRadiusProxy"
-                        :min="1" :max="30" :step="1"
-                        density="compact" hide-details color="primary" track-color="surface-light"
+                <div v-else class="mv-label-add-row is-editing">
+                    <v-text-field
+                        ref="inlineAddField"
+                        v-model="newLabelName"
+                        placeholder="Label name"
+                        density="compact"
+                        hide-details
+                        variant="outlined"
+                        autofocus
+                        class="mv-label-add-field"
+                        @keyup.enter="onAddLabelInline"
+                        @keyup.esc="showInlineAddLabel = false"
                     />
-                </template>
-            </section>
+                    <v-btn size="x-small" variant="tonal" @click="onAddLabelInline">
+                        <v-icon icon="mdi-plus" size="small" />
+                        <v-tooltip activator="parent" location="bottom">Add this label</v-tooltip>
+                    </v-btn>
+                    <v-btn size="x-small" variant="text" @click="showInlineAddLabel = false">
+                        <v-icon icon="mdi-close" size="small" />
+                        <v-tooltip activator="parent" location="bottom">Cancel</v-tooltip>
+                    </v-btn>
+                </div>
+            </div>
 
-            <!-- History: 普段は畳んで expander。undo/redo は header に常時表示。 -->
+            <!-- History (step 群の外・上部)。undo/redo は header 常時、リストは畳む expander。 -->
             <section class="mv-section">
                 <div class="mv-section-title mv-history-head" @click="showHistoryList = !showHistoryList">
                     <v-icon icon="mdi-history" size="x-small" />
@@ -1447,6 +1210,189 @@ const showIslands = ref<boolean>(false);
                 </template>
             </section>
 
+            <!-- ① Threshold: 閾値でまるごと自動セグメント -->
+            <div class="mv-step-head"><span class="mv-step-num">1</span>Threshold</div>
+            <section class="mv-section">
+                <!-- Method を上に。Fixed SUV 以外はまだ工事中で選択不可。 -->
+                <v-select
+                    :model-value="store.thresholdMethod"
+                    @update:model-value="(v: any) => store.thresholdMethod = v"
+                    :items="thresholdMethodItems"
+                    :item-props="(it: any) => ({ disabled: it.value !== 'fixed' })"
+                    density="compact"
+                    hide-details
+                    variant="outlined"
+                    label="Method"
+                />
+                <!-- Fixed SUV の preset / 手動値 (Method の下)。 -->
+                <v-select
+                    v-if="store.thresholdMethod === 'fixed'"
+                    :model-value="thresholdSelection"
+                    @update:model-value="onThresholdSelectionChange($event)"
+                    :items="THRESHOLD_PRESETS"
+                    density="compact"
+                    hide-details
+                    variant="outlined"
+                    label="Threshold (SUV)"
+                    class="mt-1"
+                />
+                <v-text-field
+                    v-if="store.thresholdMethod === 'fixed' && thresholdSelection === 'manual'"
+                    v-model.number="store.threshold"
+                    type="number"
+                    step="0.1"
+                    density="compact"
+                    hide-details
+                    variant="outlined"
+                    label="SUV value"
+                    class="mt-1"
+                />
+                    <v-text-field
+                        v-if="store.thresholdMethod === 'pctMax' || store.thresholdMethod === 'liverPct'"
+                        :model-value="(store.thresholdPct * 100).toFixed(0)"
+                        @update:model-value="(v: string) => store.thresholdPct = Math.max(0.01, Math.min(2, Number(v) / 100))"
+                        type="number"
+                        step="1"
+                        density="compact"
+                        hide-details
+                        variant="outlined"
+                        :label="store.thresholdMethod === 'pctMax' ? '% of SUVmax' : '% of liver SUVmean'"
+                        suffix="%"
+                        class="mt-1"
+                    />
+
+                <!-- Reference sphere placement (liver / bloodPool) — PERCIST / Deauville 用 -->
+                <div v-if="needsLiverReference || showRefSpheres" class="mv-ref-spheres mt-2">
+                    <div class="mv-ref-row">
+                        <v-icon
+                            :icon="store.referenceSpheres.liver ? 'mdi-check-circle' : 'mdi-circle-outline'"
+                            :color="store.referenceSpheres.liver ? 'primary' : undefined"
+                            size="x-small"
+                        />
+                        <span class="mv-ref-label">Liver</span>
+                        <span v-if="store.referenceSpheres.liver" class="mv-mono mv-ref-stats">
+                            {{ store.referenceSpheres.liver.suvMean.toFixed(3) }} ± {{ store.referenceSpheres.liver.suvStd.toFixed(3) }}
+                        </span>
+                        <v-btn
+                            size="x-small"
+                            :variant="store.referencePlacementMode === 'liver' ? 'flat' : 'tonal'"
+                            :color="store.referencePlacementMode === 'liver' ? 'primary' : undefined"
+                            @click="store.setReferencePlacementMode(store.referencePlacementMode === 'liver' ? null : 'liver')"
+                            class="ml-auto"
+                        >
+                            {{ store.referencePlacementMode === 'liver' ? 'Click on liver…' : 'Place' }}
+                            <v-tooltip activator="parent" location="bottom" max-width="260">
+                                {{ store.referencePlacementMode === 'liver'
+                                    ? 'Now click inside the liver on any Volume box to place the 3 cm reference sphere (click again here to cancel)'
+                                    : 'Place the liver reference sphere — used by PERCIST / Deauville thresholds' }}
+                            </v-tooltip>
+                        </v-btn>
+                    </div>
+                    <div class="mv-ref-row mt-1">
+                        <v-icon
+                            :icon="store.referenceSpheres.bloodPool ? 'mdi-check-circle' : 'mdi-circle-outline'"
+                            :color="store.referenceSpheres.bloodPool ? 'primary' : undefined"
+                            size="x-small"
+                        />
+                        <span class="mv-ref-label">Blood pool</span>
+                        <span v-if="store.referenceSpheres.bloodPool" class="mv-mono mv-ref-stats">
+                            {{ store.referenceSpheres.bloodPool.suvMean.toFixed(3) }} ± {{ store.referenceSpheres.bloodPool.suvStd.toFixed(3) }}
+                        </span>
+                        <v-btn
+                            size="x-small"
+                            :variant="store.referencePlacementMode === 'bloodPool' ? 'flat' : 'tonal'"
+                            :color="store.referencePlacementMode === 'bloodPool' ? 'primary' : undefined"
+                            @click="store.setReferencePlacementMode(store.referencePlacementMode === 'bloodPool' ? null : 'bloodPool')"
+                            class="ml-auto"
+                        >
+                            {{ store.referencePlacementMode === 'bloodPool' ? 'Click on aorta…' : 'Place' }}
+                            <v-tooltip activator="parent" location="bottom" max-width="260">
+                                {{ store.referencePlacementMode === 'bloodPool'
+                                    ? 'Now click inside the aorta on any Volume box to place the blood-pool reference sphere (click again here to cancel)'
+                                    : 'Place the blood-pool (aorta) reference sphere — used by Deauville scoring' }}
+                            </v-tooltip>
+                        </v-btn>
+                    </div>
+                    <div v-if="store.referencePlacementMode" class="mv-hint mt-1" style="color: var(--mv-warning, #FFB454)">
+                        Use the Sphere VOI tool and click on the {{ store.referencePlacementMode === 'liver' ? 'right liver lobe' : 'descending aorta' }} (any Volume box).
+                    </div>
+                </div>
+
+                <!-- 全身を閾値でセグメント。対象ラベルは上部の統一ラベル選択で決める。 -->
+                <div class="mv-apply-row mt-2" data-demo="apply-threshold">
+                    <v-btn
+                        class="mv-apply-main"
+                        color="primary" variant="flat" size="small"
+                        :disabled="!canApplyThreshold"
+                        @click="onApplyThreshold"
+                    >
+                        <v-icon icon="mdi-play" size="small" class="mr-1" />Segment whole body
+                        <v-tooltip activator="parent" location="bottom" max-width="280">
+                            Label every voxel above the SUV threshold across the whole PET as {{ currentLabelName }}. Manual edits are kept.
+                        </v-tooltip>
+                    </v-btn>
+                    <v-btn size="small" variant="outlined" @click="onClearThreshold">
+                        Clear
+                        <v-tooltip activator="parent" location="bottom" max-width="280">
+                            Clear the whole-body threshold mask (asks for confirmation). Manual edits are kept.
+                        </v-tooltip>
+                    </v-btn>
+                </div>
+            </section>
+
+            <!-- ② Manual edit: assign / polygon / brush で既存ラベルを手修正 -->
+            <div class="mv-step-head"><span class="mv-step-num">2</span>Manual edit</div>
+            <section class="mv-section">
+                <!-- 編集ツール: Assign / Polygon / Brush を同列に。書き込み先ラベルは上部の
+                     統一ラベル選択で決める (専用ピッカーは廃止)。使い方はホバーで tooltip 表示。 -->
+                <div class="mv-tool-toggle-wrap">
+                    <v-btn-toggle
+                        :model-value="activeSegTool"
+                        @update:model-value="onSegToolToggle"
+                        density="compact"
+                        color="primary"
+                        variant="outlined"
+                        divided
+                        class="mv-tool-toggle"
+                    >
+                        <!-- tooltip は **ボタンごと** に付ける。以前は wrap 全体に 1 つだけ付けており、
+                             どのボタンをホバーしても「現在有効なツール」の説明が出て紛らわしかった。 -->
+                        <v-btn value="assignLabel" size="small">
+                            <v-icon icon="mdi-tag-outline" size="small" class="mr-1" />Assign
+                            <v-tooltip activator="parent" location="bottom" open-delay="250" max-width="260">
+                                Assign: click a lesion on any Volume box to relabel its whole 3D island to {{ currentLabelName }}.
+                            </v-tooltip>
+                        </v-btn>
+                        <v-btn value="polygonROI" size="small">
+                            <v-icon icon="mdi-vector-polygon" size="small" class="mr-1" />Polygon
+                            <v-tooltip activator="parent" location="bottom" open-delay="250" max-width="260">
+                                Polygon: left click = vertex, right / double click = finish. Relabels the drawn area to {{ currentLabelName }}.
+                            </v-tooltip>
+                        </v-btn>
+                        <v-btn value="brushROI" size="small">
+                            <v-icon icon="mdi-brush" size="small" class="mr-1" />Brush
+                            <v-tooltip activator="parent" location="bottom" open-delay="250" max-width="260">
+                                Brush: drag on a Volume slice to relabel to {{ currentLabelName }}. Radius is set below.
+                            </v-tooltip>
+                        </v-btn>
+                    </v-btn-toggle>
+                </div>
+
+                <!-- Brush radius: brush ツール選択時のみ表示 (ボタン近傍に配置) -->
+                <template v-if="activeSegTool === 'brushROI'">
+                    <div class="mv-row-label mt-2">
+                        <span>Brush radius</span>
+                        <span class="mv-mono">{{ brushRadiusProxy.toFixed(0) }} mm</span>
+                    </div>
+                    <v-slider
+                        v-model="brushRadiusProxy"
+                        :min="1" :max="30" :step="1"
+                        density="compact" hide-details color="primary" track-color="surface-light"
+                    />
+                </template>
+            </section>
+
+            <!-- History は step 群の外 (body 上部) へ移動した (①②③ 共通のため)。 -->
             <!-- Overlay は最上部の 1 行バーへ移動済み (step 共通のため) -->
             <!-- Sphere VOI: サイドバー欄は削除。ツール本体 (App-bar) + 画像中フローティング統計
                  (DicomView .mv-sphere-float) + store.clearSphere で完結しており、ここは冗長だった。 -->
@@ -1475,13 +1421,16 @@ const showIslands = ref<boolean>(false);
                             <span class="mv-label-name">{{ row.name }}</span>
                             <span class="mv-mono mv-label-vol">{{ (row.volume_mm3 / 1000).toFixed(1) }} ml · {{ row.count }} vox</span>
                             <v-btn
-                                icon="mdi-close"
+                                icon
                                 size="x-small"
                                 variant="text"
                                 density="compact"
                                 class="ml-1"
                                 @click.stop="onRemoveLabel(row.id)"
-                            />
+                            >
+                                <v-icon icon="mdi-close" />
+                                <v-tooltip activator="parent" location="bottom">Delete the label “{{ row.name }}”</v-tooltip>
+                            </v-btn>
                         </div>
                     </div>
                     <div class="mv-add-label mt-2">
@@ -1495,133 +1444,50 @@ const showIslands = ref<boolean>(false);
                         />
                         <v-btn size="small" variant="tonal" @click="onAddLabel">
                             <v-icon icon="mdi-plus" size="small" />
+                            <v-tooltip activator="parent" location="bottom">Add a new label with the name typed on the left</v-tooltip>
                         </v-btn>
                     </div>
                 </template>
             </section>
 
-            <!-- Histogram — 選択病変 (Lesion table の行クリックで選択) の SUV 分布 -->
+            <!-- Histogram は下の Lesions expander の内部へ移動 (lesion に従属)。 -->
+
+            <!-- Lesion table (病変単位。行クリックで Histogram に反映)。
+                 Islands (連結成分 = 病変) の再検出ボタンは Lesions 見出しに統合した
+                 (旧 Islands expander は廃止)。 -->
             <section v-if="store.finalMask" class="mv-section">
-                <div class="mv-section-title mv-section-title-row">
-                    <span>
-                        <v-icon icon="mdi-chart-bar" size="x-small" />
-                        Histogram
-                        <span v-if="selectedLesion" class="mv-hist-label-name" :style="{ color: selectedLesionColorCss }">
-                            #{{ lesionRows.findIndex(r => r.componentId === selectedLesion!.componentId) + 1 }} {{ selectedLesion.labelName }}
-                        </span>
-                    </span>
-                    <v-btn
-                        size="x-small" variant="text" density="compact"
-                        :disabled="!store.finalMask || store.labels.length === 0 || radiomicsRunning"
-                        @click="onExportRadiomicsCsv"
-                        title="Export radiomics features (first-order + shape + GLCM + GLRLM) for all labels"
-                    >
-                        <v-icon icon="mdi-atom" size="x-small" class="mr-1" />
-                        {{ radiomicsRunning ? '…' : 'Radiomics' }}
-                    </v-btn>
-                </div>
-
-                <template v-if="lesionHistogram && lesionHistogram.count > 0">
-                    <svg
-                        class="mv-hist-svg"
-                        :viewBox="`0 0 ${HIST_VB_W} ${HIST_VB_H}`"
-                        preserveAspectRatio="none"
-                    >
-                        <line :x1="0" :y1="HIST_VB_H" :x2="HIST_VB_W" :y2="HIST_VB_H"
-                              stroke="var(--mv-border)" stroke-width="0.5" />
-                        <line v-if="lesionHistogram.binWidth > 0"
-                              :x1="((lesionHistogram.mean - lesionHistogram.lo) / (lesionHistogram.hi - lesionHistogram.lo)) * HIST_VB_W"
-                              :y1="0"
-                              :x2="((lesionHistogram.mean - lesionHistogram.lo) / (lesionHistogram.hi - lesionHistogram.lo)) * HIST_VB_W"
-                              :y2="HIST_VB_H"
-                              stroke="var(--mv-text-muted)" stroke-width="0.6" stroke-dasharray="2 2" />
-                        <rect
-                            v-for="(c, i) in lesionHistogram.counts"
-                            :key="i"
-                            :x="i * (HIST_VB_W / lesionHistogram.counts.length) + 0.5"
-                            :y="HIST_VB_H - (c / lesionHistogram.peak) * HIST_VB_H"
-                            :width="(HIST_VB_W / lesionHistogram.counts.length) - 1"
-                            :height="(c / lesionHistogram.peak) * HIST_VB_H"
-                            :fill="selectedLesionColorCss"
-                        />
-                    </svg>
-                    <div class="mv-hist-axis">
-                        <span class="mv-mono">{{ lesionHistogram.lo.toFixed(1) }}</span>
-                        <span class="mv-mono">{{ lesionHistogram.hi.toFixed(1) }}</span>
-                    </div>
-                    <div class="mv-stats mt-1">
-                        <div class="mv-stat-row">
-                            <span class="mv-stat-label">min / max</span>
-                            <span class="mv-mono">{{ lesionHistogram.min.toFixed(3) }} / {{ lesionHistogram.max.toFixed(3) }}</span>
-                        </div>
-                        <div class="mv-stat-row">
-                            <span class="mv-stat-label">mean</span>
-                            <span class="mv-mono">
-                                {{ lesionHistogram.mean.toFixed(3) }}
-                                <span class="mv-stat-dim">± {{ lesionHistogram.std.toFixed(3) }}</span>
-                            </span>
-                        </div>
-                        <div class="mv-stat-row">
-                            <span class="mv-stat-label">voxels</span>
-                            <span class="mv-mono">{{ lesionHistogram.count }}</span>
-                        </div>
-                    </div>
-                </template>
-                <div v-else class="mv-hint">
-                    Click a lesion row below to show its SUV histogram.
-                </div>
-            </section>
-
-            <!-- Islands: 普段は畳む expander (History と同じ)。assign が自動 flood するため通常不要。 -->
-            <section class="mv-section">
-                <div class="mv-section-title mv-history-head" @click="showIslands = !showIslands">
-                    <v-icon icon="mdi-island" size="x-small" />
-                    Islands
-                    <span v-if="store.componentMapValid" class="mv-section-count">{{ store.componentCount }}</span>
-                    <v-icon :icon="showIslands ? 'mdi-chevron-up' : 'mdi-chevron-down'" size="x-small" class="ml-auto" />
-                </div>
-                <template v-if="showIslands">
-                    <div v-if="store.componentMapValid" class="mv-hint">
-                        <span class="mv-accent">{{ store.componentCount }}</span> components detected —
-                        click an island with the Assign Label tool
-                    </div>
-                    <div v-else-if="store.finalMask" class="mv-warn-text">
-                        <v-icon icon="mdi-refresh" size="x-small" class="mr-1" />
-                        Mask updated — re-run Find islands
-                    </div>
-                    <v-btn
-                        size="small"
-                        variant="tonal"
-                        color="primary"
-                        class="mt-1"
-                        :disabled="!store.finalMask"
-                        @click="onFindIslands"
-                    >
-                        <v-icon icon="mdi-magnify" size="small" class="mr-1" />
-                        {{ store.componentMapValid ? 'Re-find' : 'Find islands' }}
-                    </v-btn>
-                </template>
-            </section>
-
-            <!-- Lesion table (病変単位。行クリックで Histogram に反映) -->
-            <section v-if="store.finalMask" class="mv-section">
-                <div class="mv-section-title mv-section-title-row">
+                <div class="mv-section-title mv-section-title-row mv-history-head" @click="showLesions = !showLesions">
                     <span>
                         <v-icon icon="mdi-format-list-bulleted-square" size="x-small" />
                         Lesions
                         <span v-if="lesionTotals" class="mv-lesion-count">{{ lesionTotals.count }}</span>
                     </span>
-                    <v-btn
-                        size="x-small"
-                        variant="text"
-                        :disabled="!lesionTotals"
-                        density="compact"
-                        @click="onExportLesionCsv"
-                    >
-                        <v-icon icon="mdi-download" size="x-small" class="mr-1" />CSV
-                    </v-btn>
+                    <span class="mv-lesion-head-right">
+                        <v-btn
+                            size="x-small"
+                            variant="text"
+                            :disabled="!store.finalMask"
+                            density="compact"
+                            :title="store.componentMapValid ? 'Re-find islands (connected components)' : 'Find islands (connected components)'"
+                            @click.stop="onFindIslands"
+                        >
+                            <v-icon icon="mdi-magnify" size="x-small" class="mr-1" />{{ store.componentMapValid ? 'Re-find' : 'Islands' }}
+                        </v-btn>
+                        <v-btn
+                            size="x-small"
+                            variant="text"
+                            :disabled="!lesionTotals"
+                            density="compact"
+                            @click.stop="onExportLesionCsv"
+                        >
+                            <v-icon icon="mdi-download" size="x-small" class="mr-1" />CSV
+                            <v-tooltip activator="parent" location="bottom">Download the lesion table (MTV / TLG / SUV) as CSV</v-tooltip>
+                        </v-btn>
+                        <v-icon :icon="showLesions ? 'mdi-chevron-up' : 'mdi-chevron-down'" size="x-small" class="ml-1" />
+                    </span>
                 </div>
 
+                <template v-if="showLesions">
                 <div v-if="!lesionTotals" class="mv-hint">
                     No lesions yet — Apply threshold or paint a polygon
                 </div>
@@ -1708,40 +1574,121 @@ const showIslands = ref<boolean>(false);
                         </div>
                     </div>
                 </template>
+
+                    <!-- Histogram (選択病変の SUV 分布)。Lesion に従属するので Lesions expander 内。 -->
+                    <div class="mv-hist-block mt-2">
+                        <div class="mv-section-title mv-section-title-row">
+                            <span>
+                                <v-icon icon="mdi-chart-bar" size="x-small" />
+                                Histogram
+                                <span v-if="selectedLesion" class="mv-hist-label-name" :style="{ color: selectedLesionColorCss }">
+                                    #{{ lesionRows.findIndex(r => r.componentId === selectedLesion!.componentId) + 1 }} {{ selectedLesion.labelName }}
+                                </span>
+                            </span>
+                            <v-btn
+                                size="x-small" variant="text" density="compact"
+                                :disabled="!store.finalMask || store.labels.length === 0 || radiomicsRunning"
+                                @click.stop="onExportRadiomicsCsv"
+                                title="Export radiomics features (first-order + shape + GLCM + GLRLM) for all labels"
+                            >
+                                <v-icon icon="mdi-atom" size="x-small" class="mr-1" />
+                                {{ radiomicsRunning ? '…' : 'Radiomics' }}
+                            </v-btn>
+                        </div>
+                        <template v-if="lesionHistogram && lesionHistogram.count > 0">
+                            <svg class="mv-hist-svg" :viewBox="`0 0 ${HIST_VB_W} ${HIST_VB_H}`" preserveAspectRatio="none">
+                                <line :x1="0" :y1="HIST_VB_H" :x2="HIST_VB_W" :y2="HIST_VB_H" stroke="var(--mv-border)" stroke-width="0.5" />
+                                <line v-if="lesionHistogram.binWidth > 0"
+                                      :x1="((lesionHistogram.mean - lesionHistogram.lo) / (lesionHistogram.hi - lesionHistogram.lo)) * HIST_VB_W"
+                                      :y1="0"
+                                      :x2="((lesionHistogram.mean - lesionHistogram.lo) / (lesionHistogram.hi - lesionHistogram.lo)) * HIST_VB_W"
+                                      :y2="HIST_VB_H"
+                                      stroke="var(--mv-text-muted)" stroke-width="0.6" stroke-dasharray="2 2" />
+                                <rect v-for="(c, i) in lesionHistogram.counts" :key="i"
+                                      :x="i * (HIST_VB_W / lesionHistogram.counts.length) + 0.5"
+                                      :y="HIST_VB_H - (c / lesionHistogram.peak) * HIST_VB_H"
+                                      :width="(HIST_VB_W / lesionHistogram.counts.length) - 1"
+                                      :height="(c / lesionHistogram.peak) * HIST_VB_H"
+                                      :fill="selectedLesionColorCss" />
+                            </svg>
+                            <div class="mv-hist-axis">
+                                <span class="mv-mono">{{ lesionHistogram.lo.toFixed(1) }}</span>
+                                <span class="mv-mono">{{ lesionHistogram.hi.toFixed(1) }}</span>
+                            </div>
+                            <div class="mv-stats mt-1">
+                                <div class="mv-stat-row"><span class="mv-stat-label">min / max</span><span class="mv-mono">{{ lesionHistogram.min.toFixed(3) }} / {{ lesionHistogram.max.toFixed(3) }}</span></div>
+                                <div class="mv-stat-row"><span class="mv-stat-label">mean</span><span class="mv-mono">{{ lesionHistogram.mean.toFixed(3) }} <span class="mv-stat-dim">± {{ lesionHistogram.std.toFixed(3) }}</span></span></div>
+                                <div class="mv-stat-row"><span class="mv-stat-label">voxels</span><span class="mv-mono">{{ lesionHistogram.count }}</span></div>
+                            </div>
+                        </template>
+                        <div v-else class="mv-hint">
+                            Click a lesion row above to show its SUV histogram.
+                        </div>
+                    </div>
+                </template>
             </section>
 
-            <!-- Advanced 開閉 (本体末尾): 使用頻度の低い機能を出し入れ。 -->
-            <button type="button" class="mv-advanced-toggle" @click="toggleAdvanced">
-                <v-icon :icon="showAdvanced ? 'mdi-chevron-down' : 'mdi-chevron-right'" size="small" />
-                Advanced tools
-                <span class="mv-advanced-hint">{{ showAdvanced ? 'hide' : 'method · reference SUV · rectangle ROI' }}</span>
-            </button>
+            <!-- Advanced tools トグルは廃止 (method / reference SUV / rectangle ROI は常時表示)。 -->
+
+            <!-- ④ Save: セッション / 成果物のエクスポート (Full / NIfTI / CSV / PDF)。 -->
+            <div class="mv-step-head"><span class="mv-step-num">4</span>Save</div>
+            <!-- NIfTI mask は最頻用なので独立ボタン。他 (Full / CSV / PDF) は Others メニューに畳む。 -->
+            <section class="mv-section mv-save-row">
+                <v-btn
+                    color="primary"
+                    variant="flat"
+                    size="small"
+                    class="mv-save-nifti"
+                    :disabled="!store.finalMask"
+                    data-demo="save-nifti"
+                    @click="store.saveMaskAsNifti()"
+                >
+                    <v-icon icon="mdi-content-save" size="small" class="mr-1" />Save NIfTI mask
+                    <v-tooltip activator="parent" location="top" max-width="280">
+                        Download the multi-label mask as .nii + .json sidecar (PET grid, same affine as the PET)
+                    </v-tooltip>
+                </v-btn>
+                <v-menu location="top">
+                    <template #activator="{ props }">
+                        <v-btn variant="tonal" size="small" class="mv-save-others" v-bind="props" title="Other export formats">
+                            Others<v-icon icon="mdi-menu-up" size="small" class="ml-1" />
+                        </v-btn>
+                    </template>
+                    <v-list density="compact">
+                        <v-list-item @click="emit('save-snapshot')">
+                            <template #prepend><v-icon icon="mdi-camera-outline" size="small" /></template>
+                            <v-list-item-title>Full session (.json)</v-list-item-title>
+                            <v-list-item-subtitle>layout + mask + labels + ROIs</v-list-item-subtitle>
+                        </v-list-item>
+                        <v-list-item :disabled="!lesionTotals" @click="onExportLesionCsv">
+                            <template #prepend><v-icon icon="mdi-file-delimited-outline" size="small" /></template>
+                            <v-list-item-title>Lesions CSV</v-list-item-title>
+                        </v-list-item>
+                        <v-list-item :disabled="!store.hasPet || pdfBusy" @click="onExportPdf">
+                            <template #prepend><v-icon icon="mdi-file-pdf-box" size="small" /></template>
+                            <v-list-item-title>{{ pdfBusy ? '…' : 'PDF report' }}</v-list-item-title>
+                            <v-list-item-subtitle>Full lesion table + images</v-list-item-subtitle>
+                        </v-list-item>
+                        <v-list-item :disabled="!store.hasPet || pptBusy" @click="onExportPpt">
+                            <template #prepend><v-icon icon="mdi-file-powerpoint-box" size="small" /></template>
+                            <v-list-item-title>{{ pptBusy ? '…' : 'PowerPoint slides' }}</v-list-item-title>
+                            <v-list-item-subtitle>Images + whole-body summary only</v-list-item-subtitle>
+                        </v-list-item>
+                    </v-list>
+                </v-menu>
+            </section>
+
+            <!-- Auto-save 状態は保存系のひとまとまりとして ④ Save 直下に置く。 -->
+            <div v-if="store.lastAutoSavedAt" class="mv-autosave-line">
+                <v-icon icon="mdi-cloud-check-outline" size="x-small" class="mr-1" />
+                Auto-saved {{ autoSavedRel }}
+            </div>
             </div><!-- /mv-seg-body -->
 
-            <!-- ===== 常時表示フッター (スクロールしない): 保存など ===== -->
-            <div class="mv-seg-foot">
-                <div class="mv-btn-row">
-                    <v-btn size="small" color="primary" variant="flat" data-demo="save-nifti" @click="onSave" title="Save NIfTI mask (+ JSON sidecar)">
-                        <v-icon icon="mdi-content-save" size="small" class="mr-1" />Save NIfTI
-                    </v-btn>
-                    <v-btn size="small" variant="tonal" color="primary" :disabled="!store.finalMask || snapshotBusy" @click="onSaveSnapshot" title="Save .mvs snapshot">
-                        <v-icon icon="mdi-download" size="small" class="mr-1" />{{ snapshotBusy ? '…' : '.mvs' }}
-                    </v-btn>
-                    <v-menu location="top end">
-                        <template #activator="{ props }">
-                            <v-btn size="small" variant="text" icon v-bind="props" title="More save / load"><v-icon icon="mdi-dots-horizontal" /></v-btn>
-                        </template>
-                        <v-list density="compact">
-                            <v-list-item @click="onLoadMaskClick"><template #prepend><v-icon icon="mdi-folder-open" size="small" /></template><v-list-item-title>Load mask (NIfTI)</v-list-item-title></v-list-item>
-                            <v-list-item @click="onLoadSnapshotClick"><template #prepend><v-icon icon="mdi-upload" size="small" /></template><v-list-item-title>Load .mvs snapshot</v-list-item-title></v-list-item>
-                            <v-list-item :disabled="!store.hasPet || pdfBusy" @click="onExportPdf"><template #prepend><v-icon icon="mdi-file-pdf-box" size="small" /></template><v-list-item-title>{{ pdfBusy ? '…' : 'Export PDF report' }}</v-list-item-title></v-list-item>
-                            <v-list-item @click="onClearManual"><template #prepend><v-icon icon="mdi-eraser" size="small" /></template><v-list-item-title>Clear edits</v-list-item-title></v-list-item>
-                        </v-list>
-                    </v-menu>
-                </div>
-                <input ref="loadFileInput" type="file" accept=".nii,.nii.gz,.json,application/octet-stream,application/json" multiple style="display: none" @change="onLoadMaskFiles" />
-                <input ref="loadSnapshotInput" type="file" accept=".mvs,.zip" style="display: none" @change="onLoadSnapshotFile" />
-            </div><!-- /mv-seg-foot -->
+            <!-- Save / Load は App-bar に集約 (カメラ=Save snapshot / ハンバーガー=Save NIfTI・
+                 Load mask・Export PDF・Clear edits・Load snapshot・ROI)。ここは Load mask 用の
+                 hidden input のみ残す (ハンバーガーの Load mask → dicomViewRef.segLoadMask から発火)。 -->
+            <input ref="loadFileInput" type="file" accept=".nii,.nii.gz,.json,application/octet-stream,application/json" multiple style="display: none" @change="onLoadMaskFiles" />
         </template>
     </div>
 </template>
@@ -2311,6 +2258,95 @@ const showIslands = ref<boolean>(false);
     height: 12px;
     border-radius: 2px;
     flex-shrink: 0;
+}
+/* ④ Save 行: NIfTI mask (主) + Others メニュー (従) */
+.mv-save-row {
+    display: flex;
+    gap: 6px;
+    align-items: stretch;
+}
+.mv-save-nifti {
+    flex: 1;
+}
+.mv-save-others {
+    flex: 0 0 auto;
+}
+
+/* 統一ラベルリスト (縦 1 列、①②③ 共有)。行 = eye / swatch / name / pencil */
+.mv-label-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    margin: 2px 0 10px;
+}
+.mv-label-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 1px 4px;
+    border-left: 2px solid transparent;
+    border-radius: 4px;
+}
+.mv-label-row.is-edit {
+    background: rgba(0, 212, 170, 0.10);
+    border-left-color: var(--mv-accent, #00d4aa);
+}
+.mv-label-eye {
+    /* 表示中は強い白でハッキリ「見えている」と分かるように。 */
+    color: #ffffff;
+    opacity: 1;
+}
+.mv-label-eye.is-hidden {
+    /* 非表示中はぐっと沈める。 */
+    color: var(--mv-text-muted, #9aa4ab);
+    opacity: 0.35;
+}
+.mv-label-row-name {
+    flex: 1;
+    text-align: left;
+    background: transparent;
+    border: none;
+    color: var(--mv-text);
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding: 2px 0;
+}
+.mv-label-row-name:hover {
+    color: var(--mv-accent, #00d4aa);
+}
+.mv-label-pencil {
+    color: var(--mv-text-muted, #9aa4ab);
+}
+.mv-label-pencil.is-active {
+    color: var(--mv-accent, #00d4aa);
+}
+/* ラベルリスト下端の「+ Add label」行 */
+.mv-label-add-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 4px 0;
+}
+.mv-label-add-btn {
+    display: inline-flex;
+    align-items: center;
+    background: transparent;
+    border: 1px dashed var(--mv-border);
+    border-radius: 4px;
+    color: var(--mv-text-muted, #9aa4ab);
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+}
+.mv-label-add-btn:hover {
+    color: var(--mv-accent, #00d4aa);
+    border-color: var(--mv-accent-dim, #00d4aa);
+}
+.mv-label-add-field {
+    flex: 1;
 }
 .mv-label-name {
     flex: 1;

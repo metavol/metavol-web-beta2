@@ -134,7 +134,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let safeLen = max(len, 1u);
     let cidx = i32(lid % safeLen);
     let cc = labelClut[cidx].rgb;
-    let a = P.surf.z;
+    let a = P.surf.z * labelClut[cidx].a;  // .a = per-label visibility (0=hidden)
     rgb = rgb * (1.0 - a) + cc * a;
   }
 

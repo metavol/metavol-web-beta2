@@ -6,7 +6,7 @@
 //
 
 
-import { ref, onMounted} from 'vue';
+import { ref, computed, onMounted} from 'vue';
 import * as THREE from '@/lib/threeMath';
 import { isWebGpuAvailable } from './webgpu/gpuContext';
 import { gpuRenderMip } from './webgpu/mipPipeline';
@@ -90,6 +90,11 @@ const prop = defineProps<{
   vrDemoRunning?: boolean;
   // この Volume box は元 DICOM に戻せるか? (DICOM-origin 系列のみ true)。
   canRevertToDicom?: boolean;
+  // 縦 paging スライダ (画像右端)。親が現在位置と範囲を渡す。
+  // null/undefined なら描画しない (MIP / VR など paging の概念が無い box)。
+  // invert: スライダ上端が index の最大側かどうか (親が world 方向から決める。
+  //         これにより PET/CT でスライス順が逆でも 2 つのスライダが同じ向きに動く)。
+  paging?: { index: number; min: number; max: number; invert?: boolean } | null;
 }>();
 
 const emit = defineEmits<{
@@ -127,6 +132,8 @@ const emit = defineEmits<{
   (e: 'toggleVrDemo'): void;
   // Volume box → DICOM slice (2D) に戻す
   (e: 'backToDicom'): void;
+  // 縦 paging スライダ操作: 目的の slice index (絶対値) へ移動
+  (e: 'setPagingIndex', index: number): void;
 }>();
 
 // Fusion box の overlay clut が active か判定 (clut1 用)
@@ -244,6 +251,23 @@ const sampleTrilinear = (
 // HTML overlay の empty state を表示制御する ref。
 const isEmpty = ref(true);
 const emptyText = ref('No image');
+
+// 縦 paging スライダ。index ↔ スライダ値の対応は 2 通りあり、親が渡す invert で決まる。
+//   invert=false: 上端 = index 最小 → value = min + max - index
+//   invert=true : 上端 = index 最大 → value = index
+// (どちらの向きが「頭側が上」になるかは volume のスライス順で変わるため親が判断する)
+const pagingSliderValue = computed(() => {
+  const p = prop.paging;
+  if (!p) return 0;
+  return p.invert ? p.index : (p.min + p.max - p.index);
+});
+const onPagingInput = (e: Event) => {
+  const p = prop.paging;
+  if (!p) return;
+  const v = Number((e.target as HTMLInputElement).value);
+  if (!Number.isFinite(v)) return;
+  emit('setPagingIndex', p.invert ? v : (p.min + (p.max - v)));
+};
 
 const init = () => {
   if (cv1.value === null) {
@@ -475,10 +499,12 @@ const drawNiftiSlice = async function(pix: Float32Array | Int16Array,
               const lid = overlay.mask[overlay.ny*overlay.nx*mz + overlay.nx*my + mx];
               if (lid > 0){
                 const c = overlay.labelClut[lid % overlay.labelClut.length];
-                const a = overlay.alpha;
-                myImageData.data[ad]   = myImageData.data[ad]   * (1-a) + c[0]*a;
-                myImageData.data[ad+1] = myImageData.data[ad+1] * (1-a) + c[1]*a;
-                myImageData.data[ad+2] = myImageData.data[ad+2] * (1-a) + c[2]*a;
+                const a = overlay.alpha * (c[3] ?? 1);  // c[3]=visibility (0=hidden)
+                if (a > 0) {
+                  myImageData.data[ad]   = myImageData.data[ad]   * (1-a) + c[0]*a;
+                  myImageData.data[ad+1] = myImageData.data[ad+1] * (1-a) + c[1]*a;
+                  myImageData.data[ad+2] = myImageData.data[ad+2] * (1-a) + c[2]*a;
+                }
               }
             }
             vm.add(overlay.v10);
@@ -628,10 +654,12 @@ const drawNiftiSliceFusion = async function(pix0: Float32Array | Int16Array,
               const lid = overlay.mask[overlay.ny*overlay.nx*mz + overlay.nx*my + mx];
               if (lid > 0){
                 const c = overlay.labelClut[lid % overlay.labelClut.length];
-                const a = overlay.alpha;
-                myImageData.data[ad]   = myImageData.data[ad]   * (1-a) + c[0]*a;
-                myImageData.data[ad+1] = myImageData.data[ad+1] * (1-a) + c[1]*a;
-                myImageData.data[ad+2] = myImageData.data[ad+2] * (1-a) + c[2]*a;
+                const a = overlay.alpha * (c[3] ?? 1);  // c[3]=visibility (0=hidden)
+                if (a > 0) {
+                  myImageData.data[ad]   = myImageData.data[ad]   * (1-a) + c[0]*a;
+                  myImageData.data[ad+1] = myImageData.data[ad+1] * (1-a) + c[1]*a;
+                  myImageData.data[ad+2] = myImageData.data[ad+2] * (1-a) + c[2]*a;
+                }
               }
             }
             vm.add(overlay.v10);
@@ -832,10 +860,12 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
               const lid = mipMaskData[nx*v0.z+v0.x];
               if (lid > 0){
                 const cc = overlay.labelClut[lid % overlay.labelClut.length];
-                const a = overlay.alpha;
-                myImageData.data[ad]   = myImageData.data[ad]   * (1-a) + cc[0]*a;
-                myImageData.data[ad+1] = myImageData.data[ad+1] * (1-a) + cc[1]*a;
-                myImageData.data[ad+2] = myImageData.data[ad+2] * (1-a) + cc[2]*a;
+                const a = overlay.alpha * (cc[3] ?? 1);  // cc[3]=visibility (0=hidden)
+                if (a > 0) {
+                  myImageData.data[ad]   = myImageData.data[ad]   * (1-a) + cc[0]*a;
+                  myImageData.data[ad+1] = myImageData.data[ad+1] * (1-a) + cc[1]*a;
+                  myImageData.data[ad+2] = myImageData.data[ad+2] * (1-a) + cc[2]*a;
+                }
               }
             }
           }else{
@@ -1946,6 +1976,32 @@ defineExpose({init, show, show2, showRgb, showDirect,
                       stroke="#FFD24A" stroke-width="0.7" stroke-dasharray="6 4" opacity="0.7" />
             </svg>
 
+            <!-- 縦 paging スライダ (画像の右端)。max<=min のときは 1 枚しかないので出さない。
+                 ネイティブ input[type=range] を CSS で縦向きにしている (v-slider だと
+                 canvas 上の絶対配置で高さ計算が崩れやすいため)。
+                 値は「上が先頭スライス」になるよう反転して扱う。 -->
+            <div
+                v-if="prop.paging && prop.paging.max > prop.paging.min"
+                class="mv-paging"
+                @mousedown.stop
+                @wheel.stop
+                @dblclick.stop
+            >
+                <input
+                    class="mv-paging-slider"
+                    type="range"
+                    :min="prop.paging.min"
+                    :max="prop.paging.max"
+                    :value="pagingSliderValue"
+                    step="1"
+                    :title="`Slice ${prop.paging.index - prop.paging.min + 1} / ${prop.paging.max - prop.paging.min + 1} — drag to page through slices`"
+                    @input="onPagingInput"
+                />
+                <div class="mv-paging-readout mv-mono">
+                    {{ prop.paging.index - prop.paging.min + 1 }}/{{ prop.paging.max - prop.paging.min + 1 }}
+                </div>
+            </div>
+
             <!-- Color scale legend (Volume / Fusion / MIP のみ) -->
             <div v-if="prop.legend" class="mv-clut-legend">
                 <span class="mv-clut-min">{{ prop.legend.minLabel }}</span>
@@ -1997,6 +2053,14 @@ defineExpose({init, show, show2, showRgb, showDirect,
   align-items: center;
   height: 22px;
   padding: 0 5px;
+  /* box の intrinsic 幅を titlebar のボタン列で決めさせない。
+     grid は repeat(cols, max-content) なので、titlebar がボタン合計幅 (500px 超) を
+     主張すると box が canvas 幅を無視して広がり、タイル全体が画像エリアから溢れて
+     右サイドバーに潜り込む (PET/CT+MIP 3x2 で顕在化)。
+     width:0 + min-width:100% で「幅は親 (= canvas) から貰う」ようにする。 */
+  width: 0;
+  min-width: 100%;
+  overflow: hidden;
   background: var(--mv-surface-2, #222B36);
   border-bottom: 1px solid var(--mv-border, #2A3441);
   font-size: 10px;
@@ -2048,7 +2112,16 @@ defineExpose({init, show, show2, showRgb, showDirect,
   display: flex;
   align-items: center;
   gap: 1px;
-  flex-shrink: 0;
+  /* box が狭いときはボタン列を切り捨てず横スクロールで到達可能にする
+     (flex-shrink:0 のままだと box を押し広げてレイアウトを壊す)。 */
+  flex-shrink: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;          /* Firefox */
+}
+.mv-titlebar-actions::-webkit-scrollbar {
+  height: 0;                      /* Chrome/Edge: バー自体は隠す (22px しかないため) */
 }
 
 .mv-tb-btn {
@@ -2216,6 +2289,55 @@ defineExpose({init, show, show2, showRgb, showDirect,
 }
 
 /* Color scale legend (CLUT bar + min/max labels) */
+/* 縦 paging スライダ: 画像の右端に重ねる。legend (右下) と干渉しないよう
+   上端〜下端 44px 手前までに収め、幅は細く保つ。 */
+.mv-paging {
+  position: absolute;
+  top: 6px;
+  right: 4px;
+  bottom: 44px;
+  width: 22px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  z-index: 3;
+}
+.mv-paging-slider {
+  /* 縦向き range。writing-mode 方式は Chrome 121+ / Firefox で有効。 */
+  writing-mode: vertical-lr;
+  direction: rtl;                 /* 上端 = 先頭スライス */
+  -webkit-appearance: slider-vertical;
+  appearance: slider-vertical;
+  width: 16px;
+  flex: 1 1 auto;
+  min-height: 40px;
+  margin: 0;
+  cursor: ns-resize;
+  accent-color: var(--mv-accent, #00d4aa);
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
+}
+.mv-paging:hover .mv-paging-slider {
+  opacity: 1;
+}
+.mv-paging-readout {
+  margin-top: 2px;
+  padding: 1px 3px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 9px;
+  line-height: 1.2;
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.mv-paging:hover .mv-paging-readout {
+  opacity: 1;
+}
+
 .mv-clut-legend {
   position: absolute;
   right: 8px;

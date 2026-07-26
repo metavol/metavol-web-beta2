@@ -15,7 +15,8 @@ export const getClutBuffer = (device: any, clut: number[][]): any => {
         data[i * 4]     = (c[0] ?? 0) / 255;
         data[i * 4 + 1] = (c[1] ?? 0) / 255;
         data[i * 4 + 2] = (c[2] ?? 0) / 255;
-        data[i * 4 + 3] = 1.0;
+        // labelClut は 4番目に per-label visibility (0/1) を積む。色 CLUT は長さ3なので既定 1.0。
+        data[i * 4 + 3] = (c[3] ?? 1.0);
     }
     buf = device.createBuffer({
         size: data.byteLength,

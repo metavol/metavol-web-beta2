@@ -9,6 +9,8 @@ export interface LabelEntry {
     id: number;
     name: string;
     color: [number, number, number];
+    // overlay 表示の on/off (eye アイコン)。未定義は表示とみなす (旧 snapshot 後方互換)。
+    visible?: boolean;
 }
 
 export interface SphereROI {
@@ -86,13 +88,15 @@ const DEFAULT_LABEL_PALETTE: Array<[number, number, number]> = [
 // CLAUDE.md の UI ポリシーに従い英語表記。順序は臨床的によく使う優先度。
 // Persona 1 の運用上 Tumor の次に Physiological (生理的集積の除外) を置く。
 // color はラベルごとに明示指定 (palette index には依存しない)。Physiological は水色。
+// 既定は 3 つだけに絞る (多すぎると選択のコストが上がるため)。
+// 部位別 (Lymph / Bone / Lung / Liver …) が要るケースはラベルリスト下端の
+// 「+ Add label」から随時足せる (addLabel が palette 色を自動割り当て)。
 const DEFAULT_LABELS: Array<{ name: string; color: [number, number, number] }> = [
     { name: 'Tumor',           color: [255, 90, 90] },    // red
-    { name: 'Physiological',   color: [120, 200, 255] },  // light blue (水色)
-    { name: 'Lymph node',      color: [90, 200, 90] },    // green
-    { name: 'Bone metastasis', color: [90, 130, 255] },   // blue
-    { name: 'Inflammation',    color: [220, 90, 220] },   // magenta
-    { name: 'Other',           color: [70, 220, 220] },   // cyan
+    { name: 'Non-tumor',       color: [120, 200, 255] },  // light blue (水色)
+    // Other は cyan だと Non-tumor の水色と紛らわしかったので黄色に。
+    // 赤 (Tumor) とは色相、水色 (Non-tumor) とは色相・明度の両方で離れる。
+    { name: 'Other',           color: [255, 205, 60] },   // amber / yellow
 ];
 
 interface State {
@@ -196,15 +200,17 @@ export const useSegmentationStore = defineStore('segmentation', {
         manualEdits: null,
         finalMask: null,
 
-        threshold: 2.5,
+        threshold: 3.0,
         thresholdUnit: 'SUV',
 
         labels: DEFAULT_LABELS.map((l, i) => ({
             id: i + 1,
             name: l.name,
             color: l.color,
+            visible: true,
         })),
-        currentLabelId: 1,
+        // 初期の編集ラベルは Non-tumor (id=2)。生理的集積を先に塗り分け、腫瘍だけを Tumor に付け替える運用。
+        currentLabelId: 2,
 
         sphere: null,
         polygon: null,
@@ -217,7 +223,7 @@ export const useSegmentationStore = defineStore('segmentation', {
         editSnapT: null,
         editSnapM: null,
 
-        overlayAlpha: 0.4,
+        overlayAlpha: 0.5,
         overlayEnabled: true,
 
         panelOpen: false,
@@ -637,9 +643,22 @@ export const useSegmentationStore = defineStore('segmentation', {
                 ? 1
                 : Math.max(...this.labels.map(l => l.id)) + 1;
             const color = DEFAULT_LABEL_PALETTE[(nextId - 1) % DEFAULT_LABEL_PALETTE.length];
-            const entry: LabelEntry = { id: nextId, name, color };
+            const entry: LabelEntry = { id: nextId, name, color, visible: true };
             this.labels.push(entry);
             return entry;
+        },
+
+        // overlay 上でのラベル表示を切り替える (eye アイコン)。複数ラベルを個別に on/off 可能。
+        // 描画は labelClut の 4 番目の成分 (visibility) 経由で反映されるので、呼び出し側は
+        // この後に show() (redraw) を実行する。
+        toggleLabelVisible(id: number) {
+            const l = this.labels.find(x => x.id === id);
+            if (l) l.visible = l.visible === false ? true : false;
+        },
+
+        // overlay バー先頭の master eye 用: 全ラベルの表示を一括で on/off する。
+        setAllLabelsVisible(v: boolean) {
+            for (const l of this.labels) l.visible = v;
         },
 
         removeLabel(id: number) {
@@ -783,23 +802,34 @@ export const useSegmentationStore = defineStore('segmentation', {
         assignLabelAtVoxel(i: number, j: number, k: number, labelId: number) {
             const pet = this.petVolumeRef;
             const m = this.finalMask;
-            if (!pet || !m) return 0;
-            // クリック位置から現在の mask を 26-連結で局所 flood fill し、seed と同一ラベルの
-            // 島だけを labelId に書き換える (finalMask + manualEdits 両方)。O(領域サイズ)。
-            this.beginMaskEdit();
-            const n = floodFillAssignLabel(m, this.manualEdits, { i, j, k }, pet.nx, pet.ny, pet.nz, labelId);
-            // ラベル値を書き換えただけで非ゼロ集合 (= 連結成分の構造) は不変なので
-            // componentMap は依然有効。maskVersion だけ bump して overlay を再描画させる。
-            if (n > 0) {
-                this.maskVersion++;
+            const t = this.thresholdMask;
+            const me = this.manualEdits;
+            if (!pet || !m || !t || !me) return 0;
+            // クリック位置から 26-連結で局所 flood fill し、seed と同一ラベルの島だけを labelId に
+            // 書き換える (finalMask + manualEdits)。O(領域サイズ)。
+            // flood fill が変更点 (changedIdx / manualBefore) を返すので、そこから **直接**
+            // sparse diff を作って履歴に push する。beginMaskEdit の全配列 clone (~100MB) と
+            // commitMaskEdit の O(n) 走査を回避 → WB PET でも assign が即時反映される。
+            const { count, changedIdx, manualBefore } = floodFillAssignLabel(m, me, { i, j, k }, pet.nx, pet.ny, pet.nz, labelId);
+            if (count > 0) {
+                const cnt = changedIdx.length;
+                const tBefore = new Uint16Array(cnt), tAfter = new Uint16Array(cnt);
+                const mAfter = new Uint16Array(cnt);
+                for (let e = 0; e < cnt; e++) {
+                    const idx = changedIdx[e];
+                    tBefore[e] = t[idx]; tAfter[e] = t[idx];   // threshold は不変
+                    mAfter[e] = labelId;
+                }
                 const lname = this.labelById(labelId)?.name ?? `#${labelId}`;
-                this.commitMaskEdit(`Assign region → ${lname}`);
-            } else {
-                // 変更なし: snapshot を破棄
-                this.editSnapT = null;
-                this.editSnapM = null;
+                // 非ゼロ集合 (連結成分の構造) は不変なので componentMap は有効なまま。
+                this.pushHistory({
+                    label: `Assign region → ${lname}`,
+                    ts: Date.now(),
+                    op: { kind: 'mask', diff: { idx: changedIdx, tBefore, tAfter, mBefore: manualBefore, mAfter } },
+                });
+                this.maskVersion++;
             }
-            return n;
+            return count;
         },
 
         // ===== Tracer preset =====

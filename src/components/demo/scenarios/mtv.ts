@@ -42,9 +42,9 @@ export const createMtvScenario = (api: DemoApi): DemoScenario => ({
         },
         {
             id: 'apply-physio',
-            caption: 'First we threshold the PET at SUV 2.5 and Apply as Physiological — this paints EVERY high-uptake region (brain, kidneys, bladder, tumour…) in one colour.',
+            caption: 'First we threshold the PET at SUV 3.0 and Apply as Non-tumor — this paints EVERY high-uptake region (brain, kidneys, bladder, tumour…) in one colour.',
             target: sel('apply-threshold'),
-            action: () => api.applyPhysiologicalThreshold(2.5),
+            action: () => api.applyPhysiologicalThreshold(3.0),
             settle: 'idle',
         },
         {

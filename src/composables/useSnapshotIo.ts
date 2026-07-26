@@ -4,8 +4,11 @@ import { type SerializedViewState, type SerializedBoxState } from '../components
 import { useSegmentationStore, type RectROI } from '../stores/segmentation';
 
 // DicomView の「View state URL / Snapshot file (session save/load)」機能を切り出した composable。
-// 挙動は元コードと完全に同一 (純粋なコード移動)。voxel データは含めず、view 状態と
-// (有効なら) PET segmentation 状態・矩形 ROI を 1 ファイルにまとめる。
+// これがアプリ唯一の「フルセッション保存」(App-bar のカメラアイコン)。1 つの .json に、
+// view 状態 (layout / window / CLUT / plane / MIP) と、(有効なら) PET segmentation 状態
+// (labels / threshold / sphere + **mask voxel を base64 で同梱**: finalMask/thresholdMask/
+// manualEdits) と、矩形 ROI をまとめる。復元は applySnapshotJson が view + mask + ROI を戻す。
+// (旧 .mvs zip は不完全 (boxState 空) だったため廃止し、これに一本化した。)
 // rectRoiToJson / importRectRoisFromJson は rect ROI export とも共有されるため DicomView に残し、
 // ここには getter/関数として渡される。
 
@@ -168,9 +171,9 @@ export function useSnapshotIo(ctx: SnapshotIoCtx) {
     if (!view || !Array.isArray(view.bs)) {
       return { ok: false, reason: 'Snapshot has no view state.' };
     }
-    // 注意: voxel data は含まれていないので、対応する image が seriesList に
-    // 既にロードされている前提。currentSeriesNumber が範囲外のときは applyViewState
-    // 内で defensive にスキップされる (info.currentSeriesNumber を直接代入するだけ)。
+    // 注意: 元画像 (PET/CT voxel) は含まれないので、対応する image が seriesList に
+    // 既にロードされている前提 (mask voxel は下の segmentation で復元する)。
+    // currentSeriesNumber が範囲外のときは applyViewState 内で defensive にスキップされる。
     applyViewState(view);
 
     let segMsg = '';

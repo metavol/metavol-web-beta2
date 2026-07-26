@@ -17,6 +17,7 @@
     "jspdf": "^4.2.1",
     "nifti-reader-js": "^0.6.8",
     "pinia": "^3.0.4",
+    "pptxgenjs": "^4.0.1",
     "roboto-fontface": "*",
     "three": "^0.164.1",
     "vue": "^3.4.21",

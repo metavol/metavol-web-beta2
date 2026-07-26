@@ -400,22 +400,36 @@ export const summarizeLesions = (
 // - seed のラベルが既に labelId でも塗り直す (manualEdits へ確定させる意味がある)。
 // - manualEdits が渡された場合は同じ voxel を labelId に書き込み、recomputeFinalMask で
 //   ラベルが元に戻らないようにする。
+export interface AssignFloodResult {
+    count: number;
+    /** 書き換えた voxel の flat index (undo 用 sparse diff の材料)。 */
+    changedIdx: Uint32Array;
+    /** 各 changedIdx における manualEdits の before 値 (undo 用)。 */
+    manualBefore: Uint16Array;
+}
+
 export const floodFillAssignLabel = (
     mask: Uint16Array,
     manualEdits: Uint16Array | null,
     seed: { i: number; j: number; k: number },
     nx: number, ny: number, nz: number,
     labelId: number,
-): number => {
+): AssignFloodResult => {
+    const empty: AssignFloodResult = { count: 0, changedIdx: new Uint32Array(0), manualBefore: new Uint16Array(0) };
     const seedIdx = seed.k * nx * ny + seed.j * nx + seed.i;
     const seedLabel = mask[seedIdx];
-    if (seedLabel === 0) return 0;   // クリック位置がマスク外なら何もしない
+    if (seedLabel === 0) return empty;   // クリック位置がマスク外なら何もしない
 
     const visited = new Set<number>();
     const stack: number[] = [seedIdx];
     visited.add(seedIdx);
     const nxny = nx * ny;
     let count = 0;
+    // 変更点を記録して呼び出し側で O(領域) の sparse diff を作れるようにする
+    // (履歴のために全 mask を clone/走査すると WB PET で ~100MB コピー + O(n) 走査になり
+    //  クリックのたびに一瞬固まる。それを避ける)。
+    const changed: number[] = [];
+    const mBefore: number[] = [];
 
     while (stack.length > 0) {
         const cur = stack.pop()!;
@@ -424,6 +438,8 @@ export const floodFillAssignLabel = (
         const j = (rem / nx) | 0;
         const i = rem - j * nx;
 
+        changed.push(cur);
+        mBefore.push(manualEdits ? manualEdits[cur] : 0);
         mask[cur] = labelId;
         if (manualEdits) manualEdits[cur] = labelId;
         count++;
@@ -444,7 +460,7 @@ export const floodFillAssignLabel = (
             }
         }
     }
-    return count;
+    return { count, changedIdx: Uint32Array.from(changed), manualBefore: Uint16Array.from(mBefore) };
 };
 
 // seed voxel が属する 26-連結成分 (非ゼロ = summarizeLesions の binary と同定義) の

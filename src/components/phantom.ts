@@ -454,6 +454,9 @@ export const generatePhantomWholeBodyPetCt = (): PetCtPhantom => {
     metadata: {
       modality: 'CT',
       seriesDescription: 'Whole-body CT (synthetic phantom)',
+      // 合成データにも安定した seriesUID を付与 (snapshot の segmentation 保存は
+      // seriesUID をキーにするため。無いと serializeForPersistence が null を返す)。
+      seriesUID: '1.2.826.0.1.3680043.metavol.phantom.wbpetct.ct',
     },
   };
 
@@ -467,6 +470,7 @@ export const generatePhantomWholeBodyPetCt = (): PetCtPhantom => {
     metadata: {
       modality: 'PT',
       seriesDescription: 'Whole-body PET (synthetic phantom)',
+      seriesUID: '1.2.826.0.1.3680043.metavol.phantom.wbpetct.pt',
       suvOk: true,
       suvFactor: 1,
       suvSource: 'units_already_SUV',

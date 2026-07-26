@@ -85,22 +85,22 @@ const resetRules = () => {
   priorityRules.value = [...DEFAULT_RULES];
 };
 
-// CT 用 (HU window)
+// CT 用 (HU window)。hint は hover tooltip 用 (実際の WC/WW は DicomView の presetSelected と一致させること)
 const wPresets = [
-  { id: 'Lung',  label: 'Lung'  },
-  { id: 'Med',   label: 'Med'   },
-  { id: 'Abd',   label: 'Abd'   },
-  { id: 'Bone',  label: 'Bone'  },
-  { id: 'Brain', label: 'Brain' },
-  { id: 'Fat',   label: 'Fat'   },
+  { id: 'Lung',  label: 'Lung',  hint: 'Lung window — WC -700 / WW 1800' },
+  { id: 'Med',   label: 'Med',   hint: 'Mediastinum window — WC 0 / WW 320' },
+  { id: 'Abd',   label: 'Abd',   hint: 'Abdomen window — WC 30 / WW 200' },
+  { id: 'Bone',  label: 'Bone',  hint: 'Bone window — WC 200 / WW 2000' },
+  { id: 'Brain', label: 'Brain', hint: 'Brain window — WC 30 / WW 80' },
+  { id: 'Fat',   label: 'Fat',   hint: 'Fat window — WC 10 / WW 275' },
 ];
 
 // PET 用 (SUV window) -- WC = (lo+hi)/2, WW = hi-lo として DicomView 側で展開
 const wPresetsPet = [
-  { id: 'SUV-0-3',  label: '0-3'  },
-  { id: 'SUV-0-6',  label: '0-6'  },
-  { id: 'SUV-0-10', label: '0-10' },
-  { id: 'SUV-0-15', label: '0-15' },
+  { id: 'SUV-0-3',  label: '0-3',  hint: 'Display range SUV 0–3 (low uptake, high contrast)' },
+  { id: 'SUV-0-6',  label: '0-6',  hint: 'Display range SUV 0–6 (typical whole-body FDG)' },
+  { id: 'SUV-0-10', label: '0-10', hint: 'Display range SUV 0–10' },
+  { id: 'SUV-0-15', label: '0-15', hint: 'Display range SUV 0–15 (high uptake)' },
 ];
 
 // 高レンジ preset (Bq/ml 表示や非 SUV 系で使用)。Other メニューに格納。
@@ -156,15 +156,19 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
       <div class="mv-btn-row">
         <v-btn size="x-small" variant="tonal" @click="changeSlice(-100000)">
           <v-icon icon="mdi-arrow-collapse-left" size="small" />
+          <v-tooltip activator="parent" location="bottom">Jump to the first slice</v-tooltip>
         </v-btn>
         <v-btn size="x-small" variant="tonal" @click="changeSlice(-1)">
           <v-icon icon="mdi-arrow-left" size="small" />
+          <v-tooltip activator="parent" location="bottom">Previous slice (or scroll the mouse wheel on an image)</v-tooltip>
         </v-btn>
         <v-btn size="x-small" variant="tonal" @click="changeSlice(1)">
           <v-icon icon="mdi-arrow-right" size="small" />
+          <v-tooltip activator="parent" location="bottom">Next slice (or scroll the mouse wheel on an image)</v-tooltip>
         </v-btn>
         <v-btn size="x-small" variant="tonal" @click="changeSlice(100000)">
           <v-icon icon="mdi-arrow-collapse-right" size="small" />
+          <v-tooltip activator="parent" location="bottom">Jump to the last slice</v-tooltip>
         </v-btn>
       </div>
     </section>
@@ -188,7 +192,10 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
           :key="p.id"
           :value="p.id"
           size="x-small"
-        >{{ p.label }}</v-btn>
+        >
+          {{ p.label }}
+          <v-tooltip activator="parent" location="bottom">{{ p.hint }}</v-tooltip>
+        </v-btn>
       </v-btn-toggle>
 
       <div class="mv-section-title mt-3 mv-pt-header">
@@ -203,8 +210,19 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
           mandatory
           class="mv-unit-toggle"
         >
-          <v-btn value="SUV" size="x-small" :disabled="isNacPt" :title="isNacPt ? 'SUV not available for non attenuation-corrected PT' : ''">SUV</v-btn>
-          <v-btn value="BqMl" size="x-small">Bq/ml</v-btn>
+          <!-- disabled な v-btn では v-tooltip が発火しないため、ここは native title を使う -->
+          <v-btn
+            value="SUV"
+            size="x-small"
+            :disabled="isNacPt"
+            :title="isNacPt
+              ? 'SUV not available for non attenuation-corrected PT'
+              : 'Show PT values as SUVbw (body-weight normalised)'"
+          >SUV</v-btn>
+          <v-btn value="BqMl" size="x-small">
+            Bq/ml
+            <v-tooltip activator="parent" location="bottom">Show PT values as raw activity concentration (Bq/ml) instead of SUV</v-tooltip>
+          </v-btn>
         </v-btn-toggle>
       </div>
       <v-btn-toggle
@@ -220,12 +238,16 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
           :key="p.id"
           :value="p.id"
           size="x-small"
-        >{{ p.label }}</v-btn>
+        >
+          {{ p.label }}
+          <v-tooltip activator="parent" location="bottom">{{ p.hint }}</v-tooltip>
+        </v-btn>
         <v-menu location="bottom">
           <template v-slot:activator="{ props: act }">
             <v-btn v-bind="act" size="x-small" :active="!!wPresetsPetOther.find(p => p.id === activePreset)">
               Other
               <v-icon icon="mdi-chevron-down" size="x-small" />
+              <v-tooltip activator="parent" location="bottom">High-range display windows (0–100 … 0–10000), e.g. for Bq/ml</v-tooltip>
             </v-btn>
           </template>
           <v-list density="compact">
@@ -244,6 +266,7 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
       <div class="mv-btn-row mt-2">
         <v-btn size="x-small" variant="text" @click="presetClicked('Reset')">
           <v-icon icon="mdi-restart" size="x-small" class="mr-1" />Reset to DICOM tag
+          <v-tooltip activator="parent" location="bottom">Restore the window centre / width stored in the DICOM header</v-tooltip>
         </v-btn>
       </div>
     </section>
@@ -258,6 +281,9 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
           @click="showAdvanced = !showAdvanced"
         >
           Advanced
+          <v-tooltip activator="parent" location="bottom">
+            {{ showAdvanced ? 'Hide advanced tools (demo phantoms, experiments, series priority)' : 'Show advanced tools (demo phantoms, experiments, series priority)' }}
+          </v-tooltip>
         </v-btn>
       </div>
 
@@ -266,12 +292,21 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
         <div class="mv-btn-row">
           <v-btn size="x-small" variant="tonal" @click="emit('phantomNema')">
             NEMA IEC
+            <v-tooltip activator="parent" location="bottom" max-width="260">
+              Generate a NEMA IEC body phantom (6 spheres) for QC — no patient data needed
+            </v-tooltip>
           </v-btn>
           <v-btn size="x-small" variant="tonal" @click="emit('phantomWholeBody')">
             Whole-body PET
+            <v-tooltip activator="parent" location="bottom" max-width="260">
+              Generate a synthetic whole-body FDG PET (brain / heart / liver / kidneys / bladder + 8 lesions)
+            </v-tooltip>
           </v-btn>
           <v-btn size="x-small" variant="tonal" @click="emit('phantomWholeBodyPetCt')">
             Whole-body PET/CT
+            <v-tooltip activator="parent" location="bottom" max-width="260">
+              Generate a matched synthetic CT + PET pair (same world space, so Fusion lines up)
+            </v-tooltip>
           </v-btn>
         </div>
         <div class="text-caption text-disabled mt-1">
@@ -285,9 +320,15 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
         <div class="mv-btn-row">
           <v-btn size="x-small" variant="tonal" @click="emit('scrambleSlices')">
             Scramble Z
+            <v-tooltip activator="parent" location="bottom" max-width="260">
+              Research tool: randomly shuffle the selected volume's z-slices (select the target box first)
+            </v-tooltip>
           </v-btn>
           <v-btn size="x-small" variant="tonal" @click="emit('recoverSlices')">
             Recover Z
+            <v-tooltip activator="parent" location="bottom" max-width="260">
+              Research tool: rebuild the slice order from slice-to-slice similarity alone, then report accuracy
+            </v-tooltip>
           </v-btn>
         </div>
         <div class="text-caption text-disabled mt-1">
@@ -331,8 +372,14 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
           </div>
         </div>
         <div class="mv-btn-row mt-1">
-          <v-btn size="x-small" variant="tonal" @click="addRule">+ Add</v-btn>
-          <v-btn size="x-small" variant="text" @click="resetRules">Reset to defaults</v-btn>
+          <v-btn size="x-small" variant="tonal" @click="addRule">
+            + Add
+            <v-tooltip activator="parent" location="bottom">Add a series-priority rule (pattern + modality + weight)</v-tooltip>
+          </v-btn>
+          <v-btn size="x-small" variant="text" @click="resetRules">
+            Reset to defaults
+            <v-tooltip activator="parent" location="bottom">Discard your rules and restore the built-in series-priority defaults</v-tooltip>
+          </v-btn>
         </div>
       </div>
     </section>
