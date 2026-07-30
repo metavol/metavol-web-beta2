@@ -82,13 +82,58 @@ const devSampleDataPlugin = (): Plugin => ({
         if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
           res.statusCode = 404; res.end('not found'); return;
         }
-        res.setHeader('Content-Type', 'application/octet-stream');
-        fs.createReadStream(filePath).pipe(res);
+        // **stream + pipe をやめて readFile にする。**
+        // 2000 ファイル超の症例を並列 fetch すると、createReadStream が fd 枯渇等で
+        // エラー終了し、**200 のまま空ボディ**を返すことがあった (実測: 大量の
+        // 「otherfile: 0 bytes」でシリーズが 16→6 に欠落)。読み切ってから送り、
+        // 失敗は 500 で明示してクライアントにリトライさせる。
+        fs.readFile(filePath, (err, data) => {
+          if (err) { res.statusCode = 500; res.end(String(err)); return; }
+          res.setHeader('Content-Type', 'application/octet-stream');
+          res.setHeader('Content-Length', String(data.length));
+          res.end(data);
+        });
       } catch (err) {
         res.statusCode = 500;
         res.end(String(err));
         next();
       }
+    });
+  },
+});
+
+// 開発専用: canvas を PNG/JPEG で受け取り .screenshots/ に保存する。
+//   POST /api/screenshot?name=foo   body = data URL 文字列
+//
+// **なぜ必要か**: Browser ペインが非表示のとき webview は hidden 扱いになり、
+// requestAnimationFrame が 1 度も発火しない (実測: hidden 状態で 1.5 秒間 0 回)。
+// 合成フレームが生成されないため、通常のスクリーンショット API は新フレームを待って
+// タイムアウトする。canvas.toDataURL() は合成に依存しないので、ここへ POST すれば
+// ペインの表示状態に関係なく描画結果を画像として確認できる。
+// dev middleware なので本番ビルドには含まれない。
+const devScreenshotPlugin = (): Plugin => ({
+  name: 'metavol-dev-screenshot',
+  configureServer(server) {
+    const outDir = path.resolve(__dirname, '.screenshots');
+    server.middlewares.use('/api/screenshot', (req, res) => {
+      if (req.method !== 'POST') { res.statusCode = 405; res.end('POST only'); return; }
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        try {
+          const name = (new URL(req.url ?? '', 'http://x').searchParams.get('name') || 'shot')
+            .replace(/[^a-zA-Z0-9_-]/g, '_');
+          const m = body.match(/^data:image\/(png|jpeg);base64,(.*)$/s);
+          if (!m) { res.statusCode = 400; res.end('expected data URL'); return; }
+          fs.mkdirSync(outDir, { recursive: true });
+          const file = path.join(outDir, `${name}.${m[1] === 'jpeg' ? 'jpg' : 'png'}`);
+          fs.writeFileSync(file, Buffer.from(m[2], 'base64'));
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ ok: true, file }));
+        } catch (err) {
+          res.statusCode = 500; res.end(String(err));
+        }
+      });
     });
   },
 });
@@ -113,6 +158,7 @@ export default defineConfig({
       },
     }),
     devSampleDataPlugin(),
+    devScreenshotPlugin(),
   ],
   define: { 'process.env': {} },
   resolve: {

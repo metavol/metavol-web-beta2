@@ -56,24 +56,26 @@ export const writeNiftiFloat32 = (vol: Volume, intentName: string = 'image'): Bl
     // qform=0, sform=1 (scanner anatomical, srow ベースの affine 採用)
     dv.setInt16(252, 0, true);
     dv.setInt16(254, 1, true);
-    // qoffset = imagePosition
-    dv.setFloat32(268, vol.imagePosition.x, true);
-    dv.setFloat32(272, vol.imagePosition.y, true);
-    dv.setFloat32(276, vol.imagePosition.z, true);
-    // srow_x / srow_y / srow_z
+    // 本アプリの world は DICOM LPS、NIfTI は RAS+。書き出し時は x,y 成分を反転して
+    // RAS に戻す (reader 側の逆変換と対。これを省くと save→load で x,y が反転する)。
     const vx = vol.vectorX, vy = vol.vectorY, vz = vol.vectorZ, p0 = vol.imagePosition;
-    dv.setFloat32(280, vx.x, true);
-    dv.setFloat32(284, vy.x, true);
-    dv.setFloat32(288, vz.x, true);
-    dv.setFloat32(292, p0.x, true);
-    dv.setFloat32(296, vx.y, true);
-    dv.setFloat32(300, vy.y, true);
-    dv.setFloat32(304, vz.y, true);
-    dv.setFloat32(308, p0.y, true);
-    dv.setFloat32(312, vx.z, true);
-    dv.setFloat32(316, vy.z, true);
-    dv.setFloat32(320, vz.z, true);
-    dv.setFloat32(324, p0.z, true);
+    // qoffset = imagePosition (RAS)
+    dv.setFloat32(268, -p0.x, true);
+    dv.setFloat32(272, -p0.y, true);
+    dv.setFloat32(276,  p0.z, true);
+    // srow_x / srow_y / srow_z (row-major, 各列が voxel 軸の world 変位)
+    dv.setFloat32(280, -vx.x, true);
+    dv.setFloat32(284, -vy.x, true);
+    dv.setFloat32(288, -vz.x, true);
+    dv.setFloat32(292, -p0.x, true);
+    dv.setFloat32(296, -vx.y, true);
+    dv.setFloat32(300, -vy.y, true);
+    dv.setFloat32(304, -vz.y, true);
+    dv.setFloat32(308, -p0.y, true);
+    dv.setFloat32(312,  vx.z, true);
+    dv.setFloat32(316,  vy.z, true);
+    dv.setFloat32(320,  vz.z, true);
+    dv.setFloat32(324,  p0.z, true);
     // intent_name
     writeAscii(u8, 328, intentName, 16);
     // magic "n+1\0"

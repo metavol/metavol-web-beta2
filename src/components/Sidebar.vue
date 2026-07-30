@@ -95,6 +95,14 @@ const wPresets = [
   { id: 'Fat',   label: 'Fat',   hint: 'Fat window — WC 10 / WW 275' },
 ];
 
+// MR 用。MR は信号強度が任意単位なので固定 window を作れない。
+// DicomView 側で volume の分位点 (下記 % 点〜その反対側) から wc/ww を算出する。
+const wPresetsMr = [
+  { id: 'MR-AUTO',       label: 'Auto',   hint: 'Window from the 1–99 percentile of this MR volume' },
+  { id: 'MR-AUTO-TIGHT', label: 'Tight',  hint: 'Window from the 5–95 percentile — higher contrast, clips more' },
+  { id: 'MR-AUTO-WIDE',  label: 'Wide',   hint: 'Window from the 0.1–99.9 percentile — keeps extremes visible' },
+];
+
 // PET 用 (SUV window) -- WC = (lo+hi)/2, WW = hi-lo として DicomView 側で展開
 const wPresetsPet = [
   { id: 'SUV-0-3',  label: '0-3',  hint: 'Display range SUV 0–3 (low uptake, high contrast)' },
@@ -195,6 +203,31 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
         >
           {{ p.label }}
           <v-tooltip activator="parent" location="bottom">{{ p.hint }}</v-tooltip>
+        </v-btn>
+      </v-btn-toggle>
+
+      <!-- MR は HU のような絶対値スケールが無いので固定プリセットが作れない。
+           volume の分位点から自動で window を決める方式にする。 -->
+      <div class="mv-section-title mt-3">
+        <v-icon icon="mdi-head-outline" size="x-small" />
+        MR window (auto)
+      </div>
+      <v-btn-toggle
+        :model-value="activePreset"
+        @update:model-value="onPresetToggle"
+        density="compact"
+        variant="outlined"
+        divided
+        class="mv-preset-toggle"
+      >
+        <v-btn
+          v-for="p in wPresetsMr"
+          :key="p.id"
+          :value="p.id"
+          size="x-small"
+        >
+          {{ p.label }}
+          <v-tooltip activator="parent" location="bottom" max-width="260">{{ p.hint }}</v-tooltip>
         </v-btn>
       </v-btn-toggle>
 

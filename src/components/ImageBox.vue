@@ -95,6 +95,8 @@ const prop = defineProps<{
   // invert: スライダ上端が index の最大側かどうか (親が world 方向から決める。
   //         これにより PET/CT でスライス順が逆でも 2 つのスライダが同じ向きに動く)。
   paging?: { index: number; min: number; max: number; invert?: boolean } | null;
+  // Fusion box の auto-register 実行中か (メニュー項目の無効化 + スピナー)
+  registerBusy?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -134,6 +136,11 @@ const emit = defineEmits<{
   (e: 'backToDicom'): void;
   // 縦 paging スライダ操作: 目的の slice index (絶対値) へ移動
   (e: 'setPagingIndex', index: number): void;
+  // Fusion box: overlay を base へ自動位置合わせ / 解除
+  (e: 'autoRegister'): void;
+  (e: 'resetRegister'): void;
+  // 「Fuse with…」: 重ねる相手を選ぶダイアログを開く
+  (e: 'pickFusion'): void;
 }>();
 
 // Fusion box の overlay clut が active か判定 (clut1 用)
@@ -1927,6 +1934,32 @@ defineExpose({init, show, show2, showRgb, showDirect,
                         <v-list-item @click="emit('toggleOverlay')">
                             <v-list-item-title>Toggle mask overlay</v-list-item-title>
                         </v-list-item>
+                        <v-divider />
+                        <v-list-item @click="emit('pickFusion')">
+                            <template #prepend><v-icon icon="mdi-layers-plus" size="small" /></template>
+                            <v-list-item-title>Fuse with…</v-list-item-title>
+                            <v-list-item-subtitle>Pick a series to overlay on this box</v-list-item-subtitle>
+                        </v-list-item>
+                        <!-- Fusion box のみ: overlay を base に自動位置合わせ。
+                             別 study (異なる FrameOfReference) 同士を d&d で重ねたときは
+                             まずズレているので、ここから直せるようにする。 -->
+                        <template v-if="prop.boxKind === 'fusion'">
+                            <v-divider />
+                            <v-list-item :disabled="prop.registerBusy" @click="emit('autoRegister')">
+                                <template #prepend>
+                                    <v-icon :icon="prop.registerBusy ? 'mdi-cog-sync' : 'mdi-vector-link'"
+                                            size="small" :class="{ 'mv-spin': prop.registerBusy }" />
+                                </template>
+                                <v-list-item-title>
+                                    {{ prop.registerBusy ? 'Registering…' : 'Auto-register overlay → base' }}
+                                </v-list-item-title>
+                                <v-list-item-subtitle>Align the overlaid series to this box's base (rigid, MI)</v-list-item-subtitle>
+                            </v-list-item>
+                            <v-list-item :disabled="prop.registerBusy" @click="emit('resetRegister')">
+                                <template #prepend><v-icon icon="mdi-restore" size="small" /></template>
+                                <v-list-item-title>Reset registration</v-list-item-title>
+                            </v-list-item>
+                        </template>
                     </v-list>
                 </v-menu>
 

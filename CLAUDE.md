@@ -102,6 +102,12 @@ src/
 - 物理座標（mm）の原点 = `imagePosition` (DICOM ImagePositionPatient)。
 - `vectorX/Y/Z` は **「voxel index 1 進むと world で何 mm 進むか」** の3Dベクトル。
   したがって `vectorX.length()` などで voxel pitch (mm) が直接得られる。
+- **すなわち vectorX/Y/Z は affine の「列」**。`world = imagePosition + i·vectorX + j·vectorY + k·vectorZ`。
+  **転置 (行として扱う) と混同しないこと** — 対角 affine (軸平行) では行と列が一致するため、
+  取り違えても軸平行データでは一切症状が出ず、回転を含むデータで初めて破綻する。
+  2026-07 に `voxelToWorld` / `inverseAffineOf` (Volume.ts) が行として計算していた誤りを修正した
+  (症状: 脳 MR/PET の NIfTI qform で world→voxel が全く別の場所を指し、registration の
+  MI が常に 0 → 最適化が空回り)。新しく affine を触るコードを書くときは必ず列で組むこと。
 - 表示時は `centerInWorld + vecx*(x-W/2) + vecy*(y-H/2)` で screen → world、
   `worldToVoxel` で world → voxel に逆変換して画素サンプリング。
 
@@ -303,6 +309,12 @@ DicomView.vue は god component（6,000 行超）。**挙動を変えずに**行
 - **`rowSpan` は `VolumeImageBoxInfo` の任意フィールド (default 1)**。`DicomImageBoxInfo.ts` に定義。
   描画側は `boxRenderHeight(i)` / `boxCellStyle(i)` (DicomView.vue) が `rowSpan` を見て canvas 高さと
   CSS grid の `grid-row: span N` を決める。**新レイアウトで背高 box を作るときはこの2関数を通すこと。**
+- **screen↔world 変換の高さは必ず `boxRenderHeight(i)` を使う (2026-07 修正)**。`imageBoxH` は
+  「1 行ぶんの高さ」なので、rowSpan=2 の box でこれを使うと中心が半行ずれる (MIP が上寄りになる不具合)。
+  修正済みの箇所: `screenToWorld` / `worldToScreen` / 球輪郭の 2 箇所 / brush・polygon の「canvas 中心画素」。
+  DICOM slice box は rowSpan を持たないので従来どおり `imageBoxH` で良い。
+  検証は canvas の実ピクセルを走査して「明るい行の中点 ≒ canvas 中心」を確認するのが確実
+  (CPU mode と GPU mode の両方で見ること。片方だけ直っている状態を見逃さないため)。
 
 ## デジタルファントム（`phantom.ts`）
 
@@ -405,10 +417,78 @@ Sidebar の Advanced → Phantom セクションのボタンから生成。`Side
 `BOX_BORDER_PX = 1` も追加 (noGapMode では SAFETY_PX=0 になるため border 分で数 px 溢れていた)。
 検証は実データで `scrollWidth - clientWidth === 0` と「box 右端 < drawer 左端」を確認する。
 
+### 2.8. box 判定関数が throw して **render が丸ごと停止**する (解決済み 2026-07)
+
+**症状**: レイアウトを変えても画面が変わらない。`imageBoxInfos` は新しいのに DOM と
+ImageBox の props は古いまま。`boxStateVersion++` も `show()` も効かない。
+**DicomView のテンプレート内にある右ドロワーも描画されなくなる**ので
+「right side bar が出ない」という別症状に化ける (実際にそう報告された)。
+
+**真因**: `isDicomSliceImageBoxInfo` / `isVolumeImageBoxInfo` / `isFusedImageBoxInfo` は
+`"clut" in imageBoxInfos.value[i]` の形で、**info が undefined だと TypeError**。
+これが `crossRefLinesFor` 経由で template から呼ばれるため、render 関数が毎回失敗し、
+Vue が `Unhandled error during execution of render function` を warn するだけで
+以後 DOM が一切更新されない。console を error だけで見ていると warn なので見落とす。
+
+**穴の発生源**: box を作る経路で `imageBoxInfos.value.push(newInfo)` を使っていた。
+push は **配列末尾**に入るので、`newBoxId > length` のときは間の index が undefined のまま
+`tileN` だけ伸びる。→ 事前に `defaultInfo` で埋めてから index 指定で代入する。
+
+**対策 (両方入れてある)**:
+1. 3 つの判定関数を null 安全に (`boxInfoAt(i)` 経由)。**render は絶対に throw させない**。
+2. box 追加時に穴を作らない。
+
+**デバッグ手順**: `app.config.errorHandler` を実行時に差し込んでから再描画を促すと実体が取れる。
+```js
+app.config.errorHandler = (e,i,info) => console.log(info, e.message, e.stack);
+dvSetupState.boxStateVersion++;
+```
+
+### 2.9. `?dev=<case>` が大量ファイルで取りこぼす (解決済み 2026-07)
+
+2375 ファイルの症例で **16 シリーズが 6 に欠落**した。dev middleware が
+`fs.createReadStream(...).pipe(res)` で fd 枯渇等に失敗すると **200 のまま空ボディ**を返し、
+クライアントは 0 バイトの File を作ってしまう (console に「otherfile: 0 bytes」が大量に出る)。
+→ サーバは `fs.readFile` + 失敗は 500、クライアントは **0 バイトもリトライ対象**にした。
+欠落は「PT が見つからない」等の別問題に見えるので、まずシリーズ数を数えること。
+
 ### 3. `setPetVolume(v)` が呼ばれるたびに mask が破棄される
 - `setPetVolume` は `thresholdMask`/`manualEdits`/`finalMask`/`undoStack`/`sphere`/`polygon` を全 null 化する。
 - `refreshSegStoreVolumeRefs()` は `===` で違いを検出し volume が「変わった」と判定すると毎回呼ぶ → **MPR を再度押すたびにマスクが消える**。
 - 緩和策: `setPetVolume` で「同じ seriesUID なら state を保持」する。あるいは `refreshSegStoreVolumeRefs()` 側で seriesUID 比較する。
+
+### 3.5. NIfTI の affine 解釈 (2026-07 修正) — brain MR/PET で発覚
+
+`sample-data/brain_mri_pet` (MR00.nii / PT00.nii) は **qform のみ** (qform_code=1, sform_code=0,
+srow は全ゼロ) で、かつ回転を含む。ここで 3 つの不具合が重なっていた:
+
+1. **方向ベクトルを affine の行から取っていた** → 正しくは列。回転があると軸が混ざる。
+2. **NIfTI は RAS+ / 本アプリ world は LPS** なのに、方向ベクトルだけ符号反転して
+   **原点 (imagePosition) を変換していなかった** → NIfTI 同士 / NIfTI と DICOM が x,y でずれる。
+   MR と PET で原点が違うため、相対位置が数百 mm 狂っていた。
+3. `Volume.voxelToWorld` / `inverseAffineOf` 自体が転置だった (上記「Volume の幾何」参照)。
+
+修正後の実測: voxel pitch がヘッダ値と一致 (MR 0.9766/0.9766/1.0、PT 0.5346/0.5346/3.0488)、
+registration の MI が 0 → 有効値になり最適化が機能。`niftiVolumeWriter` も LPS→RAS の逆変換を
+入れて save→load の往復を保った。**既存 DICOM は off-diagonal が厳密に 0 なので影響なし** (検証済み)。
+
+### 3.6. MR↔PET registration の初期化 (2026-07)
+
+MI + Nelder-Mead は **局所探索**なので初期値が全て。`onRegisterMrPt` は
+`estimateInitialParams` = **重心合わせ → 粗探索** を経てから最適化に入る。
+
+- **重心合わせだけでは足りない**: 重心は「撮影範囲に何が入っているか」に依存する。
+  brain MR/PET 実データでは MR が頸部を含み明るい脂肪に引かれて重心が FOV 中心より 44.7mm 下、
+  PET は 9.2mm 上 → 合わせると z が 70〜80mm ずれ、そこから抜け出せず「大きくずれた局所解」に落ちた。
+- **粗探索を downsample してはいけない**: factor 4 で試すと PET の z が 55→13 スライスまで潰れ
+  (`downsampleVolume` は平均でなく stride 抽出)、MI 地形が壊れて全解像度では明確に劣る点を
+  最良と誤判定した (実測 -0.31 vs -0.51)。**全解像度で軸逐次探索 (z→y→x) を 2 パス** (≒86 評価、~3.5s)。
+- 粗探索の MI binning は `estimateIntensityRange` (moving を identity 位置でサンプル) ではなく
+  **volume 全体の 1〜99 パーセンタイル** を使う。初期ずれが大きい段階では前者が背景だらけになり不安定。
+
+検証は「登録後の姿勢が局所最適か」を必ず数値で確認する: ±5/±15/±30mm と ±5° を振って
+**全て MI が悪化する**こと。実測 (brain MR/PET): 最終 MI -0.72、全摂動で悪化、
+PET 高集積部の MR 信号が周囲の 3.54 倍 (257.4 vs 72.8)。
 
 ### 4. NIfTI のみロード時は modality 不明
 - `nifti-reader-js` の affine からは Volume は作れるが modality は不明 → PET/CT 検出が動かない。

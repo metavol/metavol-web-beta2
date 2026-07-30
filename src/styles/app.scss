@@ -119,6 +119,19 @@ html, body, #app {
   height: 48px;
 }
 
+// 右サイドバー開閉ボタン: app-bar の flex から外して右上に固定する。
+// app-bar は項目が多く幅次第で内容が溢れるため、flex 内に置くと画面外に押し出されて
+// 押せなくなる (実測: 1100px 幅で viewport 外)。ここだけは幅に依存させない。
+.mv-inspector-toggle {
+  position: fixed !important;
+  top: 0;
+  right: 0;
+  height: 48px !important;
+  z-index: 1010;          // app-bar (1004〜1008 付近) より前面
+  background: var(--mv-surface) !important;
+  border-radius: 0 !important;
+}
+
 .mv-brand {
   font-family: 'Inter', sans-serif;
   font-weight: 700;

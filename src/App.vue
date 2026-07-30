@@ -417,17 +417,11 @@
             <template v-slot:prepend>
               <v-icon icon="mdi-view-grid" size="small" />
             </template>
-            <v-list-item-title>PET/CT/Fusion</v-list-item-title>
+            <v-list-item-title>MTV measurement</v-list-item-title>
             <v-list-item-subtitle>{{ petStandardTooltip }}</v-list-item-subtitle>
           </v-list-item>
           <v-divider />
-          <v-list-item @click="runLayout('triplanarPt')">
-            <template v-slot:prepend>
-              <v-icon icon="mdi-view-week-outline" size="small" />
-            </template>
-            <v-list-item-title>Triplanar PT (1×3)</v-list-item-title>
-            <v-list-item-subtitle>PT axial / coronal / sagittal</v-list-item-subtitle>
-          </v-list-item>
+          <!-- Triplanar PT (1×3) は廃止: PET Triplanar + MIP と内容が重複していたため。 -->
           <v-list-item @click="runLayout('triplanarFused')">
             <template v-slot:prepend>
               <v-icon icon="mdi-view-week" size="small" />
@@ -439,8 +433,8 @@
             <template v-slot:prepend>
               <v-icon icon="mdi-view-grid" size="small" />
             </template>
-            <v-list-item-title>PT-only 4-up (2×2)</v-list-item-title>
-            <v-list-item-subtitle>PT axi / cor / sag / MIP</v-list-item-subtitle>
+            <v-list-item-title>PET Triplanar + MIP (2×2)</v-list-item-title>
+            <v-list-item-subtitle>PT axial / coronal / sagittal + MIP</v-list-item-subtitle>
           </v-list-item>
           <v-list-item @click="runLayout('compare2up')">
             <template v-slot:prepend>
@@ -463,59 +457,53 @@
 
       <v-divider vertical class="mx-2" />
 
-      <v-btn
-        :class="['mv-tool-btn', { 'is-active': syncImageBox }]"
-        variant="text"
-        size="small"
-        @click="syncImageBox = !syncImageBox"
-      >
-        <v-icon icon="mdi-link-variant" />
-        <v-tooltip activator="parent" location="bottom">{{ syncImageBox ? 'Sync ON' : 'Sync OFF' }}</v-tooltip>
-      </v-btn>
-
-      <v-btn
-        :class="['mv-tool-btn', { 'is-active': voxelInspector }]"
-        variant="text"
-        size="small"
-        @click="voxelInspector = !voxelInspector"
-      >
-        <v-icon icon="mdi-eyedropper" />
-        <v-tooltip activator="parent" location="bottom">
-          {{ voxelInspector ? 'Voxel inspector ON (hover to read voxel values)' : 'Voxel inspector OFF (Ctrl+Shift+D)' }}
-        </v-tooltip>
-      </v-btn>
-
-      <v-btn
-        :class="['mv-tool-btn', { 'is-active': showOverlayInfo }]"
-        variant="text"
-        size="small"
-        @click="showOverlayInfo = !showOverlayInfo"
-      >
-        <v-icon icon="mdi-information-outline" />
-        <v-tooltip activator="parent" location="bottom">
-          {{ showOverlayInfo ? 'Hide patient/exam info overlay' : 'Show patient/exam info overlay' }}
-        </v-tooltip>
-      </v-btn>
-
-      <v-btn
-        class="mv-tool-btn"
-        variant="text" size="small"
-        @click="fitToWindow"
-      >
-        <v-icon icon="mdi-fit-to-screen-outline" />
-        <v-tooltip activator="parent" location="bottom">Fit to window</v-tooltip>
-      </v-btn>
-      <v-btn
-        :class="['mv-tool-btn', { 'is-active': noGapMode }]"
-        variant="text" size="small"
-        @click="noGapMode = !noGapMode"
-      >
-        <v-icon icon="mdi-arrow-expand-all" />
-        <v-tooltip activator="parent" location="bottom">
-          {{ noGapMode ? 'Edge-to-edge tiles ON (gap = 0)' : 'Edge-to-edge tiles OFF (click to fill the image area without gaps)' }}
-        </v-tooltip>
-      </v-btn>
-
+      <!-- 表示系トグルは 1 つの View メニューに集約する。
+           **app-bar が溢れると右端のボタン (右サイドバー開閉など) が画面外に押し出され、
+           操作不能になる**ため (実測: 1280px 幅で 211px 溢れ、tiles/renderer/Close all/
+           右サイドバー開閉の 4 つが viewport 外)。頻度の低いものを畳んで幅を確保する。 -->
+      <v-menu>
+        <template v-slot:activator="{ props: act }">
+          <v-btn class="mv-tool-btn" variant="text" size="small" v-bind="act">
+            <v-icon icon="mdi-tune-variant" />
+            <v-tooltip activator="parent" location="bottom">View options (sync, voxel inspector, overlays, fit)</v-tooltip>
+          </v-btn>
+        </template>
+        <v-list density="compact">
+          <v-list-item @click="syncImageBox = !syncImageBox">
+            <template v-slot:prepend>
+              <v-icon :icon="syncImageBox ? 'mdi-link-variant' : 'mdi-link-variant-off'" size="small"
+                      :color="syncImageBox ? 'primary' : undefined" />
+            </template>
+            <v-list-item-title>{{ syncImageBox ? 'Sync ON' : 'Sync OFF' }}</v-list-item-title>
+            <v-list-item-subtitle>Page/zoom all boxes together</v-list-item-subtitle>
+          </v-list-item>
+          <v-list-item @click="voxelInspector = !voxelInspector">
+            <template v-slot:prepend>
+              <v-icon icon="mdi-eyedropper" size="small" :color="voxelInspector ? 'primary' : undefined" />
+            </template>
+            <v-list-item-title>{{ voxelInspector ? 'Voxel inspector ON' : 'Voxel inspector OFF' }}</v-list-item-title>
+            <v-list-item-subtitle>Hover to read voxel values (Ctrl+Shift+D)</v-list-item-subtitle>
+          </v-list-item>
+          <v-list-item @click="showOverlayInfo = !showOverlayInfo">
+            <template v-slot:prepend>
+              <v-icon icon="mdi-information-outline" size="small" :color="showOverlayInfo ? 'primary' : undefined" />
+            </template>
+            <v-list-item-title>{{ showOverlayInfo ? 'Hide patient/exam info' : 'Show patient/exam info' }}</v-list-item-title>
+          </v-list-item>
+          <v-divider />
+          <v-list-item @click="fitToWindow">
+            <template v-slot:prepend><v-icon icon="mdi-fit-to-screen-outline" size="small" /></template>
+            <v-list-item-title>Fit to window</v-list-item-title>
+          </v-list-item>
+          <v-list-item @click="noGapMode = !noGapMode">
+            <template v-slot:prepend>
+              <v-icon icon="mdi-arrow-expand-all" size="small" :color="noGapMode ? 'primary' : undefined" />
+            </template>
+            <v-list-item-title>{{ noGapMode ? 'Edge-to-edge tiles ON' : 'Edge-to-edge tiles OFF' }}</v-list-item-title>
+            <v-list-item-subtitle>Fill the image area without gaps</v-list-item-subtitle>
+          </v-list-item>
+        </v-list>
+      </v-menu>
       <v-divider vertical class="mx-1" />
 
       <v-menu>
@@ -611,20 +599,27 @@
         </v-tooltip>
       </v-btn>
 
-      <!-- 右サイドバー開閉。制御対象の右ドロワーに接するよう app-bar の最右端に置く。 -->
-      <v-btn
-        :class="['mv-tool-btn', { 'is-active': drawerRight }]"
-        variant="text"
-        size="small"
-        data-demo="inspector"
-        @click="drawerRight = !drawerRight"
-      >
-        <v-icon icon="mdi-dock-right" />
-        <v-tooltip activator="parent" location="bottom">
-          {{ drawerRight ? 'Hide right sidebar (Segmentation panel)' : 'Show right sidebar (Segmentation panel)' }}
-        </v-tooltip>
-      </v-btn>
     </v-app-bar>
+
+    <!-- 右サイドバー開閉ボタンは **app-bar の flex 内に置かない**。
+         app-bar は項目が多く、ウィンドウ幅次第で内容が溢れる。flex 内にあると溢れた分が
+         画面外に押し出され、実測で 1280px 幅では 211px 溢れ・1100px 幅では 4 個 (tiles /
+         renderer / Close all / この開閉ボタン) が viewport 外になり、
+         **サイドバーを開く手段が消える** (「right side bar が出ない」の原因)。
+         そこで position:fixed で右上に固定し、幅に依存せず必ず押せるようにする。
+         見た目の位置は従来どおり app-bar の右端。 -->
+    <v-btn
+      :class="['mv-tool-btn', 'mv-inspector-toggle', { 'is-active': drawerRight }]"
+      variant="text"
+      size="small"
+      data-demo="inspector"
+      @click="drawerRight = !drawerRight"
+    >
+      <v-icon icon="mdi-dock-right" />
+      <v-tooltip activator="parent" location="bottom">
+        {{ drawerRight ? 'Hide right sidebar (Segmentation panel)' : 'Show right sidebar (Segmentation panel)' }}
+      </v-tooltip>
+    </v-btn>
 
     <!-- Close-all 確認ダイアログ。データ損失リスクを明示する。 -->
     <v-dialog v-model="closeAllDialogOpen" max-width="460">
@@ -799,8 +794,10 @@ const petCtReady = computed(() => {
 // 起動時は左サイドバーも隠す (右 Inspector と同じ方針)。空状態では series も設定も無く、
 // 「Drop files here」だけを見せたいため。ロード完了時に DicomView が true にする。
 const drawerLeft = ref(false);
-// Inspector (右ドロワ) は初期表示 — ROI リスト等をすぐ見せる
-const drawerRight = ref(true);
+// 右 Inspector (Segmentation) も起動時は隠す。空状態では測る対象が無いので用が無い。
+// 開くのは MTV measurement を選んだとき (runPetStandardWith) と、ユーザのトグル操作だけ。
+// **true に戻さないこと** — 起動直後にパネルが出てしまう。
+const drawerRight = ref(false);
 const leftButtonFunction = ref<string | null>(null);
 const [w, h] = getWH();
 const imageBoxW = ref(w);
@@ -854,6 +851,9 @@ const onCloseAll = () => {
 const confirmCloseAll = () => {
   closeAllDialogOpen.value = false;
   closingImages.value = true;
+  // 空状態に戻るので Segmentation パネルは畳む
+  // (自動追従の watch は持たない方針なので、ここで明示的に閉じる)
+  drawerRight.value = false;
 };
 
 // "Load files…" (ハンバーガーメニュー) から OS のファイルピッカーを開く。
@@ -938,8 +938,24 @@ const confirmPetPicker = () => {
 
 const runPetStandardWith = (overridePt?: number, overrideCt?: number) => {
   tileN.value = 4;
-  setTimeout(() => {
-    dicomViewRef.value?.setupPetStandardView?.(overridePt, overrideCt);
+  // MTV measurement は「測る」ための入口なので Segmentation パネルを開く。
+  // (drag&drop の軽い fusion では開かない ← 自動表示は MTV 経路だけ)
+  //
+  // **drawerRight を直接立てる。** 以前は dicomViewRef 経由で
+  // `dicomViewRef.value?.openInspectorForMtv?.()` を呼んでいたが、
+  //   - ref が null (mount 前 / HMR で壊れた等) だと `?.` で **無言でスキップ**される
+  //   - setup が throw すると後続の open に到達しない
+  // という 2 つの失敗経路があり「パネルが出ない」報告になっていた。
+  // drawerRight は App 自身の ref なので、ここで立てれば必ず反映される。
+  drawerRight.value = true;
+  setTimeout(async () => {
+    try {
+      await dicomViewRef.value?.setupPetStandardView?.(overridePt, overrideCt);
+    } catch (err) {
+      console.warn('[MTV] setupPetStandardView failed', err);
+    } finally {
+      drawerRight.value = true;   // レイアウト構築後にも念押し
+    }
   }, 50);
 };
 
@@ -954,13 +970,12 @@ const petStandardTooltip = computed(() => {
   if (ambiguous) return `Multiple PT/CT detected — click to choose (${cands.pt.length} PT × ${cands.ct.length} CT)`;
   const pt = cands.pt[0]?.label ?? '';
   const ct = cands.ct[0]?.label ?? '';
-  return `Build PET Standard with PT: ${pt}  /  CT: ${ct}`;
+  return `2×2 CT / PET / Fusion / MIP — PT: ${pt}  /  CT: ${ct}`;
 });
 
-const runLayout =(kind: 'triplanarPt' | 'triplanarFused' | 'ptOnly4up' | 'compare2up' | 'petCtMipRight') => {
+const runLayout =(kind: 'triplanarFused' | 'ptOnly4up' | 'compare2up' | 'petCtMipRight') => {
   const r = dicomViewRef.value;
   if (!r) return;
-  if (kind === 'triplanarPt')   r.setupTriplanarPt?.();
   if (kind === 'triplanarFused') r.setupTriplanarFused?.();
   if (kind === 'ptOnly4up')     r.setupPtOnly4up?.();
   if (kind === 'compare2up')    r.setupCompare2up?.();
@@ -1117,7 +1132,7 @@ const onRegisterMrPt = async () => {
     return;
   }
   // 動的 import で重い registration コードを実行時のみロード (bundle 分割効果)
-  const [{ registerMrToPt }, { applyRigidToVolume }] = await Promise.all([
+  const [{ registerMrToPt, estimateInitialParams }, { applyRigidToVolume }] = await Promise.all([
     import('./components/registration/registerMrPt'),
     import('./components/registration/transform'),
   ]);
@@ -1132,7 +1147,12 @@ const onRegisterMrPt = async () => {
   segStore.setMrRegistrationProgress(null);
   await new Promise(r => setTimeout(r, 30));
   try {
-    const res = registerMrToPt(pt, mr, [0, 0, 0, 0, 0, 0], (info) => {
+    // MI + Nelder-Mead は局所探索なので、FOV がまるごと離れている症例 (別々に撮った脳 MR と
+    // 脳 PET など) では初期値ゼロから収束しない。
+    // 重心合わせ → 粗グリッド探索 で「正しい山」に乗せてから最適化に渡す
+    // (重心だけだと撮影範囲の違いでバイアスが乗り、実データで z が 70〜80mm ずれた)。
+    const init = estimateInitialParams(pt, mr);
+    const res = registerMrToPt(pt, mr, init, (info) => {
       segStore.setMrRegistrationProgress({
         level: info.level, nLevels: info.nLevels,
         iter: info.iter, mi: info.bestNegMI,

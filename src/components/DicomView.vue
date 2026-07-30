@@ -429,11 +429,14 @@ onMounted(() => {
   // autoFitMode 有効時のみ rAF debounce で再フィットする。window resize もこれで拾える。
   const ia = document.querySelector('.mv-imagearea');
   if (ia && typeof ResizeObserver !== 'undefined') {
-    let rafPending = 0;
+    // debounce は setTimeout で行う。**requestAnimationFrame は使わない**:
+    // タブ/ペインが非表示のとき rAF は 1 度も発火しない (実測: hidden 状態で 1.5 秒間 0 回)。
+    // rAF に頼ると、非表示中のリサイズが永久に反映されないままになる。
+    let pending: any = null;
     imageAreaResizeObserver = new ResizeObserver(() => {
       if (!autoFitMode.value) return;
-      if (rafPending) cancelAnimationFrame(rafPending);
-      rafPending = requestAnimationFrame(() => { rafPending = 0; applyAutoFit(); });
+      if (pending) clearTimeout(pending);
+      pending = setTimeout(() => { pending = null; applyAutoFit(); }, 16);
     });
     imageAreaResizeObserver.observe(ia);
   }
@@ -469,9 +472,21 @@ const loadDevCase = async (caseId: string) => {
       while (idx < fileNames.length) {
         const my = idx++;
         const name = fileNames[my];
-        const r = await fetch(`/samples/${encodeURIComponent(caseId)}/${name.split('/').map(encodeURIComponent).join('/')}`);
-        if (!r.ok) { console.warn(`[dev-case] fetch failed: ${name}`); continue; }
-        const buf = await r.arrayBuffer();
+        // 大量ファイル (2000 超) では 200 のまま空ボディが返ることがあったので、
+        // **0 バイトもエラー扱いにしてリトライ**する。取りこぼすとシリーズが欠落して
+        // 「PT が見つからない」等の別問題に化けて分かりにくい。
+        const url = `/samples/${encodeURIComponent(caseId)}/${name.split('/').map(encodeURIComponent).join('/')}`;
+        let buf: ArrayBuffer | null = null;
+        for (let attempt = 0; attempt < 3 && !buf; attempt++) {
+          if (attempt > 0) await new Promise(r => setTimeout(r, 50 * attempt));
+          try {
+            const r = await fetch(url);
+            if (!r.ok) continue;
+            const b = await r.arrayBuffer();
+            if (b.byteLength > 0) buf = b;
+          } catch { /* retry */ }
+        }
+        if (!buf) { console.warn(`[dev-case] fetch failed (empty after retries): ${name}`); continue; }
         files[my] = new File([buf], name.split('/').pop() ?? name, { type: 'application/octet-stream' });
       }
     });
@@ -686,14 +701,27 @@ watch(tileN, async () => {
 const imageBoxInfos = ref<ImageBoxInfoBase[]>([]);
 const getDicomSliceImageBoxInfo = (index: number) => imageBoxInfos.value[index] as DicomSliceImageBoxInfo;
 const getVolumeImageBoxInfo = (index: number) => imageBoxInfos.value[index] as VolumeImageBoxInfo;
+// **必ず null 安全にすること。** これらは template から (crossRefLinesFor 等を通じて) 呼ばれる。
+// imageBoxInfos に穴 (undefined) があると `in` が TypeError を投げ、
+// **render 関数全体が毎回失敗して画面が更新されなくなる** (実測: レイアウト変更後も古い box が
+// 表示され続け、boxStateVersion の bump も show() も効かない状態になった)。
+// 穴は tileN を増やした直後や配列途中の未初期化で普通に起こりうる。
+const boxInfoAt = (i: number): any | null => {
+  const arr = imageBoxInfos.value;
+  if (i == null || i < 0 || i >= arr.length) return null;
+  return arr[i] ?? null;
+};
 const isDicomSliceImageBoxInfo = (i:number) => {
-  return "currentSliceNumber" in imageBoxInfos.value[i]; //この方法では、プロパティ名を変更したときにバグった。
+  const info = boxInfoAt(i);
+  return !!info && ("currentSliceNumber" in info); //この方法では、プロパティ名を変更したときにバグった。
 }
 const isVolumeImageBoxInfo = (i:number) => {
-  return ("clut" in imageBoxInfos.value[i]) && !("clut1" in imageBoxInfos.value[i]); //この方法では、プロパティ名を変更したときにバグった。
+  const info = boxInfoAt(i);
+  return !!info && ("clut" in info) && !("clut1" in info); //この方法では、プロパティ名を変更したときにバグった。
 }
 const isFusedImageBoxInfo = (i:number) => {
-  return "clut1" in imageBoxInfos.value[i];
+  const info = boxInfoAt(i);
+  return !!info && ("clut1" in info);
 }
 // Volume 系（単独 Volume または Fusion）の判定
 const isAnyVolumeBox = (i:number) => isVolumeImageBoxInfo(i) || isFusedImageBoxInfo(i);
@@ -1745,6 +1773,10 @@ const pagingInvertFor = (axisVec: THREE.Vector3): boolean => {
 // 画像右端の縦 paging スライダ用: 現在 index と範囲を返す。
 // MIP / VR は wheel が角度回転に割り当てられており「スライス」の概念が無いので null。
 const getBoxPaging = (i: number): { index: number; min: number; max: number; invert: boolean } | null => {
+  // Volume box の paging は centerInWorld を **in-place で mutate** するため Vue の reactive
+  // proxy では検知されない (CLAUDE.md の既知の落とし穴)。描画ごとに bump される
+  // boxStateVersion に依存させて、ホイール paging でもスライダーが追従するようにする。
+  void boxStateVersion.value;
   if (i < 0 || i >= imageBoxInfos.value.length) return null;
   if (isDicomSliceImageBoxInfo(i)) {
     const info = getDicomSliceImageBoxInfo(i);
@@ -1868,24 +1900,72 @@ const getMyWCWW1 = (i:number) => {
   return [info.myWC1, info.myWW1];
 }
 
+// modality を見て「どのレイヤに window を当てるか」を決める。
+// Fused box は base = CT/MR (myWC/myWW)、overlay = PT (myWC1/myWW1) の 2 レイヤ持ちなので、
+// PT preset を常に myWC に書くと **MR/CT 側の window が変わってしまう** (実バグだった)。
+const modalityOfSeries = (idx: number): string => {
+  const s = seriesList[idx];
+  if (!s) return '';
+  const dl = s.myDicom;
+  if (dl && dl.length > 0) return (dl[0].string('x00080060') ?? '').toUpperCase();
+  return (s.volume?.metadata?.modality ?? '').toUpperCase();
+};
+
+// kind='pt' → PT レイヤ、'anat' → CT/MR レイヤ に wc/ww を設定する。
+const setWindowForKind = (i: number, kind: 'pt' | 'anat', wc: number | null, ww: number | null) => {
+  const info = imageBoxInfos.value[i] as any;
+  if (!info) return;
+  const isFused = 'clut1' in info;
+  if (!isFused) { info.myWC = wc; info.myWW = ww; return; }   // 単一レイヤ box
+
+  const isPt = (m: string) => m === 'PT' || m === 'PET';
+  const baseIsPt = isPt(modalityOfSeries(info.currentSeriesNumber));
+  const overlayIsPt = isPt(modalityOfSeries(info.currentSeriesNumber1));
+
+  // 目的のレイヤ: 'pt' なら PT 側、'anat' なら PT でない側 (CT/MR)。
+  // 判定できないときは従来どおり base (overlay は PT という通常構成に合わせる)。
+  let useOverlay: boolean;
+  if (kind === 'pt') useOverlay = overlayIsPt || !baseIsPt;
+  else               useOverlay = baseIsPt && !overlayIsPt;
+
+  if (useOverlay) { info.myWC1 = wc; info.myWW1 = ww; }
+  else            { info.myWC = wc;  info.myWW = ww; }
+};
+
 const presetSelected = (e: string) => {
   const id = selectedImageBoxId.value;
-  // CT (HU) presets
-  if (e === "Lung") setMyWCWW(id, -700, 1800);
-  if (e === "Abd") setMyWCWW(id, 30, 200);
-  if (e === "Med") setMyWCWW(id, 0, 320);
-  if (e === "Fat") setMyWCWW(id, 10, 275);
-  if (e === "Bone") setMyWCWW(id, 200, 2000);
-  if (e === "Brain") setMyWCWW(id, 30, 80);
-  // PET (SUV / Bq/ml) presets — WC = (lo+hi)/2, WW = hi-lo
-  if (e === "SUV-0-3")     setMyWCWW(id, 1.5,    3);
-  if (e === "SUV-0-6")     setMyWCWW(id, 3,      6);
-  if (e === "SUV-0-10")    setMyWCWW(id, 5,     10);
-  if (e === "SUV-0-15")    setMyWCWW(id, 7.5,   15);
-  if (e === "SUV-0-100")   setMyWCWW(id, 50,   100);
-  if (e === "SUV-0-1000")  setMyWCWW(id, 500, 1000);
-  if (e === "SUV-0-10000") setMyWCWW(id, 5000, 10000);
-  if (e === "Reset") setMyWCWW(id, null, null);
+  // CT/MR (解剖) presets → base レイヤ
+  if (e === "Lung") setWindowForKind(id, 'anat', -700, 1800);
+  if (e === "Abd")  setWindowForKind(id, 'anat', 30, 200);
+  if (e === "Med")  setWindowForKind(id, 'anat', 0, 320);
+  if (e === "Fat")  setWindowForKind(id, 'anat', 10, 275);
+  if (e === "Bone") setWindowForKind(id, 'anat', 200, 2000);
+  if (e === "Brain") setWindowForKind(id, 'anat', 30, 80);
+  // PET (SUV / Bq/ml) presets — WC = (lo+hi)/2, WW = hi-lo → PT レイヤ
+  if (e === "SUV-0-3")     setWindowForKind(id, 'pt', 1.5,    3);
+  if (e === "SUV-0-6")     setWindowForKind(id, 'pt', 3,      6);
+  if (e === "SUV-0-10")    setWindowForKind(id, 'pt', 5,     10);
+  if (e === "SUV-0-15")    setWindowForKind(id, 'pt', 7.5,   15);
+  if (e === "SUV-0-100")   setWindowForKind(id, 'pt', 50,   100);
+  if (e === "SUV-0-1000")  setWindowForKind(id, 'pt', 500, 1000);
+  if (e === "SUV-0-10000") setWindowForKind(id, 'pt', 5000, 10000);
+  // MR は固定 HU のような絶対値が無いので、volume の分位点から自動で決める。
+  if (e.startsWith('MR-AUTO')) {
+    const pct = e === 'MR-AUTO-TIGHT' ? 0.05 : e === 'MR-AUTO-WIDE' ? 0.001 : 0.01;
+    const info = imageBoxInfos.value[id] as any;
+    const volIdx = info?.currentSeriesNumber ?? -1;
+    const v = seriesList[volIdx]?.volume;
+    if (v) {
+      const stride = Math.max(1, Math.floor(v.voxel.length / 20000));
+      const vals: number[] = [];
+      for (let t = 0; t < v.voxel.length; t += stride) vals.push(v.voxel[t]);
+      vals.sort((a, b) => a - b);
+      const lo = vals[Math.floor(vals.length * pct)] ?? vals[0];
+      const hi = vals[Math.floor(vals.length * (1 - pct))] ?? vals[vals.length - 1];
+      setWindowForKind(id, 'anat', (lo + hi) / 2, Math.max(1, hi - lo));
+    }
+  }
+  if (e === "Reset") { setWindowForKind(id, 'anat', null, null); setWindowForKind(id, 'pt', null, null); }
   show();
 };
 
@@ -2006,14 +2086,22 @@ const dropFile = async (e: DragEvent, boxId?: number) => {
     }
     return;
   }
-  // 2. Sidebar series card drag: シリーズを box にロード
+  // 2. Sidebar series card drag。
+  //    - box の上に落ちた   → その box に表示 (modality が補完関係なら fusion に昇格)
+  //    - box の無い所に落ちた → **新しい box を作って**そこに表示 (選択中 box を勝手に
+  //      書き換えていたのが「挙動が不安定」の一因だった)
   const seriesIdxStr = e.dataTransfer?.getData('application/x-metavol-series');
   if (seriesIdxStr) {
     const idx = Number(seriesIdxStr);
-    const target = boxId ?? selectedImageBoxId.value;
-    if (!isNaN(idx) && idx >= 0 && idx < seriesList.length) {
-      onSelectSeriesIntoBox(idx, target);
+    if (isNaN(idx) || idx < 0 || idx >= seriesList.length) return;
+    if (boxId == null) {
+      appendSeriesAsNewBox(idx);
+      return;
     }
+    // PT を CT/MR の box へ (またはその逆) → 重ねたいはず、と解釈して fusion。
+    // 同 modality なら単純に差し替え。
+    if (shouldFuseOnDrop(idx, boxId)) fuseSeriesIntoBox(idx, boxId);
+    else onSelectSeriesIntoBox(idx, boxId);
     return;
   }
   // 3. OS からのファイルドロップ
@@ -2056,6 +2144,201 @@ const onModalityDragStart = (e: DragEvent, srcBoxId: number) => {
 //   - Volume / Fusion: その plane (centerInWorld / vecx,y,z) を保持
 //   - DicomSlice: target series を MPR して axial を既定 plane とする
 //   - MIP / VR: alert で reject
+// ===== Fusion 相手の提案 =====
+//
+// 「読み込み時に全シリーズを役割分類して絞る」のは副作用が大きいので採らない。
+// 代わりに **重ねたい瞬間に候補を提案する**。同じ FrameOfReferenceUID (= 同じ撮影機で
+// 位置合わせ済み) の PT×CT が最有力で、実運用ではまずこれを選びたい。
+// ただしイレギュラーな組み合わせ (別 study の診断 CT に PET を重ねる等) も選べるよう、
+// 候補は除外せず「推奨」バッジと理由を付けて並べるだけにする。
+const frameOfRefOf = (idx: number): string => {
+  const dl = seriesList[idx]?.myDicom;
+  if (!dl || dl.length === 0) return '';
+  return (dl[0].string('x00200052') ?? '').trim();
+};
+
+// ImageType (0008,0008) が ORIGINAL\PRIMARY か = 撮影そのもの。
+// DERIVED / SECONDARY は再構成 (PET CORONAL 等) や MIP / コンソール保存画なので、
+// **候補から外しはしないが順位を下げる**(ユーザは変則的な組み合わせも選びたいため)。
+const isOriginalPrimary = (idx: number): boolean => {
+  const dl = seriesList[idx]?.myDicom;
+  if (!dl || dl.length === 0) return true;   // NIfTI 等は判定材料が無いので不利にしない
+  const t = (dl[0].string('x00080008') ?? '').toUpperCase();
+  if (!t) return true;
+  return t.includes('ORIGINAL') && t.includes('PRIMARY');
+};
+
+interface FusionCandidate {
+  idx: number; label: string; modality: string; nFrames: number;
+  sameFrameOfRef: boolean; sameStudy: boolean; recommended: boolean; reason: string;
+  original: boolean;        // ImageType が ORIGINAL\PRIMARY (再構成/MIP でない)
+  complementary: boolean;   // base と PT/解剖の補完関係
+}
+
+const fusionDialog = ref<{ open: boolean; boxId: number; baseLabel: string; candidates: FusionCandidate[] }>(
+  { open: false, boxId: -1, baseLabel: '', candidates: [] },
+);
+
+const getFusionCandidatesForBox = (boxId: number): { baseIdx: number; list: FusionCandidate[] } | null => {
+  const info = imageBoxInfos.value[boxId] as any;
+  if (!info) return null;
+  const baseIdx: number = info.currentSeriesNumber;
+  if (baseIdx == null) return null;
+  const baseMod = seriesModality(baseIdx);
+  const baseFor = frameOfRefOf(baseIdx);
+  const baseStudy = seriesSummaries.value[baseIdx]?.studyUID ?? '';
+
+  const list: FusionCandidate[] = [];
+  for (let i = 0; i < seriesList.length; i++) {
+    if (i === baseIdx) continue;
+    const s = seriesList[i];
+    if (!s) continue;
+    const nFrames = s.myDicom?.length ?? s.volume?.nz ?? 0;
+    if (nFrames < 2) continue;                       // 単発 (localizer / dose report) は重ねられない
+    if (seriesSummaries.value[i]?.isRgb) continue;   // RGB (コンソールの合成画) は定量にも表示にも不適
+    const mod = seriesModality(i);
+    const sameFor = !!baseFor && frameOfRefOf(i) === baseFor;
+    const sameStudy = !!baseStudy && (seriesSummaries.value[i]?.studyUID ?? '') === baseStudy;
+    const complementary = isPtModality(mod) !== isPtModality(baseMod);
+    const original = isOriginalPrimary(i);
+    const reasons: string[] = [];
+    if (sameFor) reasons.push('same frame of reference (hardware-aligned)');
+    else if (sameStudy) reasons.push('same study, different frame of reference — needs registration');
+    else reasons.push('different study — needs registration');
+    if (complementary) reasons.push(isPtModality(mod) ? 'PT overlay on anatomy' : 'anatomy under PT');
+    if (!original) reasons.push('derived (reformat / MIP)');
+    list.push({
+      idx: i, modality: mod, nFrames,
+      label: seriesSummaries.value[i]?.description || `Series ${i}`,
+      sameFrameOfRef: sameFor, sameStudy,
+      recommended: false,               // 下で最良の 1 件だけ true にする
+      reason: reasons.join(' · '),
+      original, complementary,
+    });
+  }
+  // 同 FoR → 補完 modality → 撮影そのもの (ORIGINAL\PRIMARY) → 同 study → 枚数
+  // 枚数まで見るのは、PET CORONAL(146) や PET MIP(36) より PET TRANSAXIAL(413) を上に出すため。
+  list.sort((a, b) =>
+    Number(b.sameFrameOfRef) - Number(a.sameFrameOfRef) ||
+    Number(b.complementary) - Number(a.complementary) ||
+    Number(b.original) - Number(a.original) ||
+    Number(b.sameStudy) - Number(a.sameStudy) ||
+    b.nFrames - a.nFrames);
+  // 「これを選べばまず正解」を 1 件だけ推奨表示する (全部に付けると選択の助けにならない)
+  const best = list[0];
+  if (best && best.sameFrameOfRef && best.complementary && best.original) best.recommended = true;
+  return { baseIdx, list };
+};
+
+const onOpenFusionPicker = (boxId: number) => {
+  const r = getFusionCandidatesForBox(boxId);
+  if (!r || r.list.length === 0) { alert('No other series available to fuse.'); return; }
+  fusionDialog.value = {
+    open: true, boxId,
+    baseLabel: seriesSummaries.value[r.baseIdx]?.description || `Series ${r.baseIdx}`,
+    candidates: r.list,
+  };
+};
+
+const onPickFusionCandidate = (idx: number) => {
+  const boxId = fusionDialog.value.boxId;
+  fusionDialog.value.open = false;
+  if (boxId >= 0) fuseSeriesIntoBox(idx, boxId);
+};
+
+// ===== Fusion box 単位の auto-registration =====
+//
+// 既存の「Auto-register MR ↔ PET」(App のハンバーガー) は store の mrVolumeRef/petVolumeRef に
+// 固定されている。ここでは **その box の base / overlay** を対象にするので、
+// 別 study の CT と PET を d&d で重ねたケース (FrameOfReference が違うのでズレる) も直せる。
+// 動かすのは overlay 側 volume の幾何 (imagePosition / vector*)。snapshot は volume に紐づけて保持。
+const boxRegisterBusy = ref<number | null>(null);
+const registerSnapshots = new WeakMap<Volume.Volume, any>();
+
+const onBoxAutoRegister = async (boxId: number) => {
+  const info = imageBoxInfos.value[boxId] as FusedVolumeImageBoxInfo | undefined;
+  if (!info || !('clut1' in (info as any))) { alert('This box is not a fusion box.'); return; }
+  const fixed = seriesList[info.currentSeriesNumber]?.volume;
+  const moving = seriesList[info.currentSeriesNumber1]?.volume;
+  if (!fixed || !moving) { alert('Both series need a reconstructed volume.'); return; }
+  if (fixed === moving) return;
+
+  boxRegisterBusy.value = boxId;
+  try {
+    const [{ registerMrToPt, estimateInitialParams }, tf] = await Promise.all([
+      import('./registration/registerMrPt'),
+      import('./registration/transform'),
+    ]);
+    let snap = registerSnapshots.get(moving);
+    if (!snap) { snap = tf.captureRegistrationSnapshot(moving); registerSnapshots.set(moving, snap); }
+    tf.applyRigidToVolume(moving, snap, [0, 0, 0, 0, 0, 0]);   // 元の姿勢に戻してから開始
+    await new Promise(r => setTimeout(r, 30));                 // spinner を反映
+    const init = estimateInitialParams(fixed, moving);
+    const res = registerMrToPt(fixed, moving, init);
+    tf.applyRigidToVolume(moving, snap, res.params);
+    evictVolumeTexture?.(moving.voxel);   // GPU 側の座標系キャッシュを捨てて貼り直す
+    show();
+  } catch (err: any) {
+    alert('Registration failed: ' + (err?.message ?? err));
+  } finally {
+    boxRegisterBusy.value = null;
+  }
+};
+
+const onBoxResetRegister = async (boxId: number) => {
+  const info = imageBoxInfos.value[boxId] as FusedVolumeImageBoxInfo | undefined;
+  const moving = info ? seriesList[info.currentSeriesNumber1]?.volume : null;
+  if (!moving) return;
+  const snap = registerSnapshots.get(moving);
+  if (!snap) return;
+  const tf = await import('./registration/transform');
+  tf.applyRigidToVolume(moving, snap, [0, 0, 0, 0, 0, 0]);
+  evictVolumeTexture?.(moving.voxel);
+  show();
+};
+
+// series の modality (DICOM タグ優先、無ければ volume metadata)
+const seriesModality = (idx: number): string => {
+  const s = seriesList[idx];
+  if (!s) return '';
+  const dl = s.myDicom;
+  if (dl && dl.length > 0) return (dl[0].string('x00080060') ?? '').toUpperCase();
+  return (s.volume?.metadata?.modality ?? '').toUpperCase();
+};
+const isPtModality = (m: string) => m === 'PT' || m === 'PET';
+
+// サイドバーから box へ drop したとき「差し替え」か「重ねる」かの判定。
+// PT を CT/MR の box に落とした (またはその逆) なら、重ねたい意図と解釈して fusion に昇格する。
+// 同じ modality 同士なら単純な差し替え。
+const shouldFuseOnDrop = (srcSeriesIdx: number, tgtBoxId: number): boolean => {
+  const info = imageBoxInfos.value[tgtBoxId] as any;
+  if (!info) return false;
+  if ('clut1' in info) return true;              // 既に Fusion box → overlay を差し替える形で融合継続
+  if (info.isMip || info.isVr) return false;     // MIP/VR には重ねられない
+  const tgtSeriesIdx = info.currentSeriesNumber;
+  if (tgtSeriesIdx == null || tgtSeriesIdx === srcSeriesIdx) return false;
+  const src = seriesModality(srcSeriesIdx);
+  const tgt = seriesModality(tgtSeriesIdx);
+  if (!src || !tgt) return false;
+  return isPtModality(src) !== isPtModality(tgt);   // 片方だけ PT = 補完関係
+};
+
+// box が無い場所に drop されたとき: tile を 1 つ増やして末尾の新 box に表示する。
+const appendSeriesAsNewBox = (seriesIdx: number) => {
+  const newId = tileN.value ?? 0;
+  tileN.value = newId + 1;
+  // tileN を増やしただけでは infos が伸びないので、appendNewSeriesAsBoxes と同じ作法で埋める
+  while (imageBoxInfos.value.length <= newId) {
+    imageBoxInfos.value.push(defaultInfo(imageBoxInfos.value.length));
+  }
+  nextTick().then(() => {
+    onSelectSeriesIntoBox(seriesIdx, newId);
+    selectedImageBoxId.value = newId;
+    autoFitMode.value = true;
+    applyAutoFit();
+  });
+};
+
 const fuseSeriesIntoBox = (srcSeriesIdx: number, tgtBoxId: number) => {
   if (tgtBoxId < 0 || tgtBoxId >= imageBoxInfos.value.length) return;
 
@@ -2594,7 +2877,7 @@ const brushMouseDown = (e: MouseEvent) => {
   // slice 確定: 画面中央画素を world→PET voxel し、overlay サンプリング (floor(mv+0.5)=round)
   // と同じ round 規則で決定。polygon と揃える。
   const sliceAxis = maxAxis(a.vecz);
-  const wCenter = screenToWorld(id, imageBoxW.value!/2, imageBoxH.value!/2);
+  const wCenter = screenToWorld(id, imageBoxW.value!/2, boxRenderHeight(id)/2);
   const vc = worldToVoxel_(wCenter, petIdx);
   const arr = [vc.x, vc.y, vc.z];
   const sliceIndex = Math.round(arr[sliceAxis]);
@@ -2712,7 +2995,7 @@ const handlePolygonClick = (e: MouseEvent) => {
     const petIdx = findPetSeriesIndex();
     let sliceIndexInPet = 0;
     if (petIdx >= 0){
-      const wCenter = screenToWorld(id, imageBoxW.value!/2, imageBoxH.value!/2);
+      const wCenter = screenToWorld(id, imageBoxW.value!/2, boxRenderHeight(id)/2);
       const vc = worldToVoxel_(wCenter, petIdx);
       const arr = [vc.x, vc.y, vc.z];
       // overlay の mask サンプリングは shader/CPU とも floor(mv + 0.5) = round-to-nearest。
@@ -3046,10 +3329,21 @@ const doSort = () => {
       // 空ならカード上は "Series N" にフォールバック。
       const niftiDesc = ((f['niftiHeader'] as { description?: string })['description'] ?? '').trim();
 
-      const vx = new THREE.Vector3(af[0][0],af[0][1],af[0][2]).multiplyScalar(-1);
-      const vy = new THREE.Vector3(af[1][0],af[1][1],af[1][2]).multiplyScalar(-1);
-      const vz = new THREE.Vector3(af[2][0],af[2][1],af[2][2]);
-      const pos = new THREE.Vector3(af[0][3], af[1][3], af[2][3]);
+      // NIfTI affine → 本アプリの world (DICOM LPS) 変換。
+      //
+      // 1) **方向ベクトルは affine の「列」**。af[r][c] は row-major なので、voxel index c を
+      //    1 進めたときの world 変位は (af[0][c], af[1][c], af[2][c])。
+      //    以前は「行」を取っていたため、回転を含む affine で軸が混ざり voxel pitch まで狂った
+      //    (brain MR/PET の qform データで発覚: PET の実ピッチ 0.53/0.53/3.05 が 0.58/0.65/3.02 に化けた)。
+      //    軸平行 (対角 affine) のデータでは行と列が一致するため、これまで表面化しなかった。
+      // 2) **NIfTI は RAS+、本アプリ world は LPS** → x,y 成分の符号を反転 (diag(-1,-1,1))。
+      //    方向ベクトルだけでなく **原点にも同じ変換が要る**。原点を変換していなかったため、
+      //    NIfTI 同士 / NIfTI と DICOM を並べると x,y 方向にずれていた。
+      const affCol = (c: number) => new THREE.Vector3(-af[0][c], -af[1][c], af[2][c]);
+      const vx = affCol(0);
+      const vy = affCol(1);
+      const vz = affCol(2);
+      const pos = new THREE.Vector3(-af[0][3], -af[1][3], af[2][3]);
 
       const niftiIdx = seriesList.length;
       // ファイル名から modality を推定 (003PT00.nii → 'PT' 等)。
@@ -3253,6 +3547,13 @@ const inspectNiftiRaw = async (sourceSeriesIdx: number) => {
     isMip: false,
     mip: null,
   } as VolumeImageBoxInfo;
+  // **穴を作らないこと。** push は「配列末尾」に入るので、newBoxId が length より 2 以上先だと
+  // 途中の index が undefined のまま tileN だけ伸び、template から呼ばれる box 判定関数が
+  // `'clut' in undefined` で throw して **render 全体が停止**する (実測: レイアウト変更が
+  // 画面に反映されなくなり、DicomView 内の右ドロワーも描画されなくなった)。
+  while (imageBoxInfos.value.length < newBoxId) {
+    imageBoxInfos.value.push(defaultInfo(imageBoxInfos.value.length));
+  }
   if (newBoxId >= imageBoxInfos.value.length) {
     imageBoxInfos.value.push(newInfo);
   } else {
@@ -3488,12 +3789,14 @@ const autoLayoutAfterLoad = () => {
   autoFitMode.value = true;
   nextTick().then(() => applyAutoFit());
 
-  // plain DICOM viewer のみ (volume box 無し) なら右 Inspector は不要 → 隠す。
-  // volume box を含むレイアウト (NIfTI-only 昇格など) なら表示。
-  // watch(anyVolumeBoxPresent) だけだと「plain のまま手動で開いた sidebar」を閉じないので
-  // ロード直後にここで明示的に同期する。
-  inspector.value = anyVolumeBoxPresent.value;
+  // ロード直後は Segmentation パネルを出さない (plain viewer が既定なので用が無い)。
+  // 開くのは MTV measurement を選んだときだけ。
+  inspector.value = false;
 };
+
+// MTV measurement 経路から呼ぶ: Segmentation パネルを開く。
+// (drag&drop fusion では開かない ← ユーザ指定)
+const openInspectorForMtv = () => { inspector.value = true; };
 
 // 既存 box[boxId] を seriesIdx の Volume を表示する VolumeImageBoxInfo に置換する。
 // onSelectSeriesIntoBox の Volume 経路と同等の処理を、auto-promotion 用に切り出した。
@@ -3667,7 +3970,7 @@ const sphereScreenInBox = (i: number): { x: number; y: number } | null => {
   const u = (a22*b1 - a12*b2) / det;
   const v = (a11*b2 - a12*b1) / det;
   const cx = u + (imageBoxW.value ?? 0)/2;
-  const cy = v + (imageBoxH.value ?? 0)/2;
+  const cy = v + boxRenderHeight(i)/2;     // rowSpan 対応
   const box = imb.value?.[i] as any;
   const cvRaw = box?.cv1;
   const cv: HTMLCanvasElement | null = cvRaw ? ((cvRaw.value ?? cvRaw) as HTMLCanvasElement) : null;
@@ -4008,7 +4311,7 @@ const drawAnnotationOverlays = (i: number) => {
         const u = (a22*b1 - a12*b2) / det;
         const v = (a11*b2 - a12*b1) / det;
         const cx = u + imageBoxW.value!/2;
-        const cy = v + imageBoxH.value!/2;
+        const cy = v + boxRenderHeight(i)/2;   // rowSpan 対応
         const pixPerMm = 1 / Math.sqrt(a11);
         const rPx = rIntersect * pixPerMm;
         imb.value![i].drawSphereOverlay(cx, cy, rPx);
@@ -4083,7 +4386,11 @@ const screenToWorld = (imageBoxNumber: number, x: number, y:number) => {
 
   const world = new THREE.Vector3(0,0,0);
   const a = imageBoxInfos.value[imageBoxNumber] as VolumeImageBoxInfo;
-  world.add(a.centerInWorld).addScaledVector(a.vecx,x-imageBoxW.value!/2).addScaledVector(a.vecy,y-imageBoxH.value!/2);
+  // **高さは boxRenderHeight (canvas の実寸)**。imageBoxH は「1 行ぶん」なので、
+  // rowSpan=2 の背高 box (PET/CT + MIP の MIP 列) でそのまま使うと中心が半行ずれる。
+  world.add(a.centerInWorld)
+       .addScaledVector(a.vecx, x - imageBoxW.value!/2)
+       .addScaledVector(a.vecy, y - boxRenderHeight(imageBoxNumber)/2);
   return world;
 }
 
@@ -4213,7 +4520,7 @@ const worldToScreen = (boxId: number, w: THREE.Vector3): { sx: number; sy: numbe
   const a = imageBoxInfos.value[boxId] as VolumeImageBoxInfo;
   if (!a.vecx || !a.vecy || !a.vecz) return null;
   const cx = (imageBoxW.value ?? 0) / 2;
-  const cy = (imageBoxH.value ?? 0) / 2;
+  const cy = boxRenderHeight(boxId) / 2;   // rowSpan 対応 (screenToWorld と対称)
   const dx = w.x - a.centerInWorld.x;
   const dy = w.y - a.centerInWorld.y;
   const dz = w.z - a.centerInWorld.z;
@@ -5228,9 +5535,28 @@ const getPetCtSeriesCandidates = (): { pt: SeriesCand[]; ct: SeriesCand[] } => {
     }
   }
 
-  // スコア降順 (同点は seriesList 順 = 安定ソート)
-  pt.sort((a, b) => b.score - a.score);
-  ct.sort((a, b) => b.score - a.score);
+  // スコア降順。ただし **同点だけでなく「撮影そのものか」「枚数」も見る**。
+  // priority rules は description 文字列ベースなので、実運用の混在症例では
+  // 再構成 (PET CORONAL) や MIP が本来の PET TRANSAXIAL より上に来てしまい、
+  // MTV measurement が誤ったシリーズで組まれていた (実測: PET CORONAL が自動選択された)。
+  const nFramesOf = (i: number) => seriesList[i]?.myDicom?.length ?? seriesList[i]?.volume?.nz ?? 0;
+  const rank = (a: SeriesCand, b: SeriesCand) =>
+    b.score - a.score ||
+    Number(isOriginalPrimary(b.idx)) - Number(isOriginalPrimary(a.idx)) ||
+    nFramesOf(b.idx) - nFramesOf(a.idx);
+  pt.sort(rank);
+  ct.sort(rank);
+
+  // CT は「先頭 PT と同じ FrameOfReference」を最優先にする。
+  // 混在症例では診断 CT (別 FoR) と PET/CT の CT が並ぶので、機械的に合っている方を選ぶ。
+  const topPt = pt[0];
+  if (topPt) {
+    const ptFor = frameOfRefOf(topPt.idx);
+    if (ptFor) {
+      ct.sort((a, b) =>
+        Number(frameOfRefOf(b.idx) === ptFor) - Number(frameOfRefOf(a.idx) === ptFor) || rank(a, b));
+    }
+  }
   return { pt, ct };
 };
 
@@ -5368,6 +5694,46 @@ const setupPetStandardView = async (overridePetIdx?: number, overrideCtIdx?: num
 // PET Standard と同じスタイルで複数のレイアウトを切り替え可能にする。
 
 // 与えた volume と plane で VolumeImageBoxInfo を生成する小ヘルパ。
+// 断面 (axi/cor/sag) の表示ベクトルを **world (患者) 軸** で作る。
+//
+// **volume の index 軸 (vectorX/Y/Z) を割り当ててはいけない。**
+// 以前はそうしていたため axial 撮像でしか正しくならず、coronal 撮像 (例: MR t1_mpr_ns_cor)
+// では "axial" と称して冠状断が出るなど軸が入れ替わっていた。
+// world は DICOM LPS: +X = 患者左, +Y = 背側, +Z = 頭側。
+//   axial   : 画面x = +X, 画面y = +Y,       through = Z
+//   coronal : 画面x = +X, 画面y = 頭が上,   through = Y
+//   sagittal: 画面x = +Y, 画面y = 頭が上,   through = X
+const planeVectorsWorld = (
+  v: Volume.Volume,
+  plane: 'axi' | 'cor' | 'sag',
+): { vecx: THREE.Vector3; vecy: THREE.Vector3; vecz: THREE.Vector3 } => {
+  const AX = new THREE.Vector3(1, 0, 0);
+  const AY = new THREE.Vector3(0, 1, 0);
+  const AZ = new THREE.Vector3(0, 0, 1);
+  // world 軸 e に最も沿う voxel 軸の pitch (mm) = その方向の実効スライス厚 / 画素間隔
+  const pitchAlong = (e: THREE.Vector3): number => {
+    let best = v.vectorX, bestDot = -1;
+    for (const c of [v.vectorX, v.vectorY, v.vectorZ]) {
+      const L = c.length();
+      if (L <= 0) continue;
+      const d = Math.abs((c.x * e.x + c.y * e.y + c.z * e.z) / L);
+      if (d > bestDot) { bestDot = d; best = c; }
+    }
+    return best.length() || 1;
+  };
+  let ex: THREE.Vector3, ey: THREE.Vector3, ez: THREE.Vector3;
+  if (plane === 'cor')      { ex = AX.clone(); ey = AZ.clone().negate(); ez = AY.clone(); }
+  else if (plane === 'sag') { ex = AY.clone(); ey = AZ.clone().negate(); ez = AX.clone(); }
+  else                      { ex = AX.clone(); ey = AY.clone();          ez = AZ.clone(); }
+  // 面内は等方にする (縦横で mm/px が違うと画像が歪む) — 2 軸の細かい方に合わせる
+  const inPlane = Math.min(pitchAlong(ex), pitchAlong(ey));
+  return {
+    vecx: ex.multiplyScalar(inPlane),
+    vecy: headUpVecy(ey.multiplyScalar(inPlane)),
+    vecz: ez.multiplyScalar(pitchAlong(ez)),
+  };
+};
+
 const makeVolumeBoxForPlane = (
   volIdx: number,
   plane: 'axi' | 'cor' | 'sag' | 'mip',
@@ -5380,21 +5746,7 @@ const makeVolumeBoxForPlane = (
   const p0 = voxelToWorld_(new THREE.Vector3(0, 0, 0), volIdx);
   const p1 = voxelToWorld_(new THREE.Vector3(v.nx, v.ny, v.nz), volIdx);
   const center = p0.add(p1).divideScalar(2);
-  let vecx: THREE.Vector3, vecy: THREE.Vector3, vecz: THREE.Vector3;
-  if (plane === 'cor') {
-    vecx = v.vectorX.clone();
-    vecy = headUpVecy(v.vectorZ.clone().normalize().multiplyScalar(v.vectorX.length()));
-    vecz = v.vectorY.clone();
-  } else if (plane === 'sag') {
-    vecx = v.vectorY.clone();
-    vecy = headUpVecy(v.vectorZ.clone().normalize().multiplyScalar(v.vectorY.length()));
-    vecz = v.vectorX.clone();
-  } else {
-    // axial / mip (mip uses axial vectors with isMip=true)
-    vecx = v.vectorX.clone();
-    vecy = v.vectorY.clone();
-    vecz = v.vectorZ.clone();
-  }
+  const { vecx, vecy, vecz } = planeVectorsWorld(v, plane === 'mip' ? 'axi' : plane);
   return {
     clut, myWC: wcWw.wc, myWW: wcWw.ww, description,
     currentSeriesNumber: volIdx, centerInWorld: center,
@@ -5403,24 +5755,8 @@ const makeVolumeBoxForPlane = (
   } as VolumeImageBoxInfo;
 };
 
-// L1 Triplanar PT: 1×3 (PT axial / coronal / sagittal)
-const setupTriplanarPt = async () => {
-  const petIdx = findPetSeriesIndex();
-  if (petIdx < 0) { alert('No PT series found.'); return; }
-  if (!seriesList[petIdx].volume) { if (!mpr_(petIdx)) return; }
-  const wcww = { wc: 3, ww: 6 };
-  imageBoxInfos.value[0] = makeVolumeBoxForPlane(petIdx, 'axi', 'PT axial',    1, wcww);
-  imageBoxInfos.value[1] = makeVolumeBoxForPlane(petIdx, 'cor', 'PT coronal',  1, wcww);
-  imageBoxInfos.value[2] = makeVolumeBoxForPlane(petIdx, 'sag', 'PT sagittal', 1, wcww);
-  tileN.value = 3;
-  refreshSegStoreVolumeRefs();
-  autoFitMode.value = true;
-  applyAutoFit();
-  syncImageBox.value = true;
-  await nextTick();
-  if (imb.value) for (const a of imb.value) a.init();
-  show();
-};
+// L1 Triplanar PT (1×3) は廃止 (2026-07)。
+// 「PET Triplanar + MIP (2×2)」= setupPtOnly4up が axial/coronal/sagittal を含み内容が重複していたため。
 
 // L2 Triplanar Fused: 1×3 (Fused axial / coronal / sagittal)
 // Fusion 用 base layer (CT or MR) を探す。CT 優先、なければ MR。
@@ -5457,18 +5793,8 @@ const setupTriplanarFused = async () => {
   const baseWW = base.modality === 'CT' ? 400 : 1000;
   const labelPrefix = base.modality === 'CT' ? 'Fused' : 'Fused (MR+PT)';
   const makeFused = (plane: 'axi' | 'cor' | 'sag', desc: string): FusedVolumeImageBoxInfo => {
-    let vecx: THREE.Vector3, vecy: THREE.Vector3, vecz: THREE.Vector3;
-    if (plane === 'cor') {
-      vecx = baseVol.vectorX.clone();
-      vecy = headUpVecy(baseVol.vectorZ.clone().normalize().multiplyScalar(baseVol.vectorX.length()));
-      vecz = baseVol.vectorY.clone();
-    } else if (plane === 'sag') {
-      vecx = baseVol.vectorY.clone();
-      vecy = headUpVecy(baseVol.vectorZ.clone().normalize().multiplyScalar(baseVol.vectorY.length()));
-      vecz = baseVol.vectorX.clone();
-    } else {
-      vecx = baseVol.vectorX.clone(); vecy = baseVol.vectorY.clone(); vecz = baseVol.vectorZ.clone();
-    }
+    // world 軸ベースで断面を作る (index 軸だと coronal/sagittal 撮像で軸が入れ替わる)
+    const { vecx, vecy, vecz } = planeVectorsWorld(baseVol, plane);
     return {
       centerInWorld: baseCenter.clone(), vecx, vecy, vecz,
       clut: 0, clut1: 2,
@@ -5730,27 +6056,16 @@ provide('getSliceCount', (seriesIdx: number): number => {
 // パススルーに使う (Load mask / Export PDF は file I/O・病変集計が panel 側にあるため)。
 const segPanelRef = ref<any>(null);
 
-// 右 Inspector (Segmentation) は volume viewer のときだけ出す。
-// plain DICOM viewer (生スライス box のみ) や空状態では隠す (segmentation は volume 前提)。
-//
-// **isAnyVolumeBox は使えない**: isVolumeImageBoxInfo は `"clut" in info` で判定するが、
-// defaultInfo() (plain DICOM box) も stray な `clut: 0` を持つため plain box でも true に
-// なる (ソース内の「プロパティ名を変更したときにバグった」警告どおりの罠)。
-// ここは 3D 幾何 centerInWorld の有無で判定する — VolumeImageBoxInfo /
-// FusedVolumeImageBoxInfo だけが持ち、DicomSliceImageBoxInfo は持たない。
-const isVolumeLikeBox = (i: number): boolean => {
-  const info = imageBoxInfos.value[i] as any;
-  return !!info && ('centerInWorld' in info);
-};
-const anyVolumeBoxPresent = computed(() => {
-  const n = Math.min(tileN.value ?? 0, imageBoxInfos.value.length);
-  for (let i = 0; i < n; i++) { if (isVolumeLikeBox(i)) return true; }
-  return false;
-});
-watch(anyVolumeBoxPresent, (has) => { inspector.value = has; }, { immediate: true });
+// 右 Inspector (Segmentation) の開閉は **明示的なイベントだけ** で決める。watch で自動追従させない。
+//   閉じる: 起動時 (App の drawerRight=false) / ロード直後 (autoLayoutAfterLoad) / Close all
+//   開く  : MTV measurement (openInspectorForMtv) / ユーザのトグルボタン
+// 以前は「volume box が無くなったら閉じる」watch を置いていたが、レイアウト再構築の途中で
+// volume box が一瞬 0 になるため、開いた直後に勝手に閉じてしまっていた (パネルが出ない不具合)。
+// 遅延判定でごまかすより、自動クローズ自体を持たない方が確実で、要件もすべて満たせる。
 
 defineExpose({
   setupPetStandardView,
+  openInspectorForMtv,
   // App-bar ハンバーガー用: Segmentation panel の save/load パススルー
   segLoadMask: () => segPanelRef.value?.loadMask?.(),
   segExportPdf: () => segPanelRef.value?.exportPdf?.(),
@@ -5770,7 +6085,6 @@ defineExpose({
   // 統合 Undo / Redo (App-bar の Undo/Redo ボタン用)
   undoLastAction,
   redoLastAction,
-  setupTriplanarPt,
   setupTriplanarFused,
   setupPtOnly4up,
   setupCompare2up,
@@ -5946,7 +6260,7 @@ defineExpose({
         @dragenter="dragEnter"
         @dragleave="dragLeave"
         @dragover.prevent
-        @drop.prevent="(e: DragEvent) => dropFile(e, i-1)"
+        @drop.prevent.stop="(e: DragEvent) => dropFile(e, i-1)"
         :isEnter="isEnter"
         :selected="i-1 === selectedImageBoxId"
         :modality-label="getBoxModalityLabel(i-1)"
@@ -6005,6 +6319,10 @@ defineExpose({
         @back-to-dicom="onBackToDicom(i-1)"
         :paging="getBoxPaging(i-1)"
         @set-paging-index="(idx: number) => onSetPagingIndex(i-1, idx)"
+        :register-busy="boxRegisterBusy === i-1"
+        @auto-register="onBoxAutoRegister(i-1)"
+        @reset-register="onBoxResetRegister(i-1)"
+        @pick-fusion="onOpenFusionPicker(i-1)"
       />
     </div>
 
@@ -6088,6 +6406,48 @@ defineExpose({
         <v-btn variant="flat" color="primary" @click="onRecoverYes">
           Recover
           <v-tooltip activator="parent" location="top">Load the auto-saved mask, replacing the current segmentation</v-tooltip>
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <!-- Fuse with… : 重ねる相手を提案付きで選ぶ。
+       候補は絞り込まず、推奨 (同 FrameOfReference の PT×CT) を上に出して理由を添えるだけ。
+       イレギュラーな組み合わせ (別 study の診断 CT に PET 等) も下に並ぶので選べる。 -->
+  <v-dialog v-model="fusionDialog.open" max-width="640">
+    <v-card>
+      <v-card-title class="text-body-1">
+        Fuse onto <span class="text-primary">{{ fusionDialog.baseLabel }}</span>
+      </v-card-title>
+      <v-card-text class="pt-0">
+        <div class="text-caption text-disabled mb-2">
+          Pick the series to overlay. Items marked <b>recommended</b> share this box's frame of
+          reference, so they are already spatially aligned.
+        </div>
+        <v-list density="compact" class="mv-fusion-list">
+          <v-list-item
+            v-for="c in fusionDialog.candidates"
+            :key="c.idx"
+            @click="onPickFusionCandidate(c.idx)"
+          >
+            <template #prepend>
+              <span class="modality-chip" :class="{ 'is-pt': c.modality === 'PT' || c.modality === 'PET', 'is-ct': c.modality === 'CT' }">
+                {{ c.modality || '?' }}
+              </span>
+            </template>
+            <v-list-item-title>
+              {{ c.label }}
+              <v-chip v-if="c.recommended" size="x-small" color="primary" variant="flat" class="ml-2">recommended</v-chip>
+            </v-list-item-title>
+            <v-list-item-subtitle>{{ c.nFrames }} frames · {{ c.reason }}</v-list-item-subtitle>
+          </v-list-item>
+        </v-list>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="fusionDialog.open = false">
+          Cancel
+          <v-tooltip activator="parent" location="top">Close without fusing</v-tooltip>
         </v-btn>
       </v-card-actions>
     </v-card>

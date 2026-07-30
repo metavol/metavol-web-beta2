@@ -36,3 +36,6 @@ sample-data/*
 
 # Test screenshots from Playwright runs
 /*.png
+
+# Dev-only canvas captures (vite devScreenshotPlugin)
+.screenshots/
