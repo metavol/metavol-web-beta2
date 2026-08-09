@@ -99,10 +99,11 @@ const setModality = (e: MouseEvent, index: number, modality: 'PT' | 'CT' | 'MR')
     emit('setModality', { index, modality });
 };
 
-// Primary / Other 分離 (Other はデフォルト非表示、トグルで展開)
-const primarySeries = computed(() => props.series.filter(s => s.isPrimary));
-const otherSeries   = computed(() => props.series.filter(s => !s.isPrimary));
-const showOthers = ref(false);
+// **全シリーズをフラットに表示する。**
+// 以前は isPrimary で Primary / Other に分け、Other を折りたたみに隠していたが、
+// 「MIP なのに見たい」「RGB の合成画も確認したい」といった正当な用途で埋もれてしまう。
+// 分類はせず、読み込んだものは全部そのまま出す (ユーザ指定 2026-07)。
+const allSeries = computed(() => props.series);
 
 // ===== サムネ paging (preview only) =====
 // 各カードごとに「現在プレビュー中の slice index」を保持。wheel で更新。
@@ -152,10 +153,10 @@ const sliceLabelFor = (s: { index: number }): string | null => {
             No series
         </div>
 
-        <!-- Primary series (PET-CT fusion 解析対象) -->
+        <!-- 全シリーズ (分類なし。MIP / RGB / derived も隠さず並べる) -->
         <div
-            v-for="s in primarySeries"
-            :key="`p-${s.index}`"
+            v-for="s in allSeries"
+            :key="`s-${s.index}`"
             class="series-card"
             :class="{ 'is-active-seg': isActiveForSeg(s) }"
             draggable="true"
@@ -271,63 +272,6 @@ const sliceLabelFor = (s: { index: number }): string | null => {
                     <button class="set-mod" title="Register this series as PET — enables SUV and segmentation" @click="(e) => setModality(e, s.index, 'PT')">PT</button>
                     <button class="set-mod" title="Register this series as CT — used as the fusion base layer" @click="(e) => setModality(e, s.index, 'CT')">CT</button>
                     <button class="set-mod" title="Register this series as MR — used as the fusion base layer" @click="(e) => setModality(e, s.index, 'MR')">MR</button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Other (MIP / RGB / DERIVED) — デフォルト非表示、トグルで展開 -->
-        <div v-if="otherSeries.length > 0" class="other-section">
-            <button
-                class="other-toggle"
-                :title="showOthers ? 'Hide secondary series (MIP / RGB / derived)' : 'Show secondary series (MIP / RGB / derived)'"
-                @click="showOthers = !showOthers"
-            >
-                <v-icon
-                    :icon="showOthers ? 'mdi-chevron-down' : 'mdi-chevron-right'"
-                    size="small"
-                />
-                <span>Other ({{ otherSeries.length }})</span>
-                <span class="other-hint">MIP / RGB / derived</span>
-            </button>
-            <div v-if="showOthers">
-                <div
-                    v-for="s in otherSeries"
-                    :key="`o-${s.index}`"
-                    class="series-card is-other"
-                    :class="{ 'is-active-seg': isActiveForSeg(s) }"
-                    draggable="true"
-                    @dragstart="(e: DragEvent) => onCardDragStart(e, s.index)"
-                    :title="'Drag this card onto an image box to load this series'"
-                >
-                    <div
-                        class="thumb"
-                        @wheel="(e: WheelEvent) => onThumbWheel(e, s.index)"
-                        title="Wheel to scrub slices (preview only)"
-                    >
-                        <img v-if="thumbSrcFor(s)" :src="thumbSrcFor(s) as string" draggable="false" />
-                        <div v-else class="thumb-placeholder">
-                            <v-icon icon="mdi-image-off-outline" size="small"></v-icon>
-                        </div>
-                        <span v-if="sliceLabelFor(s)" class="slice-label">{{ sliceLabelFor(s) }}</span>
-                    </div>
-                    <div class="meta">
-                        <div class="row1">
-                            <span class="modality" :style="{ background: modalityChip(s.modality).color }">
-                                {{ modalityChip(s.modality).text }}
-                            </span>
-                            <span
-                                class="source-chip"
-                                :class="{ 'is-dicom': s.sourceType === 'DICOM', 'is-nifti': s.sourceType === 'NIFTI' }"
-                                :title="s.sourceType === 'DICOM' ? 'Loaded from DICOM' : 'Loaded from NIfTI (.nii / .nii.gz)'"
-                            >{{ s.sourceType === 'DICOM' ? 'DCM' : 'NII' }}</span>
-                            <span v-if="s.isRgb" class="rgb-chip" title="Color (RGB) image">RGB</span>
-                        </div>
-                        <div class="desc-row" :title="s.description">{{ s.description }}</div>
-                        <div class="row2">
-                            {{ s.matrixSize }}
-                            <span v-if="s.datatypeName" class="info-pill dtype-pill ml-1" title="Source voxel datatype">{{ s.datatypeName }}</span>
-                        </div>
-                    </div>
                 </div>
             </div>
         </div>
@@ -447,42 +391,6 @@ const sliceLabelFor = (s: { index: number }): string | null => {
     background: rgba(0, 212, 170, 0.05);
 }
 
-/* Other (derived/MIP/RGB) section */
-.series-card.is-other {
-    opacity: 0.78;
-}
-.series-card.is-other:hover {
-    opacity: 1;
-}
-.other-section {
-    margin-top: 8px;
-    border-top: 1px solid var(--mv-border);
-    padding-top: 6px;
-}
-.other-toggle {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    width: 100%;
-    background: transparent;
-    border: none;
-    padding: 4px 6px;
-    color: var(--mv-text-dim, #8FA0B0);
-    font-size: 11px;
-    text-align: left;
-    cursor: pointer;
-    border-radius: 3px;
-}
-.other-toggle:hover {
-    background: var(--mv-surface-2);
-    color: var(--mv-text);
-}
-.other-hint {
-    margin-left: auto;
-    font-size: 9px;
-    color: var(--mv-text-muted);
-    font-style: italic;
-}
 .thumb img {
     width: 100%;
     height: 100%;

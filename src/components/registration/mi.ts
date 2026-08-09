@@ -14,12 +14,32 @@ export interface MIStats {
 
 const DEFAULT_BINS = 32;
 
+// 「体内」とみなす下限値を volume 自身の分布から決める。
+// CT なら空気 (-1000 付近) が体積の大半を占めるので、単純な分位点では空気を拾ってしまう。
+// max 側に寄せた分位点を使い、そこから一定割合下を閾値にする。
+const bodyThresholdOf = (vol: Volume): number => {
+    const stride = Math.max(1, Math.floor(vol.voxel.length / 40000));
+    const vals: number[] = [];
+    for (let i = 0; i < vol.voxel.length; i += stride) vals.push(vol.voxel[i]);
+    vals.sort((a, b) => a - b);
+    const p = (q: number) => vals[Math.min(vals.length - 1, Math.max(0, Math.floor(vals.length * q)))];
+    const lo = p(0.02), hi = p(0.98);
+    // lo(≒空気/背景) と hi(≒軟部〜骨/高集積) の間の低め (15%) に線を引く。
+    return lo + (hi - lo) * 0.15;
+};
+
 // Fixed の world 空間にランダム N 点をサンプリング。再現性のため seedable PRNG を使用。
-// PT bounding box から 5%-95% の中央領域を採るので、empty area を避けやすい。
+//
+// **背景 (体外の空気) を採らないこと。** 全身 CT では bounding box の大半が体外の空気で、
+// そのまま一様サンプルすると同時ヒストグラムが「空気×空気」で占められ、MI が
+// 「解剖が合っているか」ではなく「FOV がどれだけ重なっているか」を測る指標に化ける。
+// これが全身 PET/CT で auto-register が外れる主因だった。
+// fixed の値が体内閾値を超える点だけ採用する (rejection sampling)。
 export const generateFixedSamples = (
     fixed: Volume,
     nSamples: number,
     seed = 12345,
+    opts?: { bodyOnly?: boolean },
 ): Float32Array => {
     let s = seed;
     const rng = () => {
@@ -29,26 +49,34 @@ export const generateFixedSamples = (
         t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
         return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
+    const bodyOnly = opts?.bodyOnly !== false;      // 既定 ON
+    const thr = bodyOnly ? bodyThresholdOf(fixed) : -Infinity;
+    const nxny = fixed.nx * fixed.ny;
     const out = new Float32Array(nSamples * 3);
-    for (let i = 0; i < nSamples; i++) {
+    let got = 0;
+    // 体内点が見つからない病的ケースで無限ループしないよう試行回数に上限を置く
+    const maxTries = nSamples * 60;
+    for (let tries = 0; got < nSamples && tries < maxTries; tries++) {
         const u = 0.05 + rng() * 0.9;
         const v = 0.05 + rng() * 0.9;
         const w = 0.05 + rng() * 0.9;
-        // voxel coord → world
         const vx = u * fixed.nx;
         const vy = v * fixed.ny;
         const vz = w * fixed.nz;
-        const wp = new THREE.Vector3(vx, vy, vz);
+        if (bodyOnly) {
+            const i0 = Math.floor(vx), j0 = Math.floor(vy), k0 = Math.floor(vz);
+            const val = fixed.voxel[k0 * nxny + j0 * fixed.nx + i0];
+            if (!(val > thr)) continue;
+        }
         // world = imagePosition + vx*vectorX + vy*vectorY + vz*vectorZ
-        const wx = fixed.imagePosition.x + vx*fixed.vectorX.x + vy*fixed.vectorY.x + vz*fixed.vectorZ.x;
-        const wy = fixed.imagePosition.y + vx*fixed.vectorX.y + vy*fixed.vectorY.y + vz*fixed.vectorZ.y;
-        const wz = fixed.imagePosition.z + vx*fixed.vectorX.z + vy*fixed.vectorY.z + vz*fixed.vectorZ.z;
-        out[i*3]   = wx;
-        out[i*3+1] = wy;
-        out[i*3+2] = wz;
-        void wp;
+        out[got*3]   = fixed.imagePosition.x + vx*fixed.vectorX.x + vy*fixed.vectorY.x + vz*fixed.vectorZ.x;
+        out[got*3+1] = fixed.imagePosition.y + vx*fixed.vectorX.y + vy*fixed.vectorY.y + vz*fixed.vectorZ.y;
+        out[got*3+2] = fixed.imagePosition.z + vx*fixed.vectorX.z + vy*fixed.vectorY.z + vz*fixed.vectorZ.z;
+        got++;
     }
-    return out;
+    // 体内点が全く採れなかった場合は従来どおり一様サンプルにフォールバック
+    if (got === 0 && bodyOnly) return generateFixedSamples(fixed, nSamples, seed, { bodyOnly: false });
+    return got === nSamples ? out : out.slice(0, got * 3);
 };
 
 // 1D trilinear sample
@@ -107,6 +135,14 @@ export const estimateIntensityRange = (
 // Compute negative MI (we minimize this in optimizer; equivalent to maximizing MI).
 // rigid 6 params で moving の coords を「pt-aligned」に変換 (T)。
 // MR voxel sample location for fixed point p = T⁻¹ · p (もし T が moving → fixed の transform なら)。
+// opts.normalized = true で **NMI** (normalized mutual information) を使う。
+//
+// 素の MI は重なった sample 数 n に依存して増減する。位置がずれて overlap が減ると
+// MI も下がるので、一見それらしく見えるが、逆に「overlap さえ増えれば解剖が合っていなくても
+// スコアが良くなる」方向のバイアスがあり、全身 PET/CT のように広く均質な領域が多いデータでは
+// 解剖の一致より FOV の重なりを優先してしまう。
+//   NMI = (H(F) + H(M)) / H(F,M)
+// は overlap の大きさに対して安定で、この種の multi-modality registration の標準的な選択。
 export const computeNegativeMI = (
     fixed: Volume,
     moving: Volume,
@@ -114,6 +150,7 @@ export const computeNegativeMI = (
     stats: MIStats,
     params: RigidParams,
     bins: number = DEFAULT_BINS,
+    opts?: { normalized?: boolean },
 ): number => {
     const T = makeRigidMatrix(params);
     const Tinv = T.clone().invert();
@@ -145,7 +182,15 @@ export const computeNegativeMI = (
     }
     if (n < 100) return 0;  // too few overlap, return neutral
     const inv = 1 / n;
-    let mi = 0;
+    let hF = 0, hM = 0, hJ = 0, mi = 0;
+    for (let f = 0; f < bins; f++) {
+        const pf = histF[f] * inv;
+        if (pf > 0) hF -= pf * Math.log(pf);
+    }
+    for (let m = 0; m < bins; m++) {
+        const pm = histM[m] * inv;
+        if (pm > 0) hM -= pm * Math.log(pm);
+    }
     for (let f = 0; f < bins; f++) {
         const pf = histF[f] * inv;
         if (pf <= 0) continue;
@@ -154,8 +199,14 @@ export const computeNegativeMI = (
             const pj = histJ[fbase + m] * inv;
             if (pj <= 0) continue;
             const pm = histM[m] * inv;
+            hJ -= pj * Math.log(pj);
             mi += pj * Math.log(pj / (pf * pm));
         }
+    }
+    if (opts?.normalized) {
+        if (hJ <= 0) return 0;
+        // NMI は 1 (無相関) 〜 2 (完全一致)。最小化なので符号反転。
+        return -((hF + hM) / hJ);
     }
     // Negative because optimizer minimizes
     return -mi;

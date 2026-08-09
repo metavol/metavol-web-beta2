@@ -43,6 +43,9 @@ export interface SessionPayload {
     currentLabelId: number;
     // ROI state (optional)
     sphere?: { centerWorld: [number, number, number]; radiusMm: number } | null;
+    // 位置合わせ (rigid 6-DOF)。auto-register / 手動調整の結果を series 単位で保持する。
+    // 幾何そのものではなく **撮影時姿勢からの差分**なので、再ロードした volume に後から掛け直せる。
+    registrations?: Array<{ seriesUID: string; params: number[] }>;
     // 注意: 編集履歴 (history / redoStack) は意図的に保存しない (容量肥大化を避けるため)
 }
 

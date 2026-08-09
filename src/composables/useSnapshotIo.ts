@@ -44,6 +44,8 @@ interface MetavolSnapshotFile {
   } | null;
   // 矩形 ROI は PET volume 非依存 (DX 1 枚画像でも置ける) ため top-level に持つ。
   rectRois?: RectRoiJson[];
+  // 位置合わせ (rigid 6-DOF) も PET/mask 非依存 (MR↔CT だけの融合でも起きる) ので top-level。
+  registrations?: Array<{ seriesUID: string; params: number[] }>;
 }
 
 export interface SnapshotIoCtx {
@@ -58,6 +60,9 @@ export interface SnapshotIoCtx {
   show: () => void;
   rectRoiToJson: (r: RectROI) => RectRoiJson;
   importRectRoisFromJson: (arr: unknown) => number;
+  // store に入れた registration を実際の volume 幾何へ掛け直す (適用件数を返す)。
+  // volume を持っているのは DicomView なので、ここからは callback 経由で呼ぶ。
+  applyStoredRegistrations: () => number;
 }
 
 export function useSnapshotIo(ctx: SnapshotIoCtx) {
@@ -151,6 +156,7 @@ export function useSnapshotIo(ctx: SnapshotIoCtx) {
       segmentation,
       // 矩形 ROI は PET 非依存なので segmentation とは別に保存
       rectRois: segStore.rectRois.map(ctx.rectRoiToJson),
+      registrations: segStore.registrations.map(r => ({ seriesUID: r.seriesUID, params: [...r.params] })),
     };
     return JSON.stringify(file);
   };
@@ -203,8 +209,22 @@ export function useSnapshotIo(ctx: SnapshotIoCtx) {
       if (nr > 0) rectMsg = ` + ${nr} rect ROI(s)`;
     }
 
+    // 位置合わせの復元。store に写しを入れてから、DicomView 側で実際の volume に掛け直す。
+    // 対応は seriesUID なので、別症例を開いていれば単に 0 件になる。
+    let regMsg = '';
+    segStore.clearRegistrations();
+    if (Array.isArray(parsed.registrations)) {
+      for (const r of parsed.registrations) {
+        if (r && typeof r.seriesUID === 'string' && Array.isArray(r.params) && r.params.length === 6) {
+          segStore.setRegistration(r.seriesUID, r.params.map(Number));
+        }
+      }
+    }
+    const nReg = ctx.applyStoredRegistrations();
+    if (nReg > 0) regMsg = ` + ${nReg} registration(s)`;
+
     ctx.show();
-    return { ok: true, info: `${view.t} box(es) restored${segMsg}${rectMsg}` };
+    return { ok: true, info: `${view.t} box(es) restored${segMsg}${rectMsg}${regMsg}` };
   };
 
   // File として download / 受け取り。

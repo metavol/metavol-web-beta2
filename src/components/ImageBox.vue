@@ -6,7 +6,7 @@
 //
 
 
-import { ref, computed, onMounted} from 'vue';
+import { ref, computed, onMounted, watch } from 'vue';
 import * as THREE from '@/lib/threeMath';
 import { isWebGpuAvailable } from './webgpu/gpuContext';
 import { gpuRenderMip } from './webgpu/mipPipeline';
@@ -42,7 +42,12 @@ const prop = defineProps<{
   isEnter: boolean;
   modalityLabel?: string;
   description?: string;
-  boxKind?: 'dicom' | 'volume' | 'fusion' | 'mip';
+  // 描画方式。用語定義は CLAUDE.md「ImageBox の用語」参照。
+  //   native = 元スライスをそのまま表示 (再構成なし) / mpr = 再構成して任意断面
+  //   mip / smip / vr = 投影系 (断面を持たない)
+  rendering?: 'native' | 'mpr' | 'mip' | 'smip' | 'vr';
+  // overlay 層を持つか (base + overlay)。mpr/mip/smip/vr のどれとも組み合わさる。
+  fused?: boolean;
   currentPlane?: 'axi' | 'cor' | 'sag' | 'mip' | 'smip' | 'vr' | null;
   currentClut?: number;
   syncEnabled?: boolean;
@@ -97,6 +102,18 @@ const prop = defineProps<{
   paging?: { index: number; min: number; max: number; invert?: boolean } | null;
   // Fusion box の auto-register 実行中か (メニュー項目の無効化 + スピナー)
   registerBusy?: boolean;
+  // Fusion box の手動 alignment 状態。null なら fusion box ではない。
+  // active=true のとき画像上に調整パネルを重ねる。t*/r* は overlay の現在オフセット。
+  manualAlign?: {
+    active: boolean;
+    stepMm: number;
+    stepDeg: number;
+    canUndo: boolean;
+    tx: number; ty: number; tz: number;
+    rx: number; ry: number; rz: number;
+    shift: number;
+    overlayName: string;
+  } | null;
 }>();
 
 const emit = defineEmits<{
@@ -139,6 +156,13 @@ const emit = defineEmits<{
   // Fusion box: overlay を base へ自動位置合わせ / 解除
   (e: 'autoRegister'): void;
   (e: 'resetRegister'): void;
+  // 手動 alignment: モード切替 / 1 ステップ移動・回転 / いまの姿勢から auto で詰める
+  (e: 'toggleManualAlign'): void;
+  (e: 'manualNudge', d: { right?: number; up?: number; through?: number; rot?: number }): void;
+  (e: 'setManualStep', d: { mm?: number; deg?: number }): void;
+  (e: 'refineRegister'): void;
+  (e: 'undoRegister'): void;
+  (e: 'unfuse'): void;
   // 「Fuse with…」: 重ねる相手を選ぶダイアログを開く
   (e: 'pickFusion'): void;
 }>();
@@ -150,11 +174,13 @@ const isOverlayClutActive = (itemId: number): boolean => {
   return (prop.overlayClut & ~1) === itemId;
 };
 
-// Modality chip drag: Volume / Fusion / DicomSlice いずれからも fusion を起動できる。
-// MIP / VR は除外 (drag start handler 側で別途チェック)。
-const isModalityChipDraggable = (): boolean => {
-  return prop.boxKind === 'volume' || prop.boxKind === 'fusion' || prop.boxKind === 'dicom';
-};
+// Modality chip drag: native / mpr から fusion を起動できる。
+// **投影系 (mip/smip/vr) は除外** — 断面が無いので重ねる先にできない。
+// (旧 boxKind 時代は 'mip' が Kind だったので除外できていたが、Kind 統合時に
+//  MIP box も volume 扱いになって除外条件が消えていた。ここで復活させる)
+const isProjection = (): boolean =>
+  prop.rendering === 'mip' || prop.rendering === 'smip' || prop.rendering === 'vr';
+const isModalityChipDraggable = (): boolean => !!prop.rendering && !isProjection();
 
 const isEnter = ref(false);
 
@@ -194,7 +220,8 @@ const modalityChipColor = (m?: string): string => {
   return '#888';
 };
 
-const isVolumeKind = (): boolean => prop.boxKind === 'volume' || prop.boxKind === 'fusion' || prop.boxKind === 'mip';
+// 再構成済み (= native 以外)。mpr / mip / smip / vr。
+const isReconstructed = (): boolean => !!prop.rendering && prop.rendering !== 'native';
 
 const onSavePngLocal = () => {
   if (!cv1.value) return;
@@ -263,6 +290,18 @@ const emptyText = ref('No image');
 //   invert=false: 上端 = index 最小 → value = min + max - index
 //   invert=true : 上端 = index 最大 → value = index
 // (どちらの向きが「頭側が上」になるかは volume のスライス順で変わるため親が判断する)
+// ===== タイトルバーの overflow =====
+// box が狭いとアイコン列がタイトルバー幅を超えて溢れる (ユーザ報告)。
+// 一定幅未満では、modality chip / 説明 / ⋮ / × だけ残して、その他の操作アイコンは
+// ⋮ のポップオーバーへ Teleport で移す。閾値は「chip + 説明 + ⋮ + × +
+// アイコン 6 個ぶん」がぎりぎり入る幅として実測から 300px。
+const TITLEBAR_COMPACT_PX = 300;
+const isCompact = computed(() => (prop.width ?? 0) < TITLEBAR_COMPACT_PX);
+const overflowEl = ref<HTMLElement | null>(null);
+const overflowOpen = ref(false);
+// 広くなったら開きっぱなしを畳む (アイコンは元の位置に戻るのでパネルが空になる)
+watch(isCompact, (c) => { if (!c) overflowOpen.value = false; });
+
 const pagingSliderValue = computed(() => {
   const p = prop.paging;
   if (!p) return 0;
@@ -1531,8 +1570,13 @@ defineExpose({init, show, show2, showRgb, showDirect,
             </span>
 
             <span class="mv-titlebar-actions" @dblclick.stop>
+              <!-- box が狭いとアイコン列がタイトルバーから溢れる。そのときは Teleport で
+                   下の「⋯ (overflow)」ポップオーバーへ **同じ DOM をそのまま移す**。
+                   v-if で 2 系統書くと markup が二重化してメニュー項目の追従漏れが起きるため、
+                   Teleport の :disabled で置き場所だけ切り替える。 -->
+              <Teleport :to="overflowEl" :disabled="!isCompact || !overflowEl">
                 <!-- Volume / Fusion / MIP: 6 plane (axi/cor/sag/mip/smip/vr) + DICOM 2D 戻り -->
-                <v-menu v-if="isVolumeKind()" location="bottom end">
+                <v-menu v-if="isReconstructed()" location="bottom end">
                     <template v-slot:activator="{ props: act }">
                         <v-btn v-bind="act" icon variant="text" size="x-small" class="mv-tb-btn">
                             <v-icon icon="mdi-axis-arrow" size="small" />
@@ -1562,7 +1606,7 @@ defineExpose({init, show, show2, showRgb, showDirect,
 
                 <!-- DicomBox: Make MPR を VolumeBox と完全同一 (6 plane: axi/cor/sag/mip/smip/vr)。
                      クリックで mpr_(seriesIdx, boxId) → setPlaneOnBox(boxId, plane) を親が実行。 -->
-                <v-menu v-else-if="prop.boxKind === 'dicom'" location="bottom end">
+                <v-menu v-else-if="prop.rendering === 'native'" location="bottom end">
                     <template v-slot:activator="{ props: act }">
                         <v-btn v-bind="act" icon variant="text" size="x-small" class="mv-tb-btn">
                             <v-icon icon="mdi-axis-arrow" size="small" />
@@ -1578,7 +1622,7 @@ defineExpose({init, show, show2, showRgb, showDirect,
                 </v-menu>
 
                 <!-- CLUT (single layer: Volume / MIP / VR) -->
-                <v-menu v-if="isVolumeKind() && prop.boxKind !== 'fusion'" location="bottom end">
+                <v-menu v-if="isReconstructed() && !prop.fused" location="bottom end">
                     <template v-slot:activator="{ props: act }">
                         <v-btn v-bind="act" icon variant="text" size="x-small" class="mv-tb-btn">
                             <v-icon icon="mdi-palette" size="small" />
@@ -1595,7 +1639,7 @@ defineExpose({init, show, show2, showRgb, showDirect,
                 </v-menu>
 
                 <!-- CLUT for Fusion: base + overlay の 2 ボタン (どちらか不明問題の対応) -->
-                <v-menu v-if="prop.boxKind === 'fusion'" location="bottom end">
+                <v-menu v-if="prop.fused" location="bottom end">
                     <template v-slot:activator="{ props: act }">
                         <v-btn v-bind="act" icon variant="text" size="x-small" class="mv-tb-btn mv-tb-clut-base">
                             <v-icon icon="mdi-palette" size="small" />
@@ -1612,7 +1656,7 @@ defineExpose({init, show, show2, showRgb, showDirect,
                         </v-list-item>
                     </v-list>
                 </v-menu>
-                <v-menu v-if="prop.boxKind === 'fusion'" location="bottom end">
+                <v-menu v-if="prop.fused" location="bottom end">
                     <template v-slot:activator="{ props: act }">
                         <v-btn v-bind="act" icon variant="text" size="x-small" class="mv-tb-btn mv-tb-clut-ovl">
                             <v-icon icon="mdi-palette" size="small" />
@@ -1636,8 +1680,8 @@ defineExpose({init, show, show2, showRgb, showDirect,
                      VolumeBox:    単一メニュー
                      FusionBox:    2 階層 (Base → / Overlay → → Nearest / Bilinear) -->
                 <v-menu
-                    v-if="prop.boxKind === 'dicom'
-                          || ((prop.boxKind === 'volume' || prop.boxKind === 'fusion')
+                    v-if="prop.rendering === 'native'
+                          || (isReconstructed()
                               && (prop.currentPlane === 'axi' || prop.currentPlane === 'cor' || prop.currentPlane === 'sag'))"
                     location="bottom end"
                 >
@@ -1648,7 +1692,7 @@ defineExpose({init, show, show2, showRgb, showDirect,
                         </v-btn>
                     </template>
                     <!-- DicomSliceBox / VolumeBox: 直接 nearest/bilinear -->
-                    <v-list v-if="prop.boxKind === 'volume' || prop.boxKind === 'dicom'" density="compact">
+                    <v-list v-if="!prop.fused" density="compact">
                         <v-list-item :active="(prop.interpolation ?? 'bilinear') === 'bilinear'"
                                      @click="emit('setInterpolation', { layer: 'base', mode: 'bilinear' })">
                             <v-list-item-title>Bilinear (smooth)</v-list-item-title>
@@ -1856,7 +1900,7 @@ defineExpose({init, show, show2, showRgb, showDirect,
                 <!-- Fusion W/L active layer toggle (Fusion box のみ): Window/Level drag が
                      どっち side に効くか明示。CLUT 同様の disambiguation。 -->
                 <v-btn
-                    v-if="prop.boxKind === 'fusion'"
+                    v-if="prop.fused"
                     icon variant="text" size="x-small"
                     class="mv-tb-btn mv-tb-wl-layer"
                     @click="emit('setActiveWindowLayer', (prop.activeWindowLayer === 'base') ? 'overlay' : 'base')"
@@ -1871,7 +1915,7 @@ defineExpose({init, show, show2, showRgb, showDirect,
                 </v-btn>
 
                 <!-- Fusion blend slider (Fusion box のみ表示) -->
-                <div v-if="prop.boxKind === 'fusion'" class="mv-tb-blend">
+                <div v-if="prop.fused" class="mv-tb-blend">
                     <v-icon icon="mdi-circle-multiple-outline" size="x-small" class="mv-tb-blend-icon" />
                     <v-slider
                         :model-value="prop.overlayAlpha ?? 0.5"
@@ -1909,6 +1953,15 @@ defineExpose({init, show, show2, showRgb, showDirect,
                     <v-icon icon="mdi-arrow-expand" size="small" />
                     <v-tooltip activator="parent" location="bottom">Maximize / Restore</v-tooltip>
                 </v-btn>
+              </Teleport>
+
+                <!-- 狭いときだけ出る overflow ボタン。中身は上の Teleport が流し込む。 -->
+                <v-btn v-if="isCompact" icon variant="text" size="x-small"
+                       :class="['mv-tb-btn', { 'is-on': overflowOpen }]"
+                       @click.stop="overflowOpen = !overflowOpen">
+                    <v-icon icon="mdi-dots-vertical" size="small" />
+                    <v-tooltip activator="parent" location="bottom">Box controls</v-tooltip>
+                </v-btn>
 
                 <v-menu location="bottom end">
                     <template v-slot:activator="{ props: act }">
@@ -1943,7 +1996,7 @@ defineExpose({init, show, show2, showRgb, showDirect,
                         <!-- Fusion box のみ: overlay を base に自動位置合わせ。
                              別 study (異なる FrameOfReference) 同士を d&d で重ねたときは
                              まずズレているので、ここから直せるようにする。 -->
-                        <template v-if="prop.boxKind === 'fusion'">
+                        <template v-if="prop.fused">
                             <v-divider />
                             <v-list-item :disabled="prop.registerBusy" @click="emit('autoRegister')">
                                 <template #prepend>
@@ -1955,9 +2008,28 @@ defineExpose({init, show, show2, showRgb, showDirect,
                                 </v-list-item-title>
                                 <v-list-item-subtitle>Align the overlaid series to this box's base (rigid, MI)</v-list-item-subtitle>
                             </v-list-item>
+                            <!-- manualAlign が null = 投影系 (MIP/sMIP/VR)。断面が無く
+                                 位置合わせの可否を目視できないので項目自体を出さない。 -->
+                            <v-list-item v-if="prop.manualAlign" :disabled="prop.registerBusy"
+                                         @click="emit('toggleManualAlign')">
+                                <template #prepend>
+                                    <v-icon :icon="prop.manualAlign?.active ? 'mdi-check' : 'mdi-cursor-move'" size="small" />
+                                </template>
+                                <v-list-item-title>
+                                    {{ prop.manualAlign?.active ? 'Finish manual alignment' : 'Adjust alignment manually' }}
+                                </v-list-item-title>
+                                <v-list-item-subtitle>Nudge / rotate the overlay by hand when auto-registration is off</v-list-item-subtitle>
+                            </v-list-item>
                             <v-list-item :disabled="prop.registerBusy" @click="emit('resetRegister')">
                                 <template #prepend><v-icon icon="mdi-restore" size="small" /></template>
                                 <v-list-item-title>Reset registration</v-list-item-title>
+                                <v-list-item-subtitle>Put the overlay back where it was acquired</v-list-item-subtitle>
+                            </v-list-item>
+                            <v-divider />
+                            <v-list-item @click="emit('unfuse')">
+                                <template #prepend><v-icon icon="mdi-layers-remove" size="small" /></template>
+                                <v-list-item-title>Remove overlay (unfuse)</v-list-item-title>
+                                <v-list-item-subtitle>Keep the base series only, same view</v-list-item-subtitle>
                             </v-list-item>
                         </template>
                     </v-list>
@@ -1970,6 +2042,12 @@ defineExpose({init, show, show2, showRgb, showDirect,
                 </v-btn>
             </span>
         </div>
+
+        <!-- overflow の受け皿。**常に DOM に置いておく** (v-if で作ると Teleport の
+             ターゲットが消えて中身ごと巻き添えになる)。表示だけ v-show で切り替える。 -->
+        <div class="mv-tb-overflow" ref="overflowEl"
+             v-show="isCompact && overflowOpen"
+             @mousedown.stop @wheel.stop @dblclick.stop @click.stop></div>
 
         <div class="mv-canvas-wrap">
             <canvas ref="cv1" :width="prop.width" :height="prop.height" class="mv-canvas">
@@ -2033,6 +2111,84 @@ defineExpose({init, show, show2, showRgb, showDirect,
                 <div class="mv-paging-readout mv-mono">
                     {{ prop.paging.index - prop.paging.min + 1 }}/{{ prop.paging.max - prop.paging.min + 1 }}
                 </div>
+            </div>
+
+            <!-- 手動 alignment パネル (Fusion box で「Adjust alignment manually」を選んだとき)。
+                 auto-registration が外したときに人が見て直すための操作卓。
+                 移動方向は「画面で見えている向き」= 親が box の vecx/vecy/vecz から world に変換する。 -->
+            <div v-if="prop.manualAlign?.active" class="mv-align-panel"
+                 @mousedown.stop @wheel.stop @dblclick.stop @click.stop>
+                <div class="mv-align-hdr">
+                    <v-icon icon="mdi-cursor-move" size="x-small" />
+                    <span class="mv-align-title">Align overlay</span>
+                    <v-btn icon variant="text" size="x-small" class="mv-align-done"
+                           @click="emit('toggleManualAlign')">
+                        <v-icon icon="mdi-close" size="x-small" />
+                        <v-tooltip activator="parent" location="bottom">Finish manual alignment</v-tooltip>
+                    </v-btn>
+                </div>
+
+                <!-- 3×3 パッド: 四隅に回転と断面方向、十字に面内移動。
+                     行を増やさないよう through-plane を下段の隅に入れてある。 -->
+                <div class="mv-align-pad">
+                    <button class="mv-align-key mv-align-key--rot" title="Rotate counter-clockwise in this plane"
+                            @click="emit('manualNudge', { rot: -1 })">⟲</button>
+                    <button class="mv-align-key" title="Move overlay up (↑)"
+                            @click="emit('manualNudge', { up: 1 })">▲</button>
+                    <button class="mv-align-key mv-align-key--rot" title="Rotate clockwise in this plane"
+                            @click="emit('manualNudge', { rot: 1 })">⟳</button>
+                    <button class="mv-align-key" title="Move overlay left (←)"
+                            @click="emit('manualNudge', { right: -1 })">◀</button>
+                    <span class="mv-align-center mv-mono">{{ prop.manualAlign.stepMm }}</span>
+                    <button class="mv-align-key" title="Move overlay right (→)"
+                            @click="emit('manualNudge', { right: 1 })">▶</button>
+                    <button class="mv-align-key" title="Move overlay toward the viewer (PageUp)"
+                            @click="emit('manualNudge', { through: -1 })">−z</button>
+                    <button class="mv-align-key" title="Move overlay down (↓)"
+                            @click="emit('manualNudge', { up: -1 })">▼</button>
+                    <button class="mv-align-key" title="Move overlay away from the viewer (PageDown)"
+                            @click="emit('manualNudge', { through: 1 })">+z</button>
+                </div>
+
+                <!-- ステップ幅 -->
+                <div class="mv-align-steps">
+                    <button v-for="mm in [0.5, 1, 2, 5, 10]" :key="'mm'+mm"
+                            class="mv-align-step"
+                            :class="{ 'is-on': prop.manualAlign.stepMm === mm }"
+                            :title="`Move ${mm} mm per step`"
+                            @click="emit('setManualStep', { mm })">{{ mm }}</button>
+                    <span class="mv-align-unit">mm</span>
+                    <button v-for="dg in [1, 2, 5]" :key="'dg'+dg"
+                            class="mv-align-step"
+                            :class="{ 'is-on': prop.manualAlign.stepDeg === dg }"
+                            :title="`Rotate ${dg}° per step`"
+                            @click="emit('setManualStep', { deg: dg })">{{ dg }}</button>
+                    <span class="mv-align-unit">°</span>
+                </div>
+
+                <!-- 現在のオフセット -->
+                <div class="mv-align-readout mv-mono">
+                    T {{ prop.manualAlign.tx.toFixed(1) }} {{ prop.manualAlign.ty.toFixed(1) }}
+                    {{ prop.manualAlign.tz.toFixed(1) }} = {{ prop.manualAlign.shift.toFixed(1) }} mm ·
+                    R {{ prop.manualAlign.rx.toFixed(1) }} {{ prop.manualAlign.ry.toFixed(1) }}
+                    {{ prop.manualAlign.rz.toFixed(1) }}°
+                </div>
+
+                <div class="mv-align-actions">
+                    <button class="mv-align-act mv-align-act--undo"
+                            :disabled="prop.registerBusy || !prop.manualAlign.canUndo"
+                            title="Undo the last alignment step (Ctrl+Z)"
+                            @click="emit('undoRegister')">↶</button>
+                    <button class="mv-align-act" :disabled="prop.registerBusy"
+                            title="Run MI registration starting from the pose you set here"
+                            @click="emit('refineRegister')">
+                        {{ prop.registerBusy ? 'Refining…' : 'Refine with auto' }}
+                    </button>
+                    <button class="mv-align-act" :disabled="prop.registerBusy"
+                            title="Put the overlay back where it was acquired"
+                            @click="emit('resetRegister')">Reset</button>
+                </div>
+                <div class="mv-align-hint">Arrow keys move · Shift + drag · Ctrl+Z undo</div>
             </div>
 
             <!-- Color scale legend (Volume / Fusion / MIP のみ) -->
@@ -2139,6 +2295,26 @@ defineExpose({init, show, show2, showRgb, showDirect,
   color: var(--mv-text-dim, #8FA0B0);
   font-size: 11px;
   font-weight: 500;
+}
+
+/* タイトルバー overflow パネル: 狭い box で溢れたアイコン列の退避先。
+   titlebar のすぐ下に重ね、アイコンは折り返して並べる。 */
+.mv-tb-overflow {
+  position: absolute;
+  top: 22px;              /* .mv-titlebar の高さ */
+  right: 2px;
+  z-index: 6;
+  max-width: calc(100% - 4px);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 4px;
+  border: 1px solid var(--mv-border-strong, #3a4a5c);
+  border-radius: 4px;
+  background: rgba(10, 16, 22, 0.94);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
 }
 
 .mv-titlebar-actions {
@@ -2369,6 +2545,113 @@ defineExpose({init, show, show2, showRgb, showDirect,
 }
 .mv-paging:hover .mv-paging-readout {
   opacity: 1;
+}
+
+/* 手動 alignment パネル: 画像の左下に重ねる (右下は legend、右端は paging スライダ)。
+   画像を隠しすぎないよう幅を抑え、半透明にしておく。 */
+.mv-align-panel {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  z-index: 5;
+  width: 152px;
+  /* タイル数が多いと box 自体が小さくなる (16 分割で 243×144px の実測あり)。
+     はみ出して画像外に描かれないよう box 内に収め、入らない分はスクロールに逃がす。 */
+  max-height: calc(100% - 12px);
+  overflow-y: auto;
+  padding: 4px 5px 4px;
+  border: 1px solid var(--mv-accent, #00d4aa);
+  border-radius: 5px;
+  background: rgba(10, 16, 22, 0.86);
+  color: var(--mv-text, #e8eef2);
+  font-size: 10px;
+  user-select: none;
+}
+.mv-align-hdr {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-bottom: 4px;
+  color: var(--mv-accent, #00d4aa);
+}
+.mv-align-title { font-weight: 700; letter-spacing: 0.04em; flex: 1 1 auto; }
+.mv-align-done { margin-right: -4px; }
+.mv-align-pad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2px;
+}
+.mv-align-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: var(--mv-text-muted, #5a6877);
+}
+.mv-align-key {
+  border: 1px solid var(--mv-border-strong, #3a4a5c);
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.05);
+  color: inherit;
+  font-size: 10px;
+  line-height: 1;
+  padding: 3px 0;
+  cursor: pointer;
+}
+.mv-align-key:hover { background: rgba(0, 212, 170, 0.22); border-color: var(--mv-accent, #00d4aa); }
+.mv-align-key:active { transform: scale(0.94); }
+.mv-align-key--rot { color: var(--mv-warning, #ffb454); font-size: 12px; }
+.mv-align-steps {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+.mv-align-unit { color: var(--mv-text-muted, #5a6877); margin-right: 3px; }
+.mv-align-step {
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.05);
+  color: inherit;
+  font-size: 9px;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+.mv-align-step.is-on {
+  background: rgba(0, 212, 170, 0.22);
+  border-color: var(--mv-accent, #00d4aa);
+  color: var(--mv-accent, #00d4aa);
+}
+.mv-align-readout {
+  margin-top: 4px;
+  font-size: 8.5px;
+  line-height: 1.3;
+  color: var(--mv-text-dim, #8fa0b0);
+}
+.mv-align-actions {
+  display: flex;
+  gap: 3px;
+  margin-top: 4px;
+}
+.mv-align-act {
+  flex: 1 1 auto;
+  border: 1px solid var(--mv-border-strong, #3a4a5c);
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.05);
+  color: inherit;
+  font-size: 9px;
+  padding: 3px 0;
+  cursor: pointer;
+}
+.mv-align-act:hover:not(:disabled) { background: rgba(0, 212, 170, 0.22); border-color: var(--mv-accent, #00d4aa); }
+.mv-align-act:disabled { opacity: 0.5; cursor: default; }
+/* Undo は記号 1 文字なので伸ばさない */
+.mv-align-act--undo { flex: 0 0 22px; font-size: 11px; }
+.mv-align-hint {
+  margin-top: 4px;
+  font-size: 8px;
+  color: var(--mv-text-muted, #5a6877);
 }
 
 .mv-clut-legend {

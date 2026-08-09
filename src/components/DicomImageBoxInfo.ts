@@ -35,6 +35,11 @@ export type DicomSliceImageBoxInfo = ImageBoxInfoBase &  {
     centerX:number,
     centerY:number
     zoom: number | null,
+    // 最後に描画したときの画像マトリクス (Columns×Rows)。box リサイズ時に fit を
+    // 正確に引き直すために使う (画像サイズを知らないと「fit のままか / 何倍で見ているか」が
+    // 分からず、縦横比が変わる resize で埋まりきらない)。描画時に showImage が入れる。
+    imgW?: number,
+    imgH?: number,
     // Sampling 補間モード。default 'bilinear' (滑らか)。'nearest' で voxel 境界くっきり。
     interpolation?: Interpolation,
 }

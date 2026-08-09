@@ -63,3 +63,41 @@ export const applyRigidToVolume = (
 export const resetRegistration = (vol: Volume, snapshot: RegistrationSnapshot): void => {
     applyRigidToVolume(vol, snapshot, IDENTITY_PARAMS);
 };
+
+// ===== 手動調整 (mis-registration の救済) =====
+//
+// `makeRigidMatrix` の回転は **world 原点まわり**。パラメータの rx/ry/rz に直接
+// 角度を足すと、原点から数百 mm 離れた体幹部は大きく飛んでしまい手動調整に使えない。
+// そこで手動側は「world 空間の delta 行列を **左から** 掛けて再分解する」形に統一する:
+//
+//     M_new = Δ · M_old        (Δ = world 空間の剛体変換)
+//
+// 見えている場所を中心に回したいときは Δ = T(c)·R·T(-c) を渡す (`rotationDeltaAbout`)。
+// こうしておけば手動調整の結果も同じ RigidParams 1 本で表現でき、
+// そのまま auto-registration の開始姿勢として渡せる。
+
+export const paramsFromMatrix = (m: THREE.Matrix4): RigidParams => {
+    const pos = new THREE.Vector3();
+    const quat = new THREE.Quaternion();
+    const scl = new THREE.Vector3();
+    m.decompose(pos, quat, scl);
+    const e = new THREE.Euler().setFromQuaternion(quat, 'XYZ');
+    return [pos.x, pos.y, pos.z, e.x, e.y, e.z];
+};
+
+export const composeWorldDelta = (p: RigidParams, delta: THREE.Matrix4): RigidParams =>
+    paramsFromMatrix(delta.clone().multiply(makeRigidMatrix(p)));
+
+export const translationDelta = (v: THREE.Vector3): THREE.Matrix4 =>
+    new THREE.Matrix4().makeTranslation(v.x, v.y, v.z);
+
+export const rotationDeltaAbout = (
+    axis: THREE.Vector3,
+    angleRad: number,
+    center: THREE.Vector3,
+): THREE.Matrix4 => {
+    const r = new THREE.Matrix4().makeRotationAxis(axis.clone().normalize(), angleRad);
+    const toOrigin = new THREE.Matrix4().makeTranslation(-center.x, -center.y, -center.z);
+    const back = new THREE.Matrix4().makeTranslation(center.x, center.y, center.z);
+    return back.multiply(r).multiply(toOrigin);
+};

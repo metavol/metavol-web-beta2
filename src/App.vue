@@ -1,6 +1,7 @@
 <template>
   <v-app>
-    <v-app-bar class="mv-appbar" flat density="compact" :height="48">
+    <!-- 高さは app.scss の --mv-appbar-h と一致させること (v-app-bar は数値指定が必要) -->
+    <v-app-bar class="mv-appbar" flat density="compact" :height="APPBAR_H">
       <template v-slot:prepend>
         <v-menu>
           <template v-slot:activator="{ props: act }">
@@ -200,6 +201,15 @@
               </template>
               <v-list-item-title>Browser support</v-list-item-title>
             </v-list-item>
+
+            <!-- 左サイドバーから移設 (シリーズ一覧が長くなって到達できなくなったため) -->
+            <v-list-item @click="advancedOpen = true">
+              <template v-slot:prepend>
+                <v-icon icon="mdi-flask-outline" size="small" />
+              </template>
+              <v-list-item-title>Advanced tools…</v-list-item-title>
+              <v-list-item-subtitle>Demo phantoms, experiments, series priority rules</v-list-item-subtitle>
+            </v-list-item>
           </v-list>
         </v-menu>
 
@@ -265,6 +275,14 @@
           <v-icon :icon="t.icon" />
           <v-tooltip activator="parent" location="bottom">{{ t.label }}</v-tooltip>
         </v-btn>
+
+        <!-- Window preset: 左サイドバーから移設。読影中に最も触るので常時見える位置に置く。
+             中身は選択中 box の modality (CT / MR / PT) に応じて出し分けるので 1 ボタンで済む。 -->
+        <WindowPresetMenu
+          :modality="selectedBoxModality"
+          @preset-selected="(id: string) => dicomViewRef?.presetSelected?.(id)"
+          @redraw="dicomViewRef?.redraw?.()"
+        />
       </div>
 
       <v-divider vertical class="mx-3" />
@@ -718,6 +736,16 @@
       </v-card>
     </v-dialog>
 
+    <!-- Advanced tools (左サイドバーから移設)。実処理は DicomView 側に残っている。 -->
+    <AdvancedToolsDialog
+      v-model="advancedOpen"
+      @phantomNema="dicomViewRef?.phantomNema?.()"
+      @phantomWholeBody="dicomViewRef?.phantomWholeBody?.()"
+      @phantomWholeBodyPetCt="dicomViewRef?.phantomWholeBodyPetCt?.()"
+      @scrambleSlices="dicomViewRef?.scrambleSlices?.()"
+      @recoverSlices="dicomViewRef?.recoverSlices?.()"
+    />
+
     <DemoOverlay :demo="demo" />
   </v-app>
 </template>
@@ -728,6 +756,8 @@ import DicomView from "./components/DicomView.vue";
 import { getWH, getTileN } from "./components/UrlParser.ts";
 import { useSegmentationStore } from "./stores/segmentation";
 import DicomTagDialog from "./components/DicomTagDialog.vue";
+import WindowPresetMenu from "./components/WindowPresetMenu.vue";
+import AdvancedToolsDialog from "./components/AdvancedToolsDialog.vue";
 import DemoOverlay from "./components/demo/DemoOverlay.vue";
 import { useDemoPlayer } from "./components/demo/useDemoPlayer";
 import { buildDemoApi } from "./components/demo/demoApi";
@@ -793,6 +823,10 @@ const petCtReady = computed(() => {
 
 // 起動時は左サイドバーも隠す (右 Inspector と同じ方針)。空状態では series も設定も無く、
 // 「Drop files here」だけを見せたいため。ロード完了時に DicomView が true にする。
+// app-bar の高さ (px)。**app.scss の --mv-appbar-h と必ず一致させること。**
+// v-app-bar は数値 prop を要求するので CSS 変数を直接渡せず、ここだけ二重管理になる。
+const APPBAR_H = 36;
+
 const drawerLeft = ref(false);
 // 右 Inspector (Segmentation) も起動時は隠す。空状態では測る対象が無いので用が無い。
 // 開くのは MTV measurement を選んだとき (runPetStandardWith) と、ユーザのトグル操作だけ。
@@ -1005,6 +1039,11 @@ const canShowTags = computed<boolean>(() => {
 
 // Browser support dialog
 const browserSupportOpen = ref(false);
+// Advanced tools (phantom / experiments / series priority) — 左サイドバーから移設
+const advancedOpen = ref(false);
+// app-bar の Window preset ボタンが出し分けに使う。選択 box が変わるたびに追従させたいので
+// dicomViewRef 経由の computed にする (exposed な computed はそのまま値として読める)。
+const selectedBoxModality = computed<string>(() => dicomViewRef.value?.selectedBoxModality ?? '');
 const userAgent = computed(() => navigator.userAgent);
 const browserChecks = computed(() => {
   const w = window as unknown as { showDirectoryPicker?: unknown };

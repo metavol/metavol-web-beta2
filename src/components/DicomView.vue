@@ -46,6 +46,9 @@ import { writeNiftiFloat32, buildVolumeSidecarJson } from "./niftiVolumeWriter";
 import { triggerDownload } from "./segmentation/niftiWriter";
 import { solve } from "./linalg";
 import * as THREE from '@/lib/threeMath';
+// 手動 alignment はドラッグ中に毎フレーム呼ぶので静的 import (小さく、重い依存も無い)。
+// registerMrPt / mi は重いので従来どおり動的 import のまま。
+import * as regTf from './registration/transform';
 import {cluts, labelClut} from './Clut.ts';
 import * as nifti from 'nifti-reader-js';
 import { gunzip as fflateGunzip } from 'fflate';
@@ -151,12 +154,68 @@ const setTimeOutInitAndShow = () => {
   }, 10);
 }
 
+// box の表示サイズが変わったら、**画像の倍率もその比で追従させる**。
+// これが無いと、タイトルバーの double-click で最大化しても canvas だけ大きくなり、
+// 画像は元の大きさのまま真ん中に residual として残る (ユーザ報告)。
+//
+// 「再 fit」ではなく **比例スケール** にしてあるのは、ユーザが手で拡大していた場合に
+// その拡大率を失わせないため。fit のままなら fit のまま、2 倍で見ていたなら 2 倍のまま追従する。
+// 倍率は縦横で厳しい方 (min) を採り、収まっていたものが溢れないようにする。
+// **比率は「表示領域」で採ること。** fit 計算 (showImage) が
+//   fitH = (imageBoxH - TITLEBAR_PX) / rows
+// と titlebar 分を引いているので、こちらが生の imageBoxH で比を採ると
+// fit 状態の box が resize のたびに少しずつ fit からずれる (実測 1.14 倍)。
+const TITLEBAR_PX = 22;
+let lastBoxW: number | null = null;
+let lastBoxH: number | null = null;
+
+const scaleBoxContentsToNewSize = () => {
+  const w = imageBoxW.value ?? 0;
+  const h = Math.max(1, (imageBoxH.value ?? 0) - TITLEBAR_PX);
+  if (w <= 0 || (imageBoxH.value ?? 0) <= 0) { lastBoxW = w; lastBoxH = h; return; }
+  if (lastBoxW == null || lastBoxH == null || lastBoxW <= 0 || lastBoxH <= 0) {
+    lastBoxW = w; lastBoxH = h; return;    // 初回は基準を覚えるだけ
+  }
+  const lastW = lastBoxW, lastH = lastBoxH;
+  const r = Math.min(w / lastW, h / lastH);
+  lastBoxW = w; lastBoxH = h;
+  if (!Number.isFinite(r) || r <= 0 || Math.abs(r - 1) < 1e-6) return;
+  for (let i = 0; i < imageBoxInfos.value.length; i++) {
+    const info = imageBoxInfos.value[i] as any;
+    if (!info) continue;
+    if (isDicomSliceImageBoxInfo(i)) {
+      // zoom = box px / 画像 px。まだ fit 前 (null) なら触らない (次の描画で fit される)。
+      if (info.zoom == null) continue;
+      if (info.imgW && info.imgH) {
+        // 画像サイズが分かっているなら **fit の変化率** で更新する。
+        // 単純な min(幅比, 高さ比) だと縦横比が変わる resize で fit から外れる
+        // (16 分割 → 最大化で box は横 4.0 倍・縦 5.1 倍 → 画像は 4.0 倍しか伸びず
+        //  埋まりきらない)。fit 比なら「fit のままは fit のまま、2 倍で見ていたら 2 倍のまま」。
+        const fitOld = Math.min(lastW / info.imgW, lastH / info.imgH);
+        const fitNew = Math.min(w / info.imgW, h / info.imgH);
+        if (fitOld > 0 && fitNew > 0) info.zoom *= (fitNew / fitOld);
+        else info.zoom *= r;
+      } else {
+        info.zoom *= r;
+      }
+    } else if (isAnyVolumeBox(i)) {
+      // vecx/vecy は「1 画面 px あたりの world mm」なので、box が大きくなるほど小さくする
+      if (info.vecx) info.vecx.multiplyScalar(1 / r);
+      if (info.vecy) info.vecy.multiplyScalar(1 / r);
+    }
+  }
+  boxStateVersion.value++;
+};
+
 const imageBoxSizeChanged = () => {
+  scaleBoxContentsToNewSize();
   setTimeOutInitAndShow();
 }
 
-watch(imageBoxW, imageBoxSizeChanged);
-watch(imageBoxH, imageBoxSizeChanged);
+// **W と H はまとめて 1 回で監視する。** 個別 watch にすると、両方同時に変わったとき
+// 「W だけ新・H は旧」の中間状態で先に呼ばれ、min(newW/oldW, 1)=1 となって倍率追従が
+// 打ち消される (100×100 → 200×200 で何も起きない)。配列 watch なら 1 tick 1 回。
+watch([imageBoxW, imageBoxH], imageBoxSizeChanged);
 watch(closingImages, () => {
   if (closingImages.value){
     initializeDicomListsImagesBoxInfos();
@@ -263,7 +322,7 @@ onMounted(() => {
       show();
     },
     getBoxes: () => {
-      const out: Array<{ id: number; kind: string; plane: string; canvas: HTMLCanvasElement | null }> = [];
+      const out: Array<{ id: number; rendering: string; fused: boolean; plane: string; canvas: HTMLCanvasElement | null }> = [];
       if (!imb.value) return out;
       // imb.value[i].cv1 は Vue の auto-unwrap で canvas 要素 (HTMLCanvasElement) が直接得られる。
       // ただし fallback として DOM から `.drop_area canvas` を直接拾う経路も持つ。
@@ -279,7 +338,8 @@ onMounted(() => {
         if (!canvas && domCanvases[i]) canvas = domCanvases[i];
         out.push({
           id: i,
-          kind: getBoxKind(i),
+          rendering: getBoxRendering(i),
+          fused: isBoxFused(i),
           plane: getBoxCurrentPlane(i) ?? '?',
           canvas,
         });
@@ -590,11 +650,14 @@ const recoveryCandidate = ref<SessionPayload | null>(null);
 const showRecoveryDialog = ref(false);
 const lastCheckedRecoveryUid = ref<string | null>(null);
 
-// PT volume が変わったら IndexedDB に対応 session があるか確認、あればダイアログ。
-watch(() => segStore.petVolumeRef?.metadata?.seriesUID ?? null, async (uid) => {
-  if (!uid || uid === lastCheckedRecoveryUid.value) return;
-  lastCheckedRecoveryUid.value = uid;
-
+// PT volume が変わったときにやるのは **tracer の自動判定だけ**。
+//
+// リカバリのダイアログはここでは出さない。PT volume ref は「CT に PET を d&d で重ねた」
+// だけでも張り替わるので、単に見比べたいユーザにまで「前回の測定を復元しますか」を
+// 突きつけることになる (ユーザ報告: 過剰)。復元が意味を持つのは MTV 測定に入るときだけなので、
+// ダイアログは checkRecoveryForCurrentPet() を MTV measurement の入口から明示的に呼ぶ。
+watch(() => segStore.petVolumeRef?.metadata?.seriesUID ?? null, (uid) => {
+  if (!uid) return;
   // Auto-detect tracer from SeriesDescription / StudyDescription.
   // user が tracer を明示選択していない (activeTracerId null) ときだけ走る。
   // Recovery dialog で user が Recover を選ぶと labels/threshold は上書きされるので、
@@ -609,6 +672,14 @@ watch(() => segStore.petVolumeRef?.metadata?.seriesUID ?? null, async (uid) => {
     }
   }
 
+});
+
+// MTV 測定に入るときだけ「前回の続きを復元しますか」を尋ねる。
+// 同じ PT について一度尋ねたら再度は訊かない (lastCheckedRecoveryUid)。
+const checkRecoveryForCurrentPet = async () => {
+  const uid = segStore.petVolumeRef?.metadata?.seriesUID ?? null;
+  if (!uid || uid === lastCheckedRecoveryUid.value) return;
+  lastCheckedRecoveryUid.value = uid;
   try {
     const session = await loadSession(uid);
     if (!session) return;
@@ -619,7 +690,7 @@ watch(() => segStore.petVolumeRef?.metadata?.seriesUID ?? null, async (uid) => {
   } catch (err) {
     console.warn('[auto-save] loadSession failed', err);
   }
-});
+};
 
 const formatRelativeTime = (ts: number): string => {
   const dt = Math.max(0, Date.now() - ts);
@@ -639,6 +710,9 @@ const onRecoverYes = () => {
   if (!res.ok) {
     alert('Could not recover the session: ' + res.reason);
   } else {
+    // restoreFromPersistence は registration を store に写すだけ (volume を持たないため)。
+    // 実際の幾何に掛け直すのはここ。
+    applyStoredRegistrations();
     show();
   }
   recoveryCandidate.value = null;
@@ -711,17 +785,27 @@ const boxInfoAt = (i: number): any | null => {
   if (i == null || i < 0 || i >= arr.length) return null;
   return arr[i] ?? null;
 };
+// box 種別の判定は **その型だけが持つ固有フィールド** で行う。
+//   DICOM box  : currentSliceNumber (生スライス表示。Volume/Fusion は持たない)
+//   Volume 系  : centerInWorld      (3D 幾何。DicomSlice は持たない)
+//   Fusion box : clut1              (overlay レイヤ)
+//
+// **clut を判定に使ってはいけない。** defaultInfo() (= DICOM box) も stray な `clut: 0` を
+// 持つため、旧実装 (`"clut" in info && !("clut1" in info)`) は plain な DICOM box でも
+// true を返していた。getBoxKind は先に DicomSlice を見るので表面化しなかったが、
+// isAnyVolumeBox を直接呼ぶ箇所 (40 以上) は誤判定していた
+// (「plain viewer なのに右 Inspector が開く」等の実害あり)。
 const isDicomSliceImageBoxInfo = (i:number) => {
   const info = boxInfoAt(i);
-  return !!info && ("currentSliceNumber" in info); //この方法では、プロパティ名を変更したときにバグった。
+  return !!info && ("currentSliceNumber" in info);
 }
 const isVolumeImageBoxInfo = (i:number) => {
   const info = boxInfoAt(i);
-  return !!info && ("clut" in info) && !("clut1" in info); //この方法では、プロパティ名を変更したときにバグった。
+  return !!info && ("centerInWorld" in info) && !("clut1" in info);
 }
 const isFusedImageBoxInfo = (i:number) => {
   const info = boxInfoAt(i);
-  return !!info && ("clut1" in info);
+  return !!info && ("centerInWorld" in info) && ("clut1" in info);
 }
 // Volume 系（単独 Volume または Fusion）の判定
 const isAnyVolumeBox = (i:number) => isVolumeImageBoxInfo(i) || isFusedImageBoxInfo(i);
@@ -729,23 +813,45 @@ const isAnyVolumeBox = (i:number) => isVolumeImageBoxInfo(i) || isFusedImageBoxI
 const getSelectedInfo = () => getVolumeImageBoxInfo(selectedImageBoxId.value);
 
 // ---- Title bar 用 helpers ----
-type BoxKind = 'dicom' | 'volume' | 'fusion' | 'mip';
-const getBoxKind = (i: number): BoxKind => {
-  if (i < 0 || i >= imageBoxInfos.value.length) return 'volume';
-  if (isDicomSliceImageBoxInfo(i)) return 'dicom';
-  if (isFusedImageBoxInfo(i)) return 'fusion';
-  if (isVolumeImageBoxInfo(i)) {
-    return getVolumeImageBoxInfo(i).isMip ? 'mip' : 'volume';
-  }
-  return 'volume';
+// ===== box の語彙: Rendering (描画方式) + fused (融合の有無) =====
+//
+// 放射線科の標準語に合わせた 1 軸 + 1 フラグ。用語定義は CLAUDE.md「ImageBox の用語」参照。
+//   Rendering: native = 元スライスをそのまま表示 (再構成なし)
+//              mpr    = 再構成して任意断面
+//              mip    = 最大値投影 / smip = surface MIP / vr = ボリュームレンダリング
+//   fused    : overlay 層を持つか (base + overlay の 2 層)。mpr/mip/smip/vr のどれとも組み合わさる。
+//
+// 以前は Kind(dicom|volume|fusion) × Mode(slice|mip|smip|vr) の 2 軸だったが、
+// 「dicom なら必ず slice」という非直交な制約があり、かつ fusion が Kind と Mode の
+// 両方の意味を持っていた。native/mpr は「描画方式の違い」なので 1 軸にまとめられる。
+type BoxRendering = 'native' | 'mpr' | 'mip' | 'smip' | 'vr';
+
+const getBoxRendering = (i: number): BoxRendering => {
+  if (!isAnyVolumeBox(i)) return 'native';       // DICOM box = 元スライス表示
+  const d = imageBoxInfos.value[i] as VolumeImageBoxInfo;
+  if (d.isVr) return 'vr';
+  if (d.isMip) return d.mip?.isSurface ? 'smip' : 'mip';
+  return 'mpr';
 };
 
+const isBoxFused = (i: number): boolean => isFusedImageBoxInfo(i);
+
+// 断面を持たない描画か (= 投影系: mip / smip / vr)。
+// paging・融合の受け先・cross-ref 線・crosshair が使えないのは、すべてこの条件。
+const isProjectionRendering = (r: BoxRendering): boolean => r === 'mip' || r === 'smip' || r === 'vr';
+// box info 版 (`isMip || isVr` が 12 箇所に散在していたのを 1 つの意味に集約)
+const isProjectionInfo = (a: { isMip?: boolean; isVr?: boolean } | null | undefined): boolean =>
+  !!a && (!!a.isMip || !!a.isVr);
+
 const getBoxModalityLabel = (i: number): string => {
-  const kind = getBoxKind(i);
-  if (kind === 'fusion') return 'Fused';
-  if (kind === 'mip') return 'MIP';
-  if (kind === 'dicom') {
-    const info = getDicomSliceImageBoxInfo(i);
+  // template から呼ばれるので **throw させない** (undefined な box があっても render を止めない)
+  const infoAny = boxInfoAt(i);
+  if (!infoAny) return '';
+  const rendering = getBoxRendering(i);
+  if (isBoxFused(i)) return 'Fused';
+  if (rendering === 'mip') return 'MIP';
+  if (rendering === 'native') {
+    const info = infoAny as DicomSliceImageBoxInfo;
     const s = seriesList[info.currentSeriesNumber];
     if (s && s.myDicom && s.myDicom.length > 0) {
       const m = (s.myDicom[0].string('x00080060') ?? '').toUpperCase();
@@ -754,9 +860,8 @@ const getBoxModalityLabel = (i: number): string => {
     }
     return '2D';
   }
-  // volume
-  const info = getVolumeImageBoxInfo(i);
-  const v = seriesList[info.currentSeriesNumber]?.volume;
+  // volume 系
+  const v = seriesList[(infoAny as VolumeImageBoxInfo).currentSeriesNumber]?.volume;
   return (v?.metadata?.modality ?? 'VOL').toUpperCase();
 };
 
@@ -767,8 +872,8 @@ const getBoxDescription = (i: number): string => {
 
 // 現在の plane を box state から導出。Volume の vecx/vecy/vecz を見て
 // determinePlaneDirection で軸面を判別、isMip / isVr を見て MIP/sMIP/VR を判別。
-// 注意: defaultInfo (未ロードの初期状態) は clut を持つが vecx を持たないため、
-// `isAnyVolumeBox` が true を返しても vecx の defensive check が必須。
+// 判定は centerInWorld ベースになったので defaultInfo (DICOM box) が volume 扱いされることは
+// 無くなったが、vecx 等が未設定の途中状態はあり得るので defensive check は残す。
 const getBoxCurrentPlane = (i: number): 'axi' | 'cor' | 'sag' | 'mip' | 'smip' | 'vr' | null => {
   if (i < 0 || i >= imageBoxInfos.value.length) return null;
   if (!isAnyVolumeBox(i)) return null;
@@ -981,7 +1086,7 @@ const crossRefLinesFor = (i: number): Array<{ x1: number; y1: number; x2: number
   if (i < 0 || i >= imageBoxInfos.value.length) return undefined;
   if (!isAnyVolumeBox(i)) return undefined;
   const ai = imageBoxInfos.value[i] as VolumeImageBoxInfo;
-  if (ai.isMip || ai.isVr) return undefined;
+  if (isProjectionInfo(ai)) return undefined;
   if (!ai.vecx || !ai.vecy || !ai.centerInWorld) return undefined;
 
   const W = imageBoxW.value ?? 0;
@@ -996,7 +1101,7 @@ const crossRefLinesFor = (i: number): Array<{ x1: number; y1: number; x2: number
     if (j === i) continue;
     if (!isAnyVolumeBox(j)) continue;
     const aj = imageBoxInfos.value[j] as VolumeImageBoxInfo;
-    if (aj.isMip || aj.isVr) continue;
+    if (isProjectionInfo(aj)) continue;
     if (!aj.vecz || !aj.centerInWorld) continue;
 
     const nj = aj.vecz;
@@ -1723,10 +1828,9 @@ const importRoisFromJsonFile = async (file: File): Promise<{ ok: boolean; info: 
 };
 
 type LeftButtonFunction = "window" | "pan" | "zoom" | "page" | "sphereROI" | "rectROI" | "polygonROI" | "brushROI" | "assignLabel";
-// const leftButtonFunction = ref<LeftButtonFunction>("none");
-const leftButtonFunctionChanged = (e: LeftButtonFunction) => {
-  leftButtonFunction.value = e;
-};
+// NOTE: leftButtonFunctionChanged / changeSlice_ は Sidebar 専用のハンドラだったが、
+// Sidebar をシリーズ一覧だけに絞った際に呼び出し元が無くなったので削除した
+// (ツール選択は app-bar、slice 送りは縦スライダ / ホイール / カーソルキー)。
 
 const initializeDicomListsImagesBoxInfos = () => {
   bagOfFiles = [];
@@ -1737,20 +1841,6 @@ const initializeDicomListsImagesBoxInfos = () => {
   segStore.setCtVolume(null);
 };
 initializeDicomListsImagesBoxInfos();
-
-const changeSlice_ = (add_number: number) => {
-  const srcId = selectedImageBoxId.value;
-  // world 座標同期 paging (スライス厚差を吸収して同じ断面に揃える)
-  applySyncPaging(srcId, add_number);
-  // crosshair を source box の through-plane vec で連動
-  if (segStore.crosshairWorld && isAnyVolumeBox(srcId)) {
-    const src = imageBoxInfos.value[srcId] as VolumeImageBoxInfo;
-    if (src.vecz && !src.isMip) {
-      segStore.advanceCrosshair(src.vecz, add_number);
-      doOneOrAll(srcId, (i: number) => showImage(i));
-    }
-  }
-}
 
 // スライダ上端を「解剖学的に固定」するための反転フラグ。
 //
@@ -1793,7 +1883,7 @@ const getBoxPaging = (i: number): { index: number; min: number; max: number; inv
   }
   if (!isAnyVolumeBox(i)) return null;
   const a = getVolumeImageBoxInfo(i);
-  if (a.isMip || a.isVr) return null;
+  if (isProjectionInfo(a)) return null;
   const seriesIdx = a.currentSeriesNumber;
   const vol = seriesList[seriesIdx]?.volume;
   if (!vol || !a.vecz || !a.centerInWorld) return null;
@@ -1834,7 +1924,7 @@ const changeSlice = (index: number, add_number: number) => {
     info.currentSliceNumber = temp;
   }else{
     const a = getVolumeImageBoxInfo(index);
-    if ((a.isMip || a.isVr) && a.mip != null){
+    if (isProjectionInfo(a) && a.mip != null){
       // MIP / sMIP / VR は wheel で view angle を回転 (slice paging ではない)
       a.mip.mipAngle += 5*add_number;
       // 角度変更時は fast モードに切替 + 200ms idle で full-res 再描画
@@ -1851,7 +1941,7 @@ const changeSlice = (index: number, add_number: number) => {
 //   centerInWorld += n * ((srcCenter - centerInWorld)·n)   (n = vecz 単位ベクトル)
 const alignBoxThroughPlaneToWorld = (i: number, srcCenter: THREE.Vector3) => {
   const a = getVolumeImageBoxInfo(i);
-  if (a.isMip || a.isVr || !a.vecz) return;
+  if (isProjectionInfo(a) || !a.vecz) return;
   const n = a.vecz.clone().normalize();
   const d = srcCenter.clone().sub(a.centerInWorld).dot(n);
   a.centerInWorld.addScaledVector(n, d);
@@ -1931,6 +2021,25 @@ const setWindowForKind = (i: number, kind: 'pt' | 'anat', wc: number | null, ww:
   if (useOverlay) { info.myWC1 = wc; info.myWW1 = ww; }
   else            { info.myWC = wc;  info.myWW = ww; }
 };
+
+// app-bar の Window preset ボタンが「どの modality のプリセットを出すか」を決めるのに使う。
+// 選択中 box が fusion なら **overlay ではなく active layer** を見る (PT preset が
+// MR/CT 側に当たってしまう不具合を過去に踏んでいるので、W/L の当たり先と揃える)。
+const selectedBoxModality = computed<string>(() => {
+  void boxStateVersion.value;
+  const i = selectedImageBoxId.value;
+  const info = boxInfoAt(i) as any;
+  if (!info) return '';
+  let sIdx = info.currentSeriesNumber;
+  if (isFusedImageBoxInfo(i) && info.activeWindowLayer !== 'base') {
+    sIdx = info.currentSeriesNumber1;
+  }
+  const s = seriesList[sIdx];
+  if (!s) return '';
+  const dl = s.myDicom;
+  if (dl && dl.length > 0) return (dl[0].string('x00080060') ?? '').toUpperCase();
+  return (s.volume?.metadata?.modality ?? '').toUpperCase();
+});
 
 const presetSelected = (e: string) => {
   const id = selectedImageBoxId.value;
@@ -2130,7 +2239,7 @@ const onModalityDragStart = (e: DragEvent, srcBoxId: number) => {
   // Volume / Fusion 経路 (MIP/VR は除外)
   if (!isAnyVolumeBox(srcBoxId)) { e.preventDefault(); return; }
   const a = imageBoxInfos.value[srcBoxId] as VolumeImageBoxInfo;
-  if (a.isMip || a.isVr) { e.preventDefault(); return; }
+  if (isProjectionInfo(a)) { e.preventDefault(); return; }
   const seriesIdx = a.currentSeriesNumber;
   if (seriesIdx == null || seriesIdx < 0 || seriesIdx >= seriesList.length) { e.preventDefault(); return; }
   if (!seriesList[seriesIdx]?.volume) { e.preventDefault(); return; }
@@ -2255,7 +2364,10 @@ const onPickFusionCandidate = (idx: number) => {
 const boxRegisterBusy = ref<number | null>(null);
 const registerSnapshots = new WeakMap<Volume.Volume, any>();
 
-const onBoxAutoRegister = async (boxId: number) => {
+// opts.fromCurrent = true: **いまの姿勢 (手動調整の結果) を開始点**にして MI 最適化する。
+//   手で大まかに合わせてから機械に詰めさせる用途。ユーザが明示的に押したときだけなので
+//   同一 FrameOfReference のスキップも適用しない。
+const onBoxAutoRegister = async (boxId: number, opts?: { fromCurrent?: boolean }) => {
   const info = imageBoxInfos.value[boxId] as FusedVolumeImageBoxInfo | undefined;
   if (!info || !('clut1' in (info as any))) { alert('This box is not a fusion box.'); return; }
   const fixed = seriesList[info.currentSeriesNumber]?.volume;
@@ -2271,12 +2383,65 @@ const onBoxAutoRegister = async (boxId: number) => {
     ]);
     let snap = registerSnapshots.get(moving);
     if (!snap) { snap = tf.captureRegistrationSnapshot(moving); registerSnapshots.set(moving, snap); }
-    tf.applyRigidToVolume(moving, snap, [0, 0, 0, 0, 0, 0]);   // 元の姿勢に戻してから開始
+    // MI は moving の **現在の幾何** に params を掛けて評価するので、開始姿勢は
+    // 必ず identity に戻し、「どこから探すか」は params (startParams) で表現する。
+    const startParams = (opts?.fromCurrent ? [...(snap.currentParams as number[])] : [0, 0, 0, 0, 0, 0]) as any;
+    // auto-register 全体で 1 undo ステップ。以降この関数内は setVolumeRegistration しか
+    // 呼ばない (= push しない) ので、ここで 1 回積めば過不足ない。
+    regUndoLastUid = null;   // 直前の手動 nudge と同一ステップにまとめない
+    pushRegUndo(moving);
+    regUndoLastUid = null;   // 次の手動操作も新しいステップから始める
+    // 元の姿勢に戻してから開始。**store 側も同時に戻す**ので、下の early return
+    // (同一 FoR) で抜けても画面と保存内容が食い違わない。
+    setVolumeRegistration(moving, [0, 0, 0, 0, 0, 0]);
     await new Promise(r => setTimeout(r, 30));                 // spinner を反映
-    const init = estimateInitialParams(fixed, moving);
-    const res = registerMrToPt(fixed, moving, init);
-    tf.applyRigidToVolume(moving, snap, res.params);
-    evictVolumeTexture?.(moving.voxel);   // GPU 側の座標系キャッシュを捨てて貼り直す
+
+    // **同一 FrameOfReference なら位置合わせしない。**
+    // 同 FoR = 同一装置が同一座標系で撮ったもの (PET/CT 一体機など) で、**既に正解**。
+    // ここに MI 最適化を掛けると、MI が装置の位置合わせより「良い」と誤判定して壊す。
+    //   実測 (Hirata の PET TRANSAXIAL × CT TRANSAXIAL+, 同 FoR):
+    //     重心+粗探索あり → 311.6mm 移動 / identity から最適化のみ → それでも 115.2mm 移動。
+    //   MI は全身 PET/CT では十分に鋭くないので、ハードウェアの位置合わせを覆させない。
+    const sameFor = !!frameOfRefOf(info.currentSeriesNumber) &&
+                    frameOfRefOf(info.currentSeriesNumber) === frameOfRefOf(info.currentSeriesNumber1);
+    if (sameFor && !opts?.fromCurrent) {
+      alert('These two series share the same frame of reference — they are already aligned by the scanner. '
+          + 'Auto-registration was skipped so the existing alignment is not disturbed.');
+      return;
+    }
+
+    // 別 FoR (別スキャナ / 別 study を drag&drop で重ねた等) のみ位置合わせする。
+    const mi = await import('./registration/mi');
+    const samples = mi.generateFixedSamples(fixed, 8000, 20260728);
+    const stats = mi.estimateIntensityRange(fixed, moving, samples);
+    const scoreOf = (p: any) => mi.computeNegativeMI(fixed, moving, samples, stats, p);
+
+    const startScore = scoreOf(startParams);
+    const start: any = startParams;
+    // **重心合わせ + 粗探索 (estimateInitialParams) は使わない。**
+    // Hirata20260728 の実測で、この推定は毎回 320〜340mm 飛ばしていた
+    // (正解が分かっている同一 FoR ペアで検証。scripts/reg-eval.mjs)。
+    // しかも「推定が現状より悪ければ採用しない」ガードが効かない — MI がその
+    // 320mm ずれた姿勢を正解姿勢より高く評価するため。指標が信用できない以上、
+    // 初期値を大きく動かす段階は入れない。
+    void estimateInitialParams;
+
+    const res = registerMrToPt(fixed, moving, start);
+    // **最終結果が開始位置より悪ければ適用しない。** registration が状況を悪化させないための保険。
+    const finalScore = scoreOf(res.params);
+    const chosen = finalScore <= startScore ? res.params : start;
+    // 実測上、この MI は全身 PET/CT では補正力が乏しく「ほとんど動かない」ことがある。
+    // 何も起きなかったように見えて不信感を招くので、動かなかったときは手動調整へ誘導する。
+    const movedMm = Math.hypot(chosen[0] - startParams[0], chosen[1] - startParams[1], chosen[2] - startParams[2]);
+    if (movedMm < 2) {
+      alert('Auto-registration could not improve the alignment (it moved the overlay by less than 2 mm).\n\n'
+          + 'Mutual-information registration is weak on whole-body PET/CT. '
+          + 'Use "Adjust alignment manually" to line them up by hand, then "Refine with auto" to polish.');
+    }
+    // NOTE: ここで evictVolumeTexture は **不要**。GPU texture が持つのは voxel だけで、
+    // 幾何 (p00/v01/v10) は描画ごとに CPU 側で volume から作り直して uniform で渡している。
+    // 捨てると数百 MB の再アップロードが走るだけ (手動調整をリアルタイムにするため撤去)。
+    setVolumeRegistration(moving, chosen);
     show();
   } catch (err: any) {
     alert('Registration failed: ' + (err?.message ?? err));
@@ -2291,10 +2456,182 @@ const onBoxResetRegister = async (boxId: number) => {
   if (!moving) return;
   const snap = registerSnapshots.get(moving);
   if (!snap) return;
-  const tf = await import('./registration/transform');
-  tf.applyRigidToVolume(moving, snap, [0, 0, 0, 0, 0, 0]);
-  evictVolumeTexture?.(moving.voxel);
+  pushRegUndo(moving);
+  setVolumeRegistration(moving, [0, 0, 0, 0, 0, 0]);
   show();
+};
+
+// ===== 手動 alignment =====
+//
+// auto-registration が外したとき (MI の局所解、FOV の食い違い、体位差など) に
+// **人が見て直せる**手段。動かすのは fusion box の overlay 側 volume。
+// 操作は「画面で見えている向き」で行う: box の vecx (右) / vecy (下) / vecz (奥) を基準に
+// world の平行移動を作るので、axial でも coronal でも直感どおりに動く。
+const manualAlignBoxId = ref<number | null>(null);
+const manualStepMm = ref(2);
+const manualStepDeg = ref(2);
+// 幾何は THREE.Vector3 の in-place mutation なので Vue は変化を検知できない。
+// パネルの数値表示を追従させるための version カウンタ (boxStateVersion と同じ作法)。
+const manualAlignVersion = ref(0);
+
+const fusedMovingVolume = (boxId: number): Volume.Volume | null => {
+  if (!isFusedImageBoxInfo(boxId)) return null;
+  const info = imageBoxInfos.value[boxId] as FusedVolumeImageBoxInfo;
+  return seriesList[info.currentSeriesNumber1]?.volume ?? null;
+};
+
+const regSnapshotOf = (vol: Volume.Volume) => {
+  let s = registerSnapshots.get(vol);
+  if (!s) { s = regTf.captureRegistrationSnapshot(vol); registerSnapshots.set(vol, s); }
+  return s;
+};
+
+// ===== registration の undo =====
+//
+// mask 編集の履歴 (store の history) とは別建てにしてある。あちらは voxel の sparse diff で、
+// 位置合わせは 6 個の数値なので、同じ仕組みに載せる利点が無く、
+// 「マスクを戻したいのか位置を戻したいのか」が混ざると分かりにくいため。
+// 手動 alignment 中の Ctrl+Z とパネルの ↶ ボタンから引く。永続化はしない。
+const REG_UNDO_MAX = 50;
+const REG_UNDO_COALESCE_MS = 400;
+const regUndoStack = ref<Array<{ seriesUID: string; params: number[] }>>([]);
+let regUndoLastAt = 0;
+let regUndoLastUid: string | null = null;
+
+// 変更の **直前** の姿勢を積む。ドラッグやキーリピートで 1px ずつ積むと使い物にならないので、
+// 同じ series への連続操作が 400ms 以内なら 1 ステップにまとめる。
+const pushRegUndo = (vol: Volume.Volume) => {
+  const uid = vol.metadata?.seriesUID;
+  if (!uid) return;
+  const now = performance.now();
+  if (uid === regUndoLastUid && now - regUndoLastAt < REG_UNDO_COALESCE_MS) {
+    regUndoLastAt = now;
+    return;
+  }
+  const cur = registerSnapshots.get(vol)?.currentParams ?? [0, 0, 0, 0, 0, 0];
+  regUndoStack.value.push({ seriesUID: uid, params: [...(cur as number[])] });
+  if (regUndoStack.value.length > REG_UNDO_MAX) regUndoStack.value.shift();
+  regUndoLastAt = now;
+  regUndoLastUid = uid;
+};
+
+const canUndoRegistration = () => regUndoStack.value.length > 0;
+
+const undoRegistration = (): boolean => {
+  const e = regUndoStack.value.pop();
+  if (!e) return false;
+  regUndoLastUid = null;    // 次の操作は必ず新しいステップとして積む
+  for (const s of seriesList) {
+    const v = s?.volume;
+    if (!v || v.metadata?.seriesUID !== e.seriesUID) continue;
+    setVolumeRegistration(v, e.params);
+    show();
+    return true;
+  }
+  return false;
+};
+
+// volume の幾何を params に合わせ、**永続化用の写しも同時に更新**する。
+// registration を変える経路は必ずここを通すこと (auto / 手動 / reset / snapshot 復元)。
+// そうしないと画面と .mvs / auto-save の内容が食い違う。
+const setVolumeRegistration = (vol: Volume.Volume, params: readonly number[]) => {
+  const snap = regSnapshotOf(vol);
+  regTf.applyRigidToVolume(vol, snap, params as any);
+  segStore.setRegistration(vol.metadata?.seriesUID, params);
+  manualAlignVersion.value++;
+};
+
+// snapshot / auto-save から復元した registration を、いま読み込まれている volume に掛け直す。
+// 対応は **seriesUID**。該当シリーズが無ければ黙って飛ばす (別症例を開いている場合)。
+const applyStoredRegistrations = (): number => {
+  let n = 0;
+  for (const rec of segStore.registrations) {
+    for (const s of seriesList) {
+      const v = s?.volume;
+      if (!v || v.metadata?.seriesUID !== rec.seriesUID) continue;
+      regTf.applyRigidToVolume(v, regSnapshotOf(v), rec.params as any);
+      n++;
+    }
+  }
+  if (n > 0) { manualAlignVersion.value++; show(); }
+  return n;
+};
+
+// 手動 alignment を出してよい box か。
+// **投影系 (MIP/sMIP/VR) は除外する。** 断面が無いので
+//   - through-plane 移動が投影方向そのもので、MIP では見た目がほとんど変わらない
+//   - そもそも投影像では「合っているか」を目視で判断できない
+// ため、調整の場として不適切 (paging を null にしているのと同じ理由)。
+const canManualAlign = (boxId: number): boolean =>
+  isFusedImageBoxInfo(boxId) && !isProjectionInfo(boxInfoAt(boxId));
+
+// パネル表示用: overlay の現在オフセット (translation mm / rotation deg)
+const getBoxManualAlign = (boxId: number) => {
+  void manualAlignVersion.value;
+  if (!canManualAlign(boxId)) return null;
+  const vol = fusedMovingVolume(boxId);
+  const p = (vol ? registerSnapshots.get(vol)?.currentParams : null) ?? [0, 0, 0, 0, 0, 0];
+  const deg = (r: number) => r * 180 / Math.PI;
+  return {
+    active: manualAlignBoxId.value === boxId,
+    stepMm: manualStepMm.value,
+    stepDeg: manualStepDeg.value,
+    canUndo: regUndoStack.value.length > 0,
+    tx: p[0], ty: p[1], tz: p[2],
+    rx: deg(p[3]), ry: deg(p[4]), rz: deg(p[5]),
+    shift: Math.hypot(p[0], p[1], p[2]),
+    overlayName: vol?.metadata?.seriesDescription ?? 'overlay',
+  };
+};
+
+const applyRegDelta = (boxId: number, delta: THREE.Matrix4) => {
+  const vol = fusedMovingVolume(boxId);
+  if (!vol) return;
+  const snap = regSnapshotOf(vol);
+  pushRegUndo(vol);
+  setVolumeRegistration(vol, regTf.composeWorldDelta(snap.currentParams, delta));
+  show();   // 同じ overlay を映している他の box も一緒に更新する
+};
+
+// 画面基準の平行移動 (mm)。right = box の vecx 方向、up = 画面上方向 (= -vecy)、
+// through = vecz 方向 (奥へ)。
+const nudgeRegister = (boxId: number, rightMm: number, upMm: number, throughMm: number) => {
+  const info = imageBoxInfos.value[boxId] as VolumeImageBoxInfo | undefined;
+  if (!info?.vecx || !info.vecy || !info.vecz) return;
+  const d = info.vecx.clone().normalize().multiplyScalar(rightMm)
+    .add(info.vecy.clone().normalize().multiplyScalar(-upMm))
+    .add(info.vecz.clone().normalize().multiplyScalar(throughMm));
+  applyRegDelta(boxId, regTf.translationDelta(d));
+};
+
+// 面内回転。回転中心は **いま見えている断面の中心** (centerInWorld)。
+// volume 重心にすると画面外を軸に回ることがあり、手で合わせる操作としては直感に反する。
+//
+// 回転軸に **vecz を使ってはいけない**。vecz の符号はデータ依存 (スライス順が
+// 頭→足か足→頭か) なので、同じ「⟳」ボタンが症例によって逆回りになる。
+// 画面の右 (vecx) × 下 (vecy) = 奥向き を軸にすれば、正の角度が常に画面上の
+// 時計回りになる (右手系で vecx が vecy 側へ倒れる = right→down = 時計回り)。
+const rotateRegister = (boxId: number, deg: number) => {
+  const info = imageBoxInfos.value[boxId] as VolumeImageBoxInfo | undefined;
+  if (!info?.vecx || !info.vecy || !info.centerInWorld) return;
+  const intoScreen = info.vecx.clone().cross(info.vecy);
+  if (intoScreen.lengthSq() === 0) return;
+  applyRegDelta(boxId, regTf.rotationDeltaAbout(intoScreen, deg * Math.PI / 180, info.centerInWorld));
+};
+
+const onBoxToggleManualAlign = (boxId: number) => {
+  if (manualAlignBoxId.value === boxId) { manualAlignBoxId.value = null; return; }
+  if (!canManualAlign(boxId)) return;   // 投影系 / 非 fusion では開かない
+  manualAlignBoxId.value = boxId;
+  selectedImageBoxId.value = boxId;
+};
+
+const onBoxManualNudge = (boxId: number, e: { right?: number; up?: number; through?: number; rot?: number }) => {
+  if (e.rot) { rotateRegister(boxId, e.rot * manualStepDeg.value); return; }
+  nudgeRegister(boxId,
+    (e.right ?? 0) * manualStepMm.value,
+    (e.up ?? 0) * manualStepMm.value,
+    (e.through ?? 0) * manualStepMm.value);
 };
 
 // series の modality (DICOM タグ優先、無ければ volume metadata)
@@ -2314,7 +2651,7 @@ const shouldFuseOnDrop = (srcSeriesIdx: number, tgtBoxId: number): boolean => {
   const info = imageBoxInfos.value[tgtBoxId] as any;
   if (!info) return false;
   if ('clut1' in info) return true;              // 既に Fusion box → overlay を差し替える形で融合継続
-  if (info.isMip || info.isVr) return false;     // MIP/VR には重ねられない
+  if (isProjectionInfo(info)) return false;     // MIP/VR には重ねられない
   const tgtSeriesIdx = info.currentSeriesNumber;
   if (tgtSeriesIdx == null || tgtSeriesIdx === srcSeriesIdx) return false;
   const src = seriesModality(srcSeriesIdx);
@@ -2357,16 +2694,24 @@ const fuseSeriesIntoBox = (srcSeriesIdx: number, tgtBoxId: number) => {
       return;
     }
     const v = seriesList[tgtSeriesIdx].volume!;
-    const p0 = voxelToWorld_(new THREE.Vector3(0, 0, 0), tgtSeriesIdx);
-    const p1 = voxelToWorld_(new THREE.Vector3(v.nx, v.ny, v.nz), tgtSeriesIdx);
-    tgtCenter = p0.add(p1).divideScalar(2);
-    tgtVecx = v.vectorX.clone();
-    tgtVecy = v.vectorY.clone();
+    // **落とされた側 (通常 CT) の見え方を変えない。**
+    // DICOM box は「zoom = box px / 画像 px」で拡大率を持ち、Volume box は
+    // 「vecx = 1 画面 px あたりの world mm」で持つ。単位が違うので v.vectorX を
+    // そのまま使うと融合した瞬間に倍率が飛ぶ (ユーザ報告)。
+    //   |vectorX| = voxel pitch(mm/画像px) なので、mm/画面px = pitch / zoom。
+    const tgtZoom = tInfo.zoom ?? 1;
+    tgtVecx = v.vectorX.clone().multiplyScalar(1 / tgtZoom);
+    tgtVecy = v.vectorY.clone().multiplyScalar(1 / tgtZoom);
     tgtVecz = v.vectorZ.clone();
+    // 表示中のスライスも保つ (中央スライスへ飛ばない)。pan (centerX/Y) も画像 px なので world へ。
+    const k = Math.min(Math.max(0, tInfo.currentSliceNumber ?? 0), Math.max(0, v.nz - 1));
+    tgtCenter = voxelToWorld_(
+      new THREE.Vector3(v.nx / 2 + (tInfo.centerX ?? 0), v.ny / 2 + (tInfo.centerY ?? 0), k),
+      tgtSeriesIdx);
   } else if (isAnyVolumeBox(tgtBoxId)) {
     // Volume / Fusion target: 既存 plane を保持
     const tgtInfoBefore = imageBoxInfos.value[tgtBoxId] as VolumeImageBoxInfo;
-    if (tgtInfoBefore.isMip || tgtInfoBefore.isVr) {
+    if (isProjectionInfo(tgtInfoBefore)) {
       alert('Cannot fuse onto MIP or VR boxes.');
       return;
     }
@@ -2434,6 +2779,32 @@ const fuseSeriesIntoBox = (srcSeriesIdx: number, tgtBoxId: number) => {
   showImage(tgtBoxId);
 };
 
+// 融合の解除: overlay 層を捨てて **base 単独の Volume box** に戻す。
+// d&d で重ねたあと元に戻す手段が無い、というユーザ報告への対応。
+// 断面・倍率・pan はそのまま引き継ぐ (解除で視野が飛ばない)。
+const unfuseBox = (boxId: number) => {
+  if (!isFusedImageBoxInfo(boxId)) return;
+  const f = imageBoxInfos.value[boxId] as FusedVolumeImageBoxInfo;
+  if (manualAlignBoxId.value === boxId) manualAlignBoxId.value = null;
+  imageBoxInfos.value[boxId] = {
+    clut: f.clut ?? 0,
+    myWC: f.myWC ?? null,
+    myWW: f.myWW ?? null,
+    description: seriesSummaries.value[f.currentSeriesNumber]?.description ?? '',
+    currentSeriesNumber: f.currentSeriesNumber,
+    centerInWorld: f.centerInWorld.clone(),
+    vecx: f.vecx.clone(),
+    vecy: f.vecy.clone(),
+    vecz: f.vecz.clone(),
+    interpolation: f.interpolation,
+    isMip: false,
+    mip: null,
+  } as VolumeImageBoxInfo;
+  refreshSegStoreVolumeRefs();
+  boxStateVersion.value++;
+  showImage(boxId);
+};
+
 const doOneOrAll = (id: number, action: (i:number) => void ) => {
   if (syncImageBox.value){
     for (let i=0; i<imb.value!.length; i++){
@@ -2456,7 +2827,7 @@ const isSyncPagingCompatible = (srcId: number, tgtId: number): boolean => {
   const tgt = imageBoxInfos.value[tgtId] as VolumeImageBoxInfo | undefined;
   if (!src || !tgt) return false;
   // src or tgt が MIP/VR なら paging 連動しない (回転と paging が混在しないように)
-  if (src.isMip || src.isVr || tgt.isMip || tgt.isVr) return false;
+  if (isProjectionInfo(src) || isProjectionInfo(tgt)) return false;
   // DicomSlice は paging 概念に互換性あり
   if (isDicomSliceImageBoxInfo(srcId) || isDicomSliceImageBoxInfo(tgtId)) return true;
   // Volume/Fusion: vecz の方向が平行なら同 plane
@@ -2576,6 +2947,17 @@ const mouseMove = (e: MouseEvent) => {
   // e.buttons のビット: 1=左, 2=右, 4=中。
   if ((e.buttons & 4) !== 0){
     doPan(id, e.movementX, e.movementY);
+    return;
+  }
+
+  // 手動 alignment 中の box: **Shift + 左ドラッグ**で overlay を面内移動。
+  // Shift 必須にしてあるのは、調整中でも window/pan など通常ツールを使えるようにするため。
+  if (manualAlignBoxId.value === id && (e.buttons & 1) !== 0 && e.shiftKey && canManualAlign(id)){
+    const a = imageBoxInfos.value[id] as VolumeImageBoxInfo | undefined;
+    if (a?.vecx && a.vecy){
+      // px → mm は box の vec 長 (1 px あたりの world 距離) で換算。zoom しても手応えが一致する。
+      nudgeRegister(id, e.movementX * a.vecx.length(), -e.movementY * a.vecy.length(), 0);
+    }
     return;
   }
 
@@ -2797,7 +3179,7 @@ const jumpToWorld = (p: THREE.Vector3) => {
   for (let i = 0; i < imageBoxInfos.value.length; i++){
     if (!isAnyVolumeBox(i)) continue;
     const a = getVolumeImageBoxInfo(i);
-    if (a.isMip || a.isVr || !a.centerInWorld) continue;   // 未初期化 box を防御
+    if (isProjectionInfo(a) || !a.centerInWorld) continue;   // 未初期化 box を防御
     a.centerInWorld.copy(p);
   }
   segStore.setCrosshairWorld(p);
@@ -2868,7 +3250,7 @@ const brushMouseDown = (e: MouseEvent) => {
   // polygon と同じく pure Volume box (PT/CT/MR の単独スライス) のみ。MIP/VR は slice 概念が無い。
   if (!isVolumeImageBoxInfo(id)) return;
   const a = getVolumeImageBoxInfo(id);
-  if (a.isMip || a.isVr) return;
+  if (isProjectionInfo(a)) return;
   if (!segStore.petVolumeRef) return;
   const petIdx = findPetSeriesIndex();
   if (petIdx < 0) return;
@@ -2960,6 +3342,8 @@ const brushMouseUp = () => {
 
 // rectROI / brushROI の左ボタン down/up を tool に応じて振り分ける。
 const onBoxMouseDown = (e: MouseEvent) => {
+  // 手動 alignment の Shift+ドラッグ中は ROI 系ツールを起動しない (誤って描かないように)
+  if (e.shiftKey && manualAlignBoxId.value === getIdOfEventOccured(e)) return;
   if (leftButtonFunction.value === "rectROI") rectRoiMouseDown(e);
   else if (leftButtonFunction.value === "brushROI") brushMouseDown(e);
 };
@@ -3123,7 +3507,67 @@ const onDblClick = (e: MouseEvent) => {
   }
 };
 
+// カーソルキー paging: 選択中 (フォーカスのある) box を 1 スライスずつ送る。
+// 方向は **右端の縦スライダと一致**させる (↑ = スライダ上端 = 頭側/腹側/右側)。
+// index の増減で決めると PET と CT でスライス順が逆の症例で上下が食い違うため、
+// getBoxPaging().invert を通して world 基準に揃える (スライダと同じ規則)。
+const PAGING_KEY_STEP: Record<string, number> = {
+  ArrowUp: -1, ArrowLeft: -1,
+  ArrowDown: 1, ArrowRight: 1,
+  PageUp: -10, PageDown: 10,
+};
+
+// 文字入力中 (threshold の数値欄, ラベル rename 等) にキーを奪わない
+const isTypingTarget = (t: EventTarget | null): boolean => {
+  const el = t as HTMLElement | null;
+  if (!el || typeof el.tagName !== "string") return false;
+  const tag = el.tagName.toUpperCase();
+  // Vuetify の slider は input[type=range]。フォーカス時は slider 自身の
+  // 矢印キー処理 (= 同じ paging) に任せる。
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable === true;
+};
+
+const onPagingKey = (e: KeyboardEvent): boolean => {
+  const dir = PAGING_KEY_STEP[e.key];
+  if (dir === undefined) return false;
+  if (e.ctrlKey || e.metaKey || e.altKey) return false;   // ショートカットは奪わない
+  if (isTypingTarget(e.target)) return false;
+  const i = selectedImageBoxId.value;
+  // 投影系 (MIP/sMIP/VR) は断面が無いので null → 何もしない (既定のスクロールも妨げない)
+  const p = getBoxPaging(i);
+  if (!p) return false;
+  const step = p.invert ? -dir : dir;
+  e.preventDefault();
+  onSetPagingIndex(i, p.index + step);
+  return true;
+};
+
+// 手動 alignment 中は、その box に限りカーソルキーを **overlay の移動** に割り当てる。
+// (paging より優先。モードは明示的に ON にしたときだけなので取り違えは起きない)
+const MANUAL_ALIGN_KEY: Record<string, { right?: number; up?: number; through?: number }> = {
+  ArrowLeft: { right: -1 }, ArrowRight: { right: 1 },
+  ArrowUp: { up: 1 }, ArrowDown: { up: -1 },
+  PageUp: { through: 1 }, PageDown: { through: -1 },
+};
+
+const onManualAlignKey = (e: KeyboardEvent): boolean => {
+  const boxId = manualAlignBoxId.value;
+  if (boxId == null || boxId !== selectedImageBoxId.value) return false;
+  // box が閉じられた / fusion でなくなった / MIP に切り替えられた場合はモードを畳んで
+  // paging に戻す (そうしないとカーソルキーが何もしないまま吸われ続ける)
+  if (!canManualAlign(boxId)) { manualAlignBoxId.value = null; return false; }
+  const d = MANUAL_ALIGN_KEY[e.key];
+  if (!d) return false;
+  if (e.ctrlKey || e.metaKey || e.altKey) return false;
+  if (isTypingTarget(e.target)) return false;
+  e.preventDefault();
+  onBoxManualNudge(boxId, d);
+  return true;
+};
+
 const onKeyDown = (e: KeyboardEvent) => {
+  if (onManualAlignKey(e)) return;
+  if (onPagingKey(e)) return;
   if (e.key === "Escape" && segStore.polygon?.inProgress){
     cancelPolygon();
   } else if ((e.key === "z" || e.key === "Z") && (e.ctrlKey || e.metaKey) && e.shiftKey){
@@ -3135,8 +3579,11 @@ const onKeyDown = (e: KeyboardEvent) => {
     e.preventDefault();
     redoLastAction();
   } else if ((e.key === "z" || e.key === "Z") && (e.ctrlKey || e.metaKey)){
-    // Ctrl+Z = undo。マスク編集 (Apply/Clear/polygon/brush/assign) と 矩形 ROI をまとめて巻き戻す
     e.preventDefault();
+    // 手動 alignment 中は **位置合わせ**を 1 ステップ戻す。
+    // マスク編集の履歴とは別建てなので、モードを閉じれば従来どおりマスクの undo に戻る。
+    if (manualAlignBoxId.value != null && undoRegistration()) return;
+    // Ctrl+Z = undo。マスク編集 (Apply/Clear/polygon/brush/assign) と 矩形 ROI をまとめて巻き戻す
     undoLastAction();
   }
 };
@@ -3184,6 +3631,17 @@ const recomputeSphereStats = () => {
 };
 
 // シリーズ idx を box id にロードする (drop ハンドラから呼ばれる)。
+// DICOM box に **別シリーズを載せ替えたとき**は zoom / pan を捨てる。
+// zoom は「box px ÷ 画像 px」の実数で、画像サイズが変われば意味が変わる。
+// 持ち越すと、512² の CT を見ていた box に別マトリクスの Scout が入ったときに
+// 拡大されたまま表示され、全体が見えなくなる (ユーザ報告)。null にしておけば
+// showImage 側の fit 計算 (Math.min(fitW, fitH)) が新しい画像で引き直される。
+const resetDicomBoxView = (info: DicomSliceImageBoxInfo) => {
+  info.zoom = null;
+  info.centerX = 0;
+  info.centerY = 0;
+};
+
 const onSelectSeriesIntoBox = (idx: number, id: number) => {
   if (idx < 0 || idx >= seriesList.length) return;
   if (id < 0 || id >= imageBoxInfos.value.length) return;
@@ -3194,6 +3652,7 @@ const onSelectSeriesIntoBox = (idx: number, id: number) => {
     (info as DicomSliceImageBoxInfo).currentSeriesNumber = idx;
     (info as DicomSliceImageBoxInfo).currentSliceNumber = 0;
     (info as DicomSliceImageBoxInfo).description = seriesSummaries.value[idx]?.description ?? "";
+    resetDicomBoxView(info as DicomSliceImageBoxInfo);
   } else {
     // Volume 表示中: 該当シリーズが volume を持たないなら生成 (box[idx] には影響させない)
     if (!seriesList[idx].volume && seriesList[idx].myDicom){
@@ -3711,10 +4170,9 @@ const loadFiles = (files: FileList | File[]) => {
 // tile 数を増やしてもらう前提で省略。
 const appendNewSeriesAsBoxes = (startSeriesCount: number) => {
   if (seriesList.length <= startSeriesCount) return;
+  // 追加分も **全シリーズ** を box にする (isPrimary で選別しない。初回ロードと同じ方針)
   const newPrimaryIdxs: number[] = [];
-  for (let i = startSeriesCount; i < seriesList.length; i++) {
-    if (seriesSummaries.value[i]?.isPrimary !== false) newPrimaryIdxs.push(i);
-  }
+  for (let i = startSeriesCount; i < seriesList.length; i++) newPrimaryIdxs.push(i);
   if (newPrimaryIdxs.length === 0) return;
 
   const oldTileN = tileN.value ?? 0;
@@ -3745,27 +4203,30 @@ const appendNewSeriesAsBoxes = (startSeriesCount: number) => {
 // loadFiles 完了後に呼ぶ自動レイアウト:
 //   - DICOM / NIfTI ともに「最初は raw 表示」が原則。auto PET Standard は行わない。
 //     ユーザが PET Standard ボタン / Layouts / drag-and-drop で明示的に Fusion を起動する。
-//   - primary シリーズ数に応じて tileN を引き上げ、Box 0..N-1 を対応シリーズに割り当てる。
+//   - **読み込んだ全シリーズ**を tile に並べる (isPrimary による選別はしない)。
 //   - NIfTI volume-only シリーズには Box 自体を Volume Box に昇格させる
 //     (DicomSlice Box は myDicom 必須のため、NIfTI を入れても黒画面になる)。
-//   tileN の上限は MAX_AUTO_TILES (= 9, 3x3 まで)。それ以上のシリーズがある
-//   場合はユーザに手動で tile 数を増やしてもらう。
-const MAX_AUTO_TILES = 9;
+//   tileN の上限は MAX_AUTO_TILES。超える分はユーザに手動で tile 数を増やしてもらう。
+const MAX_AUTO_TILES = 24;
 const autoLayoutAfterLoad = () => {
   if (seriesList.length === 0) return;
 
-  // 通常 multi-series: primary なシリーズだけを tile に並べる
-  // (SR / RTSTRUCT / single-frame PR 等はスキップ。seriesSummaries の isPrimary を信頼)
-  const primaryIdxs: number[] = [];
-  for (let i = 0; i < seriesSummaries.value.length; i++) {
-    if (seriesSummaries.value[i].isPrimary) primaryIdxs.push(i);
-  }
-  // primary が 0 なら Other 含めて 1 つでも見えた方が良いため fallback
-  const idxs = primaryIdxs.length > 0 ? primaryIdxs : seriesList.map((_, i) => i);
+  // **全シリーズを対象にする。** 以前は isPrimary (枚数 20 以上 + 非 RGB) で絞っていたが、
+  // MIP や RGB の合成画も「読み込んだのに出てこない」と分かりにくいので分類をやめた
+  // (左サイドバーの Primary/Other 分けも同時に廃止。ユーザ指定 2026-07)。
+  const idxs = seriesList.map((_, i) => i);
 
   const N = Math.min(MAX_AUTO_TILES, idxs.length);
   if (N <= 0) return;
   tileN.value = N;
+
+  // **tileN を伸ばす前に infos を N 個まで埋める。**
+  // imageBoxInfos の初期長は 8 なので、9 個以上のシリーズを並べると 9 番目以降が
+  // undefined になり、下の `info.currentSeriesNumber = ...` が throw して
+  // **render 関数ごと停止**する (画面が更新されなくなる)。
+  while (imageBoxInfos.value.length < N) {
+    imageBoxInfos.value.push(defaultInfo(imageBoxInfos.value.length));
+  }
 
   // 各 Box i に idxs[i] のシリーズを割り当て。
   // NIfTI volume-only は DicomSlice Box では描画できないため Volume Box に昇格。
@@ -3782,6 +4243,8 @@ const autoLayoutAfterLoad = () => {
       info.currentSeriesNumber = seriesIdx;
       info.currentSliceNumber = 0;
       info.description = seriesSummaries.value[seriesIdx]?.description ?? '';
+      // 逐次ロード中は同じ box に別シリーズが順に載るので、前のシリーズ用の zoom を捨てる
+      resetDicomBoxView(info);
     }
   }
 
@@ -3952,7 +4415,7 @@ const sphereScreenInBox = (i: number): { x: number; y: number } | null => {
   const s = segStore.sphere;
   if (!s || !isVolumeImageBoxInfo(i)) return null;
   const a = getVolumeImageBoxInfo(i);
-  if (a.isMip || a.isVr || !a.vecz) return null;
+  if (isProjectionInfo(a) || !a.vecz) return null;
   const c = s.centerWorld;
   const po = a.centerInWorld;
   const n = a.vecz.clone().normalize();
@@ -4033,6 +4496,10 @@ const show = () => {
 const showImage = (i:number) => {
 
   const info1 = imageBoxInfos.value[i];
+  // tileN が infos より先に伸びる過渡状態 (レイアウト切替や HMR 直後) では
+  // ここが undefined になりうる。判定関数は null 安全だが、この下で info を直接
+  // 読む経路があるので入口でも弾く (CLAUDE.md 2.8 と同じ「throw させない」方針)。
+  if (!info1) return;
 
   // 各 draw メソッドは async (GPU パスは offscreen 描画後に ctx.drawImage する)。
   // アノテーション (polygon / sphere / rect) を同期的に描くと、後から解決する GPU 描画に
@@ -4065,6 +4532,9 @@ const showImage = (i:number) => {
         // const mod = dataSet.string('x00080060');
         const rows = dataSet.int16("x00280010") ?? 512;
         const cols = dataSet.int16("x00280011") ?? 512;
+        // box リサイズ時に fit を正確に引き直すため、描画のたびに画像サイズを控える
+        info.imgW = cols;
+        info.imgH = rows;
 
         // WindowCenter/Width: box の override → DICOM タグ → pixel 値域からの auto-window。
         // DX や Secondary Capture は WC/WW タグを欠くことが多く、その場合に
@@ -4095,8 +4565,7 @@ const showImage = (i:number) => {
           // 注意: 縦は box 全体高 imageBoxH ではなく titlebar (22px) を引いた表示領域。
           //   canvas の buffer は box 全体高だが visible 部分は titlebar より下なので、
           //   titlebar 高を引かないと下端 22px が画面外にはみ出す。
-          //   .mv-titlebar の CSS height = 22px と一致させる。
-          const TITLEBAR_PX = 22;
+          //   .mv-titlebar の CSS height = 22px と一致させる (定数は上部で 1 か所に定義)。
           const fitW = (imageBoxW.value ?? 1) / cols;
           const fitH = Math.max(1, ((imageBoxH.value ?? 1) - TITLEBAR_PX)) / rows;
           info.zoom = Math.min(fitW, fitH);
@@ -4619,6 +5088,7 @@ const {
   show,
   rectRoiToJson,
   importRectRoisFromJson,
+  applyStoredRegistrations,
 });
 
 // 描画パイプラインが使う labelClut を store の各ラベル色から動的生成する。
@@ -5473,7 +5943,10 @@ const computeFitBoxSize = (cols: number, rows: number): { w: number; h: number }
     const sidebarW = drawer.value ? 280 : 0;
     const inspectorW = inspector.value ? 320 : 0;
     availW = Math.max(200, window.innerWidth - sidebarW - inspectorW - 16);
-    availH = Math.max(200, window.innerHeight - 48 - 16);
+    // app-bar 高さは CSS 変数 --mv-appbar-h が唯一の情報源。取れなければ 36 を仮定。
+    const barH = parseFloat(getComputedStyle(document.documentElement)
+      .getPropertyValue('--mv-appbar-h')) || 36;
+    availH = Math.max(200, window.innerHeight - barH - 16);
   }
 
   // noGapMode 時は gap も safety も 0 にして画像エリアいっぱいに敷き詰める。
@@ -5688,6 +6161,10 @@ const setupPetStandardView = async (overridePetIdx?: number, overrideCtIdx?: num
     for (const a of imb.value){ a.init(); }
   }
   show();
+
+  // **ここが MTV 測定の入口。** 前回の続きがあるならこのタイミングでだけ尋ねる
+  // (d&d で PET を重ねただけのユーザには訊かない)。
+  void checkRecoveryForCurrentPet();
 }
 
 // ===== レイアウトプリセット =====
@@ -6066,6 +6543,12 @@ const segPanelRef = ref<any>(null);
 defineExpose({
   setupPetStandardView,
   openInspectorForMtv,
+  // app-bar の Window preset ボタン / ハンバーガーの Advanced ダイアログ用。
+  // どちらも UI は App.vue 側に移したが、実処理は従来どおりここに残っている。
+  presetSelected,
+  selectedBoxModality,
+  phantomNema,
+  phantomWholeBody,
   // App-bar ハンバーガー用: Segmentation panel の save/load パススルー
   segLoadMask: () => segPanelRef.value?.loadMask?.(),
   segExportPdf: () => segPanelRef.value?.exportPdf?.(),
@@ -6146,22 +6629,10 @@ defineExpose({
   >
     <sidebar
       :series-summaries="seriesSummaries"
-      @fileLoaded="loadFile"
-      @dirLoaded="loadFiles"
-      @sort="doSort"
-      @leftButtonFunctionChanged="leftButtonFunctionChanged"
-      @presetSelected="presetSelected"
-      @changeSlice="changeSlice_"
       @setModality="onSetSeriesModality"
       @setActiveForSeg="onSetActiveForSeg"
       @inspectRaw="(p: { index: number }) => inspectNiftiRaw(p.index)"
       @viewHeader="(p: { index: number }) => onViewNiftiHeader(p.index)"
-      @phantomNema="phantomNema"
-      @phantomWholeBody="phantomWholeBody"
-      @phantomWholeBodyPetCt="phantomWholeBodyPetCt"
-      @scrambleSlices="scrambleSlices"
-      @recoverSlices="recoverSlices"
-      @redraw="show"
     />
   </v-navigation-drawer>
 
@@ -6265,7 +6736,8 @@ defineExpose({
         :selected="i-1 === selectedImageBoxId"
         :modality-label="getBoxModalityLabel(i-1)"
         :description="getBoxDescription(i-1)"
-        :box-kind="getBoxKind(i-1)"
+        :rendering="getBoxRendering(i-1)"
+        :fused="isBoxFused(i-1)"
         :current-plane="getBoxCurrentPlane(i-1)"
         :current-clut="getBoxCurrentClut(i-1)"
         :legend="getBoxLegend(i-1)"
@@ -6320,8 +6792,15 @@ defineExpose({
         :paging="getBoxPaging(i-1)"
         @set-paging-index="(idx: number) => onSetPagingIndex(i-1, idx)"
         :register-busy="boxRegisterBusy === i-1"
+        :manual-align="getBoxManualAlign(i-1)"
         @auto-register="onBoxAutoRegister(i-1)"
         @reset-register="onBoxResetRegister(i-1)"
+        @toggle-manual-align="onBoxToggleManualAlign(i-1)"
+        @manual-nudge="(d: any) => onBoxManualNudge(i-1, d)"
+        @set-manual-step="(d: any) => { if (d.mm != null) manualStepMm = d.mm; if (d.deg != null) manualStepDeg = d.deg; }"
+        @refine-register="onBoxAutoRegister(i-1, { fromCurrent: true })"
+        @undo-register="undoRegistration()"
+        @unfuse="unfuseBox(i-1)"
         @pick-fusion="onOpenFusionPicker(i-1)"
       />
     </div>

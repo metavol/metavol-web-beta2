@@ -42,9 +42,13 @@ export const useAutoSave = () => {
     const stopThreshold = watch(() => store.threshold + ':' + store.thresholdUnit, () => scheduleSave());
     const stopSphere    = watch(() => store.sphere?.radiusMm ?? null, () => scheduleSave());
 
+    // 位置合わせ (auto-register / 手動調整) も保存対象。mask とは独立に変わるので個別に監視。
+    // 手動調整はドラッグ中に高頻度で bump されるが、DEBOUNCE_MS で 1 回にまとまる。
+    const stopReg = watch(() => store.registrationVersion, () => scheduleSave());
+
     onUnmounted(() => {
         if (timer != null) clearTimeout(timer);
-        stopMask(); stopLabels(); stopThreshold(); stopSphere();
+        stopMask(); stopLabels(); stopThreshold(); stopSphere(); stopReg();
     });
 
     return {

@@ -7,6 +7,7 @@ export {}
 
 declare module 'vue' {
   export interface GlobalComponents {
+    AdvancedToolsDialog: typeof import('./src/components/AdvancedToolsDialog.vue')['default']
     DebugInspector: typeof import('./src/components/DebugInspector.vue')['default']
     DemoOverlay: typeof import('./src/components/demo/DemoOverlay.vue')['default']
     DicomTagDialog: typeof import('./src/components/DicomTagDialog.vue')['default']
@@ -16,5 +17,6 @@ declare module 'vue' {
     SeriesList: typeof import('./src/components/SeriesList.vue')['default']
     Sidebar: typeof import('./src/components/Sidebar.vue')['default']
     VrTfEditor: typeof import('./src/components/VrTfEditor.vue')['default']
+    WindowPresetMenu: typeof import('./src/components/WindowPresetMenu.vue')['default']
   }
 }

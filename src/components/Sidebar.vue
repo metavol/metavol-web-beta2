@@ -1,8 +1,13 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+// 左サイドバー = **シリーズ一覧だけ**。
+//
+// 以前はこの下に Slice / Window preset / Advanced を積んでいたが、
+// 全シリーズを表示するようにした結果、16 series で一覧だけが 1748px になり (ペインは 700px)、
+// 下のセクションが実質到達不能になった。使用頻度で振り分けて外に出してある:
+//   - Window preset  → app-bar の WindowPresetMenu (最頻用。選択 box の modality で出し分け)
+//   - Slice の 4 ボタン → 廃止 (画像右端の縦スライダ / ホイール / カーソルキーで代替済み)
+//   - Advanced       → ハンバーガー → AdvancedToolsDialog
 import SeriesList from './SeriesList.vue';
-import { useSegmentationStore } from '../stores/segmentation';
-import { loadPriorityRules, savePriorityRules, resetPriorityRules, DEFAULT_RULES, type PriorityRule } from './seriesPriorityRules';
 
 defineProps<{
   seriesSummaries?: Array<{
@@ -29,123 +34,18 @@ defineProps<{
 }>();
 
 const emit = defineEmits([
-  "fileLoaded",
-  "dirLoaded",
-  "leftButtonFunctionChanged",
-  "openSample",
-  "presetSelected",
-  "changeSlice",
-  "phantomNema",
-  "phantomWholeBody",
-  "phantomWholeBodyPetCt",
-  "scrambleSlices",
-  "recoverSlices",
-  "redraw",
   "setModality",
   "setActiveForSeg",
   "inspectRaw",
   "viewHeader",
 ]);
-
-// 最後にクリックした preset を track して active 表示。
-// Reset または window tool で WC/WW を直接いじったら null に戻る (今は前者のみ実装)。
-const activePreset = ref<string | null>(null);
-
-const presetClicked = (e: string) => {
-  if (e === 'Reset') activePreset.value = null;
-  else activePreset.value = e;
-  emit("presetSelected", e);
-};
-const onPresetToggle = (val: string | null | undefined) => {
-  // v-btn-toggle で active が変わったとき: 同じ button をもう 1 度押すと null になる
-  if (val == null) {
-    activePreset.value = null;
-    emit("presetSelected", "Reset");
-  } else {
-    presetClicked(val);
-  }
-};
-const changeSlice = (e: number) => emit("changeSlice", e);
-
-const showAdvanced = ref(false);
-
-// PET Standard 候補スコアリングの編集可能ルール (localStorage 永続化)
-const priorityRules = ref<PriorityRule[]>(loadPriorityRules());
-const onRulesChanged = () => savePriorityRules(priorityRules.value);
-const addRule = () => {
-  priorityRules.value.push({ pattern: '', modality: 'ANY', weight: 1 });
-  onRulesChanged();
-};
-const removeRule = (i: number) => {
-  priorityRules.value.splice(i, 1);
-  onRulesChanged();
-};
-const resetRules = () => {
-  resetPriorityRules();
-  priorityRules.value = [...DEFAULT_RULES];
-};
-
-// CT 用 (HU window)。hint は hover tooltip 用 (実際の WC/WW は DicomView の presetSelected と一致させること)
-const wPresets = [
-  { id: 'Lung',  label: 'Lung',  hint: 'Lung window — WC -700 / WW 1800' },
-  { id: 'Med',   label: 'Med',   hint: 'Mediastinum window — WC 0 / WW 320' },
-  { id: 'Abd',   label: 'Abd',   hint: 'Abdomen window — WC 30 / WW 200' },
-  { id: 'Bone',  label: 'Bone',  hint: 'Bone window — WC 200 / WW 2000' },
-  { id: 'Brain', label: 'Brain', hint: 'Brain window — WC 30 / WW 80' },
-  { id: 'Fat',   label: 'Fat',   hint: 'Fat window — WC 10 / WW 275' },
-];
-
-// MR 用。MR は信号強度が任意単位なので固定 window を作れない。
-// DicomView 側で volume の分位点 (下記 % 点〜その反対側) から wc/ww を算出する。
-const wPresetsMr = [
-  { id: 'MR-AUTO',       label: 'Auto',   hint: 'Window from the 1–99 percentile of this MR volume' },
-  { id: 'MR-AUTO-TIGHT', label: 'Tight',  hint: 'Window from the 5–95 percentile — higher contrast, clips more' },
-  { id: 'MR-AUTO-WIDE',  label: 'Wide',   hint: 'Window from the 0.1–99.9 percentile — keeps extremes visible' },
-];
-
-// PET 用 (SUV window) -- WC = (lo+hi)/2, WW = hi-lo として DicomView 側で展開
-const wPresetsPet = [
-  { id: 'SUV-0-3',  label: '0-3',  hint: 'Display range SUV 0–3 (low uptake, high contrast)' },
-  { id: 'SUV-0-6',  label: '0-6',  hint: 'Display range SUV 0–6 (typical whole-body FDG)' },
-  { id: 'SUV-0-10', label: '0-10', hint: 'Display range SUV 0–10' },
-  { id: 'SUV-0-15', label: '0-15', hint: 'Display range SUV 0–15 (high uptake)' },
-];
-
-// 高レンジ preset (Bq/ml 表示や非 SUV 系で使用)。Other メニューに格納。
-const wPresetsPetOther = [
-  { id: 'SUV-0-100',   label: '0-100'   },
-  { id: 'SUV-0-1000',  label: '0-1000'  },
-  { id: 'SUV-0-10000', label: '0-10000' },
-];
-
-// PT 表示単位 (legend / 4-corner / 入力換算に影響。voxel と内部 WC/WW は SUV のまま)。
-const segStore = useSegmentationStore();
-// NAC PT (= 減衰補正されていない PT) は SUV 換算不可のため SUV モードを禁止し Bq/ml 固定。
-// dicom2volume.ts 側で suvFactor=1 強制 + suvOk=false を設定済み。
-const isNacPt = computed<boolean>(() => {
-  const pt = segStore.petVolumeRef;
-  if (!pt) return false;
-  return pt.metadata?.suvOk === false;
-});
-const petUnit = computed<'SUV' | 'BqMl'>(() => isNacPt.value ? 'BqMl' : segStore.petDisplayUnit);
-const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
-  if (isNacPt.value) return;  // NAC PT では SUV 切替不可
-  if (v === 'SUV' || v === 'BqMl') {
-    segStore.petDisplayUnit = v;
-    emit('redraw');
-  }
-};
 </script>
 
 <template>
   <div class="mv-sidebar">
-
-    <!-- Series -->
-    <section class="mv-section">
-      <div class="mv-section-title">
-        <v-icon icon="mdi-folder-multiple-image" size="x-small" />
-        Series
-      </div>
+    <!-- ヘッダ ("SERIES 16") は置かない。ペインの中身がシリーズ一覧しか無いので
+         見出しは情報を足しておらず、縦を食うだけ (ユーザ指定)。 -->
+    <div class="mv-sidebar-body">
       <SeriesList
         :series="seriesSummaries ?? []"
         @setModality="(p: { index: number; modality: 'PT' | 'CT' | 'MR' }) => emit('setModality', p)"
@@ -153,269 +53,7 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
         @inspectRaw="(p: { index: number }) => emit('inspectRaw', p)"
         @viewHeader="(p: { index: number }) => emit('viewHeader', p)"
       />
-    </section>
-
-    <!-- Slice -->
-    <section class="mv-section">
-      <div class="mv-section-title">
-        <v-icon icon="mdi-layers-triple" size="x-small" />
-        Slice
-      </div>
-      <div class="mv-btn-row">
-        <v-btn size="x-small" variant="tonal" @click="changeSlice(-100000)">
-          <v-icon icon="mdi-arrow-collapse-left" size="small" />
-          <v-tooltip activator="parent" location="bottom">Jump to the first slice</v-tooltip>
-        </v-btn>
-        <v-btn size="x-small" variant="tonal" @click="changeSlice(-1)">
-          <v-icon icon="mdi-arrow-left" size="small" />
-          <v-tooltip activator="parent" location="bottom">Previous slice (or scroll the mouse wheel on an image)</v-tooltip>
-        </v-btn>
-        <v-btn size="x-small" variant="tonal" @click="changeSlice(1)">
-          <v-icon icon="mdi-arrow-right" size="small" />
-          <v-tooltip activator="parent" location="bottom">Next slice (or scroll the mouse wheel on an image)</v-tooltip>
-        </v-btn>
-        <v-btn size="x-small" variant="tonal" @click="changeSlice(100000)">
-          <v-icon icon="mdi-arrow-collapse-right" size="small" />
-          <v-tooltip activator="parent" location="bottom">Jump to the last slice</v-tooltip>
-        </v-btn>
-      </div>
-    </section>
-
-    <!-- Window preset -->
-    <section class="mv-section">
-      <div class="mv-section-title">
-        <v-icon icon="mdi-contrast-circle" size="x-small" />
-        Window preset (CT)
-      </div>
-      <v-btn-toggle
-        :model-value="activePreset"
-        @update:model-value="onPresetToggle"
-        density="compact"
-        variant="outlined"
-        divided
-        class="mv-preset-toggle"
-      >
-        <v-btn
-          v-for="p in wPresets"
-          :key="p.id"
-          :value="p.id"
-          size="x-small"
-        >
-          {{ p.label }}
-          <v-tooltip activator="parent" location="bottom">{{ p.hint }}</v-tooltip>
-        </v-btn>
-      </v-btn-toggle>
-
-      <!-- MR は HU のような絶対値スケールが無いので固定プリセットが作れない。
-           volume の分位点から自動で window を決める方式にする。 -->
-      <div class="mv-section-title mt-3">
-        <v-icon icon="mdi-head-outline" size="x-small" />
-        MR window (auto)
-      </div>
-      <v-btn-toggle
-        :model-value="activePreset"
-        @update:model-value="onPresetToggle"
-        density="compact"
-        variant="outlined"
-        divided
-        class="mv-preset-toggle"
-      >
-        <v-btn
-          v-for="p in wPresetsMr"
-          :key="p.id"
-          :value="p.id"
-          size="x-small"
-        >
-          {{ p.label }}
-          <v-tooltip activator="parent" location="bottom" max-width="260">{{ p.hint }}</v-tooltip>
-        </v-btn>
-      </v-btn-toggle>
-
-      <div class="mv-section-title mt-3 mv-pt-header">
-        <v-icon icon="mdi-radioactive" size="x-small" />
-        <span>PT window</span>
-        <v-btn-toggle
-          :model-value="petUnit"
-          @update:model-value="onPetUnitChange"
-          density="compact"
-          variant="outlined"
-          divided
-          mandatory
-          class="mv-unit-toggle"
-        >
-          <!-- disabled な v-btn では v-tooltip が発火しないため、ここは native title を使う -->
-          <v-btn
-            value="SUV"
-            size="x-small"
-            :disabled="isNacPt"
-            :title="isNacPt
-              ? 'SUV not available for non attenuation-corrected PT'
-              : 'Show PT values as SUVbw (body-weight normalised)'"
-          >SUV</v-btn>
-          <v-btn value="BqMl" size="x-small">
-            Bq/ml
-            <v-tooltip activator="parent" location="bottom">Show PT values as raw activity concentration (Bq/ml) instead of SUV</v-tooltip>
-          </v-btn>
-        </v-btn-toggle>
-      </div>
-      <v-btn-toggle
-        :model-value="activePreset"
-        @update:model-value="onPresetToggle"
-        density="compact"
-        variant="outlined"
-        divided
-        class="mv-preset-toggle"
-      >
-        <v-btn
-          v-for="p in wPresetsPet"
-          :key="p.id"
-          :value="p.id"
-          size="x-small"
-        >
-          {{ p.label }}
-          <v-tooltip activator="parent" location="bottom">{{ p.hint }}</v-tooltip>
-        </v-btn>
-        <v-menu location="bottom">
-          <template v-slot:activator="{ props: act }">
-            <v-btn v-bind="act" size="x-small" :active="!!wPresetsPetOther.find(p => p.id === activePreset)">
-              Other
-              <v-icon icon="mdi-chevron-down" size="x-small" />
-              <v-tooltip activator="parent" location="bottom">High-range display windows (0–100 … 0–10000), e.g. for Bq/ml</v-tooltip>
-            </v-btn>
-          </template>
-          <v-list density="compact">
-            <v-list-item
-              v-for="p in wPresetsPetOther"
-              :key="p.id"
-              :active="activePreset === p.id"
-              @click="onPresetToggle(p.id)"
-            >
-              <v-list-item-title>{{ p.label }}</v-list-item-title>
-            </v-list-item>
-          </v-list>
-        </v-menu>
-      </v-btn-toggle>
-
-      <div class="mv-btn-row mt-2">
-        <v-btn size="x-small" variant="text" @click="presetClicked('Reset')">
-          <v-icon icon="mdi-restart" size="x-small" class="mr-1" />Reset to DICOM tag
-          <v-tooltip activator="parent" location="bottom">Restore the window centre / width stored in the DICOM header</v-tooltip>
-        </v-btn>
-      </div>
-    </section>
-
-    <!-- Demo / Advanced -->
-    <section class="mv-section">
-      <div class="d-flex align-center">
-        <v-btn
-          size="x-small"
-          variant="text"
-          :prepend-icon="showAdvanced ? 'mdi-chevron-down' : 'mdi-chevron-right'"
-          @click="showAdvanced = !showAdvanced"
-        >
-          Advanced
-          <v-tooltip activator="parent" location="bottom">
-            {{ showAdvanced ? 'Hide advanced tools (demo phantoms, experiments, series priority)' : 'Show advanced tools (demo phantoms, experiments, series priority)' }}
-          </v-tooltip>
-        </v-btn>
-      </div>
-
-      <div v-if="showAdvanced" class="mt-2">
-        <div class="mv-section-title">Demo phantoms</div>
-        <div class="mv-btn-row">
-          <v-btn size="x-small" variant="tonal" @click="emit('phantomNema')">
-            NEMA IEC
-            <v-tooltip activator="parent" location="bottom" max-width="260">
-              Generate a NEMA IEC body phantom (6 spheres) for QC — no patient data needed
-            </v-tooltip>
-          </v-btn>
-          <v-btn size="x-small" variant="tonal" @click="emit('phantomWholeBody')">
-            Whole-body PET
-            <v-tooltip activator="parent" location="bottom" max-width="260">
-              Generate a synthetic whole-body FDG PET (brain / heart / liver / kidneys / bladder + 8 lesions)
-            </v-tooltip>
-          </v-btn>
-          <v-btn size="x-small" variant="tonal" @click="emit('phantomWholeBodyPetCt')">
-            Whole-body PET/CT
-            <v-tooltip activator="parent" location="bottom" max-width="260">
-              Generate a matched synthetic CT + PET pair (same world space, so Fusion lines up)
-            </v-tooltip>
-          </v-btn>
-        </div>
-        <div class="text-caption text-disabled mt-1">
-          NEMA IEC: 6 hot spheres in a warm body, cold lung insert.<br />
-          Whole-body PET: synthetic FDG-PET with brain, heart, liver, kidneys, bladder, and 8 metastases.<br />
-          Whole-body PET/CT: paired synthetic CT + PET (cervical-cancer-like geometry) built from
-          geometric shapes; opens as PET Standard.
-        </div>
-
-        <div class="mv-section-title mt-3">Experiments</div>
-        <div class="mv-btn-row">
-          <v-btn size="x-small" variant="tonal" @click="emit('scrambleSlices')">
-            Scramble Z
-            <v-tooltip activator="parent" location="bottom" max-width="260">
-              Research tool: randomly shuffle the selected volume's z-slices (select the target box first)
-            </v-tooltip>
-          </v-btn>
-          <v-btn size="x-small" variant="tonal" @click="emit('recoverSlices')">
-            Recover Z
-            <v-tooltip activator="parent" location="bottom" max-width="260">
-              Research tool: rebuild the slice order from slice-to-slice similarity alone, then report accuracy
-            </v-tooltip>
-          </v-btn>
-        </div>
-        <div class="text-caption text-disabled mt-1">
-          Scramble Z: randomly shuffles the selected volume's z-slices (view coronal/MIP to see it).<br />
-          Recover Z: reorders slices by slice-to-slice similarity (SSD) and reports how well the
-          original order was recovered.
-        </div>
-
-        <!-- PET Standard 候補スコアリングルール (ATTN > NAC、WB > Lung 等) -->
-        <div class="mv-section-title mt-3">Series priority rules</div>
-        <div class="mv-rules-help text-caption text-disabled mb-1">
-          Higher score wins for default PT/CT pick. + boosts, − avoids.
-        </div>
-        <div class="mv-rules-table">
-          <div v-for="(r, i) in priorityRules" :key="i" class="mv-rule-row">
-            <input
-              class="mv-rule-pat"
-              type="text"
-              v-model="r.pattern"
-              placeholder="substring"
-              @change="onRulesChanged"
-            />
-            <select
-              class="mv-rule-mod"
-              v-model="r.modality"
-              @change="onRulesChanged"
-            >
-              <option value="ANY">ANY</option>
-              <option value="PT">PT</option>
-              <option value="CT">CT</option>
-              <option value="MR">MR</option>
-            </select>
-            <input
-              class="mv-rule-w"
-              type="number"
-              v-model.number="r.weight"
-              step="1"
-              @change="onRulesChanged"
-            />
-            <button class="mv-rule-del" @click="removeRule(i)" title="Delete rule">×</button>
-          </div>
-        </div>
-        <div class="mv-btn-row mt-1">
-          <v-btn size="x-small" variant="tonal" @click="addRule">
-            + Add
-            <v-tooltip activator="parent" location="bottom">Add a series-priority rule (pattern + modality + weight)</v-tooltip>
-          </v-btn>
-          <v-btn size="x-small" variant="text" @click="resetRules">
-            Reset to defaults
-            <v-tooltip activator="parent" location="bottom">Discard your rules and restore the built-in series-priority defaults</v-tooltip>
-          </v-btn>
-        </div>
-      </div>
-    </section>
+    </div>
   </div>
 </template>
 
@@ -425,96 +63,12 @@ const onPetUnitChange = (v: 'SUV' | 'BqMl' | null | undefined) => {
   display: flex;
   flex-direction: column;
   padding-top: 4px;
+  min-height: 0;
 }
-
-/* Window preset segmented control: 横一杯に 6 等分、各 btn を細めに */
-.mv-preset-toggle {
-  width: 100%;
-}
-
-/* PT 単位トグル (SUV / Bq/ml) */
-.mv-pt-header {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.mv-pt-header > span {
-  flex: 0 0 auto;
-}
-.mv-unit-toggle {
-  margin-left: auto;
-  height: 18px;
-}
-.mv-unit-toggle :deep(.v-btn) {
-  min-width: 0 !important;
-  padding: 0 6px !important;
-  font-size: 9px !important;
-  height: 18px !important;
-  text-transform: none;
-  letter-spacing: 0;
-}
-.mv-unit-toggle :deep(.v-btn--active) {
-  background: rgba(0, 212, 170, 0.16) !important;
-  color: var(--mv-accent) !important;
-  border-color: var(--mv-accent-dim) !important;
-}
-.mv-preset-toggle :deep(.v-btn) {
-  flex: 1 1 0;
-  min-width: 0 !important;
-  padding: 0 4px !important;
-  font-size: 11px !important;
-  letter-spacing: 0;
-  text-transform: none;
-  height: 26px !important;
-}
-.mv-preset-toggle :deep(.v-btn--active) {
-  background: rgba(0, 212, 170, 0.16) !important;
-  color: var(--mv-accent) !important;
-  border-color: var(--mv-accent-dim) !important;
-}
-
-/* Series priority rules editor */
-.mv-rules-table {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.mv-rule-row {
-  display: grid;
-  grid-template-columns: 1fr 60px 50px 22px;
-  gap: 4px;
-  align-items: center;
-}
-.mv-rule-pat,
-.mv-rule-mod,
-.mv-rule-w {
-  background: var(--mv-surface-2, #1a232b);
-  border: 1px solid var(--mv-border-strong, #3a4a55);
-  color: var(--mv-text);
-  font-size: 11px;
-  padding: 2px 4px;
-  border-radius: 2px;
-  font-family: inherit;
-  width: 100%;
-  box-sizing: border-box;
-}
-.mv-rule-w {
-  text-align: right;
-}
-.mv-rule-del {
-  background: transparent;
-  border: 1px solid transparent;
-  color: var(--mv-text-muted);
-  font-size: 14px;
-  line-height: 1;
-  padding: 0;
-  width: 22px;
-  height: 22px;
-  border-radius: 2px;
-  cursor: pointer;
-}
-.mv-rule-del:hover {
-  color: var(--mv-error, #FF5C7A);
-  border-color: var(--mv-error, #FF5C7A);
+.mv-sidebar-body {
+  flex: 1 1 auto;
+  min-height: 0;      /* これが無いと flex 子が縮まずスクロールしない */
+  overflow-y: auto;
+  padding: 8px 12px;
 }
 </style>

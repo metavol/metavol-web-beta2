@@ -98,6 +98,46 @@ src/
   **Inj/Acq time・Δt・Decay factor・Dose@corr・SUV slope** を表示 (Vox-BASE ダイアログと直接照合可能)。
   SUV 表示は全て小数**3桁**。SUV factor 逆算 `doseAtRefBq = BW×1000/suvFactor` は BQML 経路のみ表示。
 
+### ImageBox の用語 (2026-07 定義) — 会話でもコードでもこの語彙で統一する
+
+**box** = 画面上のタイル 1 枚。中身は **Rendering (描画方式)** と **fused (融合の有無)** で言う。
+放射線科の標準語 (native / MPR / MIP / VR) に合わせてあるので、そのまま口頭でも通じる。
+
+**① Rendering — 排他。5 値** (`getBoxRendering`)
+
+| 値 | 意味 | 実体 |
+|---|---|---|
+| `native` | 元スライスをそのまま表示。再構成なし。**マスク/セグメンテーション不可** | `DicomSliceImageBoxInfo` |
+| `mpr` | 再構成して任意断面 | `VolumeImageBoxInfo` (isMip/isVr なし) |
+| `mip` | 最大値投影 | `isMip: true` |
+| `smip` | surface MIP (閾値 + 深さ) | `isMip: true, mip.isSurface: true` |
+| `vr` | ボリュームレンダリング | `isVr: true` |
+
+**② fused — 真偽値** (`isBoxFused`)
+
+overlay 層を持つか (= `clut1` の有無)。**`mpr`/`mip`/`smip`/`vr` のどれとでも組み合わさる**
+(fused VR は `fusionVrPipeline` で実在する)。だから融合は Rendering の値にせず直交フラグにしてある。
+
+- 「再構成済み」= `rendering !== 'native'` (内部判定は `isAnyVolumeBox`)
+- 「**投影系**」= `mip` / `smip` / `vr` = **断面を持たない** → paging・融合の受け先・cross-ref 線・
+  crosshair が使えない。判定は `isProjectionRendering(r)` / `isProjectionInfo(info)` に集約
+  (以前は `isMip || isVr` が 12 箇所に散在していた)。
+
+→ **「MIP box」という型は無い**。正しくは「**MIP レンダリングの box**」。
+   (2026-07 に Kind(dicom|volume|fusion) × Mode(slice|mip|smip|vr) の 2 軸から移行。
+    旧構成は「dicom なら必ず slice」と非直交で、かつ fusion が Kind と Mode の両方の意味を持っていた)
+
+**MIP の回転軸は volume の k 軸 (添字空間)**。axial 撮像でのみ体軸まわりの回転になる。
+coronal/sagittal 撮像では解剖学的に正しくない (断面ベクトルは `planeVectorsWorld` で world 基準に
+直してあるが、MIP の回転はこの修正の対象外)。
+
+**③ 判定は固有フィールドで行う。`clut` を使わないこと**
+
+`defaultInfo()` (= DICOM box) も stray な `clut: 0` を持つため、`"clut" in info` では
+**DICOM box が Volume box と誤判定される**。判定は上表の固有フィールドで行う:
+`currentSliceNumber` → DICOM / `centerInWorld` → Volume 系 / `+clut1` → Fusion。
+また判定関数は **undefined を渡されても throw しない**こと (下記「2.8」参照)。
+
 ### Volume の幾何
 - 物理座標（mm）の原点 = `imagePosition` (DICOM ImagePositionPatient)。
 - `vectorX/Y/Z` は **「voxel index 1 進むと world で何 mm 進むか」** の3Dベクトル。
@@ -193,6 +233,15 @@ Volume 単独 / Fusion 両方をハンドル（`isVolumeImageBoxInfo` は `clut1
 - **Ctrl+Z** : undo / **Ctrl+Shift+Z** or **Ctrl+Y** : redo（下記「編集履歴」参照）
 - **Esc** : 進行中 polygon キャンセル
 - **右クリック / ダブルクリック** : polygon 確定
+- **↑↓←→** : 選択中 box の paging (±1) / **PageUp・PageDown** : ±10
+  - **手動 alignment 中はその box に限り overlay の移動に切り替わる** (`onManualAlignKey` が
+    `onPagingKey` より先。3.57 参照)
+  - 実装は `onPagingKey` (DicomView.vue)。**向きは右端の縦スライダと一致**させる:
+    index の増減ではなく `getBoxPaging().invert` を通すので、PET と CT でスライス順が逆でも
+    ↑ が常に頭側 (through-plane が Y/X なら腹側/右側) になる。
+  - 投影系 (MIP/sMIP/VR) は `getBoxPaging` が null なので**何もしない** (preventDefault もしない)。
+  - `input` / `textarea` / `select` / contenteditable にフォーカスがあるときは奪わない。
+    Vuetify の paging スライダは `input[type=range]` なので、掴んだ後は slider 自身の矢印処理に任せる。
 
 ## 編集履歴 (undo / redo)
 
@@ -380,20 +429,21 @@ Sidebar の Advanced → Phantom セクションのボタンから生成。`Side
   `findIslands`/`summarizeLesions` の島 = 「非ゼロの 26-連結成分」で定義が異なる (こちらは病変単位)。
   voxel inspector (Ctrl+Shift+D) で mask 各層 (threshold / manual / final / component) を hover 確認できる。
 
-### 2.5. `isVolumeImageBoxInfo` は plain DICOM box にも true を返す（重要な罠、2026-07 判明）
+### 2.5. `isVolumeImageBoxInfo` が plain DICOM box にも true を返していた（解決済み 2026-07）
 
-- **`defaultInfo()` (`DicomImageBoxInfo.ts`) は plain DICOM box なのに `clut: 0` を持つ。**
-  一方 `isVolumeImageBoxInfo(i)` は `("clut" in info) && !("clut1" in info)` で判定するため、
-  **生スライス box でも true** になる (`isAnyVolumeBox` も同様に true)。
+- **`defaultInfo()` (`DicomImageBoxInfo.ts`) は DICOM box なのに `clut: 0` を持つ。**
+  旧実装の `isVolumeImageBoxInfo(i)` は `("clut" in info) && !("clut1" in info)` で判定していたため、
+  **生スライス box でも true** になっていた (`isAnyVolumeBox` も同様)。
   ソース中の「この方法では、プロパティ名を変更したときにバグった」というコメントどおりの罠。
 - 実測 (実 PET/CT DICOM 778 files ロード後): 全 box が `clut:true` / `currentSliceNumber:true` /
-  `centerInWorld:false`。つまり plain viewer なのに `isAnyVolumeBox` は全部 true を返す。
-- **これが原因で「plain viewer なのに右 Inspector が開く」不具合が出た。**
-- **「本当に Volume/Fusion box か」を判定したいときは `'centerInWorld' in info` を使うこと**
-  (`VolumeImageBoxInfo` / `FusedVolumeImageBoxInfo` だけが持つ 3D 幾何。box 生成箇所 16 個すべてが
-  `centerInWorld` を持つことを確認済み)。DicomView の `isVolumeLikeBox()` がその実装。
-- `isAnyVolumeBox` 自体は Ctrl+wheel ズーム等の既存経路が依存しているため変更していない
-  (これらは先に `isDicomSliceImageBoxInfo` で分岐するので実害が出ていない)。触るときは要注意。
+  `centerInWorld:false`。plain viewer なのに `isAnyVolumeBox` が全部 true だった。
+- **「plain viewer なのに右 Inspector が開く」不具合の原因**だった。
+- **修正**: 判定を固有フィールドに統一した (上の「ImageBox の用語」③ を参照)。
+  `isVolumeImageBoxInfo` = `'centerInWorld' in info && !('clut1' in info)`、
+  `isFusedImageBoxInfo` = `'centerInWorld' in info && 'clut1' in info`。
+  判定が **厳しくなる**方向なので、`if (!isAnyVolumeBox) return` 型のガードは
+  DICOM box を正しく除外するようになった (呼び出し 40 箇所は全て「DICOM を先に分岐 → else volume」
+  の形であることを確認済み)。**`clut` を判定に使わないこと。**
 
 ### 2.7. タイルが画像エリアから溢れて右サイドバーに潜り込む (解決済み 2026-07)
 
@@ -471,6 +521,133 @@ srow は全ゼロ) で、かつ回転を含む。ここで 3 つの不具合が�
 修正後の実測: voxel pitch がヘッダ値と一致 (MR 0.9766/0.9766/1.0、PT 0.5346/0.5346/3.0488)、
 registration の MI が 0 → 有効値になり最適化が機能。`niftiVolumeWriter` も LPS→RAS の逆変換を
 入れて save→load の往復を保った。**既存 DICOM は off-diagonal が厳密に 0 なので影響なし** (検証済み)。
+
+### 3.55. 同一 FrameOfReference には registration を掛けないこと (2026-07)
+
+**同 FrameOfReferenceUID = 同一装置が同一座標系で撮ったもの (PET/CT 一体機など) で、既に正解。**
+ここに MI 最適化を掛けると **MI が装置の位置合わせより「良い」と誤判定して壊す**。
+
+実測 (Hirata20260728 の `PET TRANSAXIAL` × `CT TRANSAXIAL+`、同 FoR):
+
+| 条件 | PET の移動量 |
+|---|---|
+| 重心合わせ + 粗探索してから最適化 | **311.6mm** |
+| identity から最適化のみ | **115.2mm** |
+| 「開始位置より悪ければ不採用」ガードのみ | 効かない (MI 上は "改善" 判定のため) |
+
+→ 全身 PET/CT では MI が十分に鋭くないので、**ガードでは防げない**。
+`onBoxAutoRegister` は **同 FoR なら実行せず、その旨を伝えて return** する。
+位置合わせが要るのは「別 study / 別スキャナのシリーズを drag&drop で重ねた」ケースだけ。
+
+別 FoR の場合も保険として、(a) 推定初期値が現状より悪ければ採用しない、
+(b) 最終結果が開始位置より悪ければ適用しない、の 2 段ガードを入れてある。
+
+### 3.57. mis-registration を人が直す手段 (2026-08)
+
+auto-registration は外れることがある (MI の局所解、FOV / 体位の食い違い、別 study 同士)。
+**外れたときに人が直せる**手段を fusion box の「…」メニューに用意してある:
+
+- **Adjust alignment manually** — 画像左下に調整パネル (`.mv-align-panel`)。
+  面内 D-pad / through-plane ± / 面内回転 ± / step (0.5〜10mm, 1〜5°) / 現在オフセット表示。
+  **カーソルキー**と **Shift+左ドラッグ**でも動かせる (Shift 必須なのは調整中も window/pan を
+  使えるようにするため)。
+- **Refine with auto** — **いまの手動姿勢を開始点**に MI 最適化。手で当たりを付けて機械に詰めさせる。
+  `onBoxAutoRegister(boxId, { fromCurrent: true })`。このときは重心合わせ+粗探索を**使わない**
+  (ユーザが付けた当たりを壊すため)。同一 FoR のスキップも適用しない (明示操作なので)。
+- **Reset registration** — 撮影時の姿勢に戻す。
+
+実装上の要点:
+
+- **回転は world 原点まわりにしないこと。** `makeRigidMatrix` の rx/ry/rz は world 原点基準なので、
+  角度を直接足すと体幹部が数百 mm 飛ぶ。手動側は world 空間の delta 行列を**左から**掛けて
+  再分解する (`composeWorldDelta` / `paramsFromMatrix`, transform.ts)。回転中心は
+  `rotationDeltaAbout` で **box の centerInWorld** (= いま見えている断面の中心) にしてある。
+- 移動方向は box の `vecx` (右) / `vecy` (下) / `vecz` (奥) 基準。axial でも coronal でも
+  「画面で見えている向き」に動く。px→mm 換算は `vec*.length()` なので zoom しても手応えが一致。
+- **registration 変更後に `evictVolumeTexture` を呼ばないこと (2026-08 撤去)**。GPU texture が
+  持つのは voxel だけで、幾何 (p00/v01/v10) は描画ごとに CPU 側で volume から作り直して
+  uniform で渡している。捨てると数百 MB の再アップロードが走るだけで、ドラッグ調整が実用にならない。
+- 幾何は `THREE.Vector3` の in-place mutation なのでパネルの数値表示は Vue が追えない。
+  `manualAlignVersion` を bump して追従させる (`boxStateVersion` と同じ作法)。
+- **投影系 (MIP/sMIP/VR) では出さない** (`canManualAlign` = fused かつ非 projection)。
+  断面が無く「合っているか」を目視判断できないため。メニュー項目自体も出ない。
+
+**永続化 (2026-08)**
+
+registration は volume の幾何そのものではなく **撮影時姿勢からの差分 (rigid 6-DOF)** として
+store (`segStore.registrations`, seriesUID → params) に写しを持ち、
+snapshot (.mvs, top-level `registrations`) と auto-save (`SessionPayload.registrations`) の
+両方に保存する。復元は seriesUID 照合で、別症例を開いていれば 0 件になるだけ。
+
+- **registration を変える経路は必ず `setVolumeRegistration()` を通すこと。** 幾何と store の
+  写しを同時に更新する唯一の場所。直接 `applyRigidToVolume` を呼ぶと画面と保存内容が食い違う。
+- store は volume を持たないので、`restoreFromPersistence` / `applySnapshotJson` は
+  **写しを入れるだけ**。実際に幾何へ掛け直すのは DicomView の `applyStoredRegistrations()`
+  (snapshot 適用時と recovery dialog の Recover で呼ぶ)。
+- identity は保存しない (エントリごと消す)。auto-register の途中 reset も store に反映するので、
+  同一 FoR の early return で抜けても不整合にならない。
+
+**undo (2026-08)**
+
+mask 編集の履歴 (store の `history`) とは **別建て**。位置合わせは 6 個の数値で、voxel の
+sparse diff と混ぜても得が無く、「マスクを戻したいのか位置を戻したいのか」が曖昧になるため。
+
+- `regUndoStack` (DicomView, 最大 50, 永続化しない)。変更の **直前**の params を積む。
+- ドラッグ/キーリピートで 1px ずつ積まれないよう、同一 series への連続操作は **400ms 以内なら
+  1 ステップにまとめる** (`REG_UNDO_COALESCE_MS`)。auto-register は全体で 1 ステップ。
+- 引くのは手動 alignment 中の **Ctrl+Z** とパネルの ↶ ボタン。モードを閉じれば Ctrl+Z は
+  従来どおりマスクの undo に戻る。
+
+### 3.58. **MI 自動位置合わせは全身 PET/CT では成立していない (2026-08 実測)**
+
+**先に結論**: 現状の MI ベース auto-register は、全身 PET/CT では**補正力がほぼ無い**。
+段階を足すほど悪化する。まず `scripts/reg-eval.mjs` で測ってから触ること。
+
+**評価方法 (再現可能)**: Hirata20260728 の `CT TRANSAXIAL+`(8) と `PET TRANSAXIAL`(14) は
+**同一 FrameOfReferenceUID** = 装置が既に正しく合わせている。これを正解とし、PET に既知の
+剛体変換をかけてわざとずらし、戻させて残差 (体内 27 点の平均変位 mTRE) を測る。
+
+```bash
+node scripts/reg-eval.mjs     # パイプライン構成ごとの mTRE 表
+node scripts/reg-diag.mjs     # 指標か最適化かの切り分け
+node scripts/affine-check.mjs # world↔voxel の検算 (数秒、DICOM 不要)
+```
+
+**実測 (平均 mTRE。開始誤差の平均 49.1mm)**
+
+| 構成 | mTRE |
+|---|---|
+| 初期値推定 + pyramid[4,2,1] (旧既定) | **320.9mm** |
+| 初期値推定なし + pyramid[4,2,1] | 153.3mm |
+| 初期値推定なし + pyramid[2,1] | 84.9mm |
+| 初期値推定なし + 単一解像度 (現既定) | **48.0mm** |
+| 初期値推定 + 単一解像度 | 346.2mm |
+
+**分かったこと**
+
+- **指標そのものが弱い。** 正解姿勢の MI = 0.2083 に対し 27mm ずらして 0.1937。差は 0.015 しかなく、
+  正解の周囲 30mm により良い点がある (正解が谷底になっていない)。NMI では正解姿勢で 1.049
+  (1.0 = 無相関)。**320mm ずれた姿勢を正解より高く評価する**ため、
+  「悪化するなら採用しない」ガードも効かない。
+- **多重解像度が有害。** 正解から始めても pyramid を通すと 120.6mm 飛ぶ (単一解像度なら 13.1mm)。
+  最粗レベル (factor 4) で解剖の対応が失われ、偽の最適に落ちてから戻れない。
+  `downsampleVolume` を stride 抽出 → 箱平均に直しても解消しない (356→321mm)。
+- **`estimateInitialParams` (重心+粗探索) は毎回 320〜340mm 飛ばす。** 呼び出しから外した。
+  旧 `computeCentroidWorld` は voxel 値を重みにしており、CT の HU は空気が -1000 の**負値**なので
+  「CT の骨の重心」と「PET の集積の重心」を突き合わせていた (単独で 464mm)。二値の幾何重心に
+  直したが、それでも全体成績は改善しなかった。
+
+**効かなかった対策 (再試行しないこと)**: 体内限定サンプリング / NMI 化 / 箱平均 downsample。
+いずれも単独では改善せず、NMI は悪化した (356→433mm)。座標変換 (`worldToVoxel`) は無罪
+(往復誤差 0、回転を含む幾何でも)。
+
+**当面の実用手段**: 手動 alignment (3.57) で当たりを付けてから「Refine with auto」。
+正解付近から単一解像度なら 13.1mm に収まることは実測済み。auto-register が 2mm 未満しか
+動かなかったときは、その旨と手動調整への誘導を出すようにしてある。
+
+**次に試すなら**: MI を捨て、CT↔PET で共通して確かな特徴である **体輪郭**を使う指標
+(閾値マスク同士の Dice / 表面距離) を検討する。強度の対応が弱いモダリティ間では
+輪郭ベースの方が素直。
 
 ### 3.6. MR↔PET registration の初期化 (2026-07)
 

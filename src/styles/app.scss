@@ -1,6 +1,10 @@
 // Dark Medical theme — global styles
 
 :root {
+  // app-bar の高さ。**ここ 1 か所で決める** (以前は 48px が 5 箇所に散っていた)。
+  // 中身 (.v-toolbar__content) は density=compact + 28px ボタンで実測 32px なので、
+  // 36px で上下 2px ずつの余白。48px は 16px 分が無駄な帯になっていた。
+  --mv-appbar-h: 36px;
   --mv-bg: #0F1419;
   --mv-surface: #1A2028;
   --mv-surface-2: #222B36;
@@ -33,7 +37,7 @@ html, body, #app {
 .v-main {
   // Vuetify が --v-layout-top/-left/-right で計算する余白をそのまま使う。
   // 以前は `padding: 0 !important` で潰してしまい、app-bar が画像領域に被っていた。
-  --v-layout-top: 48px !important; // app-bar 高さに合わせる
+  --v-layout-top: var(--mv-appbar-h) !important; // app-bar 高さに合わせる
   padding-top: var(--v-layout-top) !important;
   padding-right: var(--v-layout-right) !important;
   padding-bottom: var(--v-layout-bottom) !important;
@@ -116,7 +120,23 @@ html, body, #app {
 .mv-appbar {
   background: var(--mv-surface) !important;
   border-bottom: 1px solid var(--mv-border);
-  height: 48px;
+  height: var(--mv-appbar-h);
+
+  // Vuetify は .v-toolbar__content の高さを「height prop - 16px」にし、bar の上端に寄せる。
+  // その結果 28px のボタンが 20px の content からはみ出して**上端で見切れ**、
+  // さらに下に 16px の何も無い帯が残っていた (= 「タイトルバーが不必要に大きい」の正体)。
+  // content に bar の全高を使わせて、ボタンを縦中央に揃える。
+  .v-toolbar__content,
+  .v-toolbar__prepend,
+  .v-toolbar__append {
+    height: 100% !important;
+  }
+
+  // prepend のハンバーガーだけ 40px と大きく、36px の bar からはみ出すので揃える
+  .v-toolbar__prepend .v-btn {
+    height: 28px !important;
+    width: 28px !important;
+  }
 }
 
 // 右サイドバー開閉ボタン: app-bar の flex から外して右上に固定する。
@@ -126,10 +146,18 @@ html, body, #app {
   position: fixed !important;
   top: 0;
   right: 0;
-  height: 48px !important;
+  height: var(--mv-appbar-h) !important;
   z-index: 1010;          // app-bar (1004〜1008 付近) より前面
   background: var(--mv-surface) !important;
   border-radius: 0 !important;
+}
+
+// 幅が足りない画面ではワードマークを畳む。
+// app-bar は項目が多く、実測 1272px の content 幅に対して 1279px と 7px 溢れていた
+// (Window preset ボタンを app-bar に移した分)。ブランド表記は装飾で、アプリの識別は
+// ブラウザのタブタイトルでも付くので、ツールを優先して 114px を明け渡す。
+@media (max-width: 1440px) {
+  .mv-brand { display: none; }
 }
 
 .mv-brand {
@@ -156,7 +184,7 @@ html, body, #app {
 .mv-imagearea {
   background: #000;
   width: 100%;
-  height: calc(100vh - 48px); // app-bar 分を引く
+  height: calc(100vh - var(--mv-appbar-h)); // app-bar 分を引く
   display: flex;
   flex-direction: column;
   align-items: center;

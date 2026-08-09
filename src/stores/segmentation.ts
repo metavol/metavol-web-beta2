@@ -147,6 +147,13 @@ interface State {
 
     lastAutoSavedAt: number | null;  // epoch ms (auto-save 完了時刻)
 
+    // 位置合わせ (rigid 6-DOF) を **series 単位**で保持する。
+    // 実体 (volume の imagePosition / vector*) は DicomView 側が持つが、それは
+    // 再ロードで失われるので、永続化できる「撮影時姿勢からの差分」をここに写しておく。
+    // auto-register / 手動調整のたびに DicomView が setRegistration で更新する。
+    registrations: Array<{ seriesUID: string; params: number[] }>;
+    registrationVersion: number;     // auto-save の watch 用
+
     // CT 寝台除去 (体マスク) — 1=体内、0=体外。CT volume と同じ次元。
     ctBodyMask: Uint8Array | null;
     ctBodyMaskEnabled: boolean;     // 表示時に適用するか (toggle)
@@ -239,6 +246,8 @@ export const useSegmentationStore = defineStore('segmentation', {
         componentMapValid: false,
 
         lastAutoSavedAt: null,
+        registrations: [],
+        registrationVersion: 0,
 
         ctBodyMask: null,
         ctBodyMaskEnabled: false,
@@ -908,7 +917,30 @@ export const useSegmentationStore = defineStore('segmentation', {
                 sphere: this.sphere
                     ? { centerWorld: [this.sphere.centerWorld.x, this.sphere.centerWorld.y, this.sphere.centerWorld.z], radiusMm: this.sphere.radiusMm }
                     : null,
+                registrations: this.registrations.map(r => ({ seriesUID: r.seriesUID, params: [...r.params] })),
             };
+        },
+
+        // ===== 位置合わせ (rigid 6-DOF) の記録 =====
+        // 実際に volume を動かすのは DicomView (registerSnapshots + applyRigidToVolume)。
+        // ここは **永続化のための写し** だけを持つ。identity は保持しない (エントリごと消す)。
+        setRegistration(seriesUID: string | undefined | null, params: readonly number[]) {
+            if (!seriesUID) return;
+            const isIdentity = params.every(v => Math.abs(v) < 1e-9);
+            const i = this.registrations.findIndex(r => r.seriesUID === seriesUID);
+            if (isIdentity) {
+                if (i >= 0) this.registrations.splice(i, 1);
+            } else if (i >= 0) {
+                this.registrations[i].params = [...params];
+            } else {
+                this.registrations.push({ seriesUID, params: [...params] });
+            }
+            this.registrationVersion++;
+        },
+        clearRegistrations() {
+            if (this.registrations.length === 0) return;
+            this.registrations = [];
+            this.registrationVersion++;
         },
 
         // 永続化された session payload を現在 PT volume に対して復元する。
@@ -924,6 +956,7 @@ export const useSegmentationStore = defineStore('segmentation', {
             currentLabelId: number;
             sphere: { centerWorld: [number, number, number]; radiusMm: number } | null;
             savedAt: number;
+            registrations?: Array<{ seriesUID: string; params: number[] }>;
         }): { ok: true } | { ok: false; reason: string } {
             const pet = this.petVolumeRef;
             if (!pet) return { ok: false, reason: 'No PET volume loaded.' };
@@ -961,6 +994,14 @@ export const useSegmentationStore = defineStore('segmentation', {
                     radiusMm: payload.sphere.radiusMm,
                     suvMax: 0, suvMean: 0, suvStd: 0, voxelCount: 0,
                 };
+            }
+            // 位置合わせは **記録するだけ**。実際に volume を動かすのは DicomView 側で、
+            // 復元後に applyStoredRegistrations() を呼んでもらう (この store は volume を持たない)。
+            if (Array.isArray(payload.registrations)) {
+                this.registrations = payload.registrations
+                    .filter(r => r && typeof r.seriesUID === 'string' && Array.isArray(r.params) && r.params.length === 6)
+                    .map(r => ({ seriesUID: r.seriesUID, params: r.params.map(Number) }));
+                this.registrationVersion++;
             }
             this.clearHistory();
             this.invalidateComponentMap();
