@@ -598,56 +598,58 @@ sparse diff と混ぜても得が無く、「マスクを戻したいのか位�
 - 引くのは手動 alignment 中の **Ctrl+Z** とパネルの ↶ ボタン。モードを閉じれば Ctrl+Z は
   従来どおりマスクの undo に戻る。
 
-### 3.58. **MI 自動位置合わせは全身 PET/CT では成立していない (2026-08 実測)**
+### 3.58. **registration を壊していた 2 つの幾何バグ (2026-08 解決)**
 
-**先に結論**: 現状の MI ベース auto-register は、全身 PET/CT では**補正力がほぼ無い**。
-段階を足すほど悪化する。まず `scripts/reg-eval.mjs` で測ってから触ること。
+**結論: MI 自動位置合わせは全身 PET/CT でも脳 MR/PET でも機能する。** 以前ここに
+「MI は成立しない」と書いていたが、それは下記 2 つのバグの上で測った結果で、**すべて無効**。
 
-**評価方法 (再現可能)**: Hirata20260728 の `CT TRANSAXIAL+`(8) と `PET TRANSAXIAL`(14) は
-**同一 FrameOfReferenceUID** = 装置が既に正しく合わせている。これを正解とし、PET に既知の
-剛体変換をかけてわざとずらし、戻させて残差 (体内 27 点の平均変位 mTRE) を測る。
+**バグ①: `applyRigidToVolume` が voxel サイズを破壊していた**
 
-```bash
-node scripts/reg-eval.mjs     # パイプライン構成ごとの mTRE 表
-node scripts/reg-diag.mjs     # 指標か最適化かの切り分け
-node scripts/affine-check.mjs # world↔voxel の検算 (数秒、DICOM 不要)
+```ts
+vol.vectorX.copy(origVx.transformDirection(m));   // ← transformDirection は正規化する
 ```
+`vectorX/Y/Z` は「voxel を 1 進めたとき world で何 mm 動くか」= 長さが voxel pitch そのもの。
+THREE の `transformDirection` は回転後に **正規化** するので、この関数を通すたびに
+**全部 1mm 角の volume に化ける**。実測 (metmri の MR): pitch 6.42mm の軸が 1.00 に。
+auto-register / 手動調整 / snapshot 復元のすべてが通るため、**位置合わせを 1 回でも
+掛けた時点で幾何が壊れ**、以後 MI も表示も当てにならなくなっていた。
+→ 3x3 回転だけを掛けて長さを保つ `rotateKeepingLength` に修正。
 
-**実測 (平均 mTRE。開始誤差の平均 49.1mm)**
+**バグ②: `estimateIntensityRange` が位置合わせ前の姿勢で moving を標本化していた**
 
-| 構成 | mTRE |
-|---|---|
-| 初期値推定 + pyramid[4,2,1] (旧既定) | **320.9mm** |
-| 初期値推定なし + pyramid[4,2,1] | 153.3mm |
-| 初期値推定なし + pyramid[2,1] | 84.9mm |
-| 初期値推定なし + 単一解像度 (現既定) | **48.0mm** |
-| 初期値推定 + 単一解像度 | 346.2mm |
+fixed と同じ world 点で moving をサンプルしていたが、別装置由来のデータは初期状態で
+**まったく重ならない** (実測 metmri: overlap 0/4000)。moving 側のレンジが min=max=0 に潰れ、
+以後どの姿勢でも全 voxel が最終ビンに入って **MI が恒等的に 0**。重心で 3897/4000 重ねた
+後も 0 のままだった。→ moving のレンジは volume 全体の分位点から取る (姿勢非依存)。
 
-**分かったこと**
+**修正後の実測 (`node scripts/reg-eval.mjs`)**
 
-- **指標そのものが弱い。** 正解姿勢の MI = 0.2083 に対し 27mm ずらして 0.1937。差は 0.015 しかなく、
-  正解の周囲 30mm により良い点がある (正解が谷底になっていない)。NMI では正解姿勢で 1.049
-  (1.0 = 無相関)。**320mm ずれた姿勢を正解より高く評価する**ため、
-  「悪化するなら採用しない」ガードも効かない。
-- **多重解像度が有害。** 正解から始めても pyramid を通すと 120.6mm 飛ぶ (単一解像度なら 13.1mm)。
-  最粗レベル (factor 4) で解剖の対応が失われ、偽の最適に落ちてから戻れない。
-  `downsampleVolume` を stride 抽出 → 箱平均に直しても解消しない (356→321mm)。
-- **`estimateInitialParams` (重心+粗探索) は毎回 320〜340mm 飛ばす。** 呼び出しから外した。
-  旧 `computeCentroidWorld` は voxel 値を重みにしており、CT の HU は空気が -1000 の**負値**なので
-  「CT の骨の重心」と「PET の集積の重心」を突き合わせていた (単独で 464mm)。二値の幾何重心に
-  直したが、それでも全体成績は改善しなかった。
+Hirata20260728 の CT TRANSAXIAL+ × PET TRANSAXIAL (同一 FoR を正解とし、既知量ずらして戻す)。
+開始誤差 26.9〜70.8mm、平均 mTRE:
 
-**効かなかった対策 (再試行しないこと)**: 体内限定サンプリング / NMI 化 / 箱平均 downsample。
-いずれも単独では改善せず、NMI は悪化した (356→433mm)。座標変換 (`worldToVoxel`) は無罪
-(往復誤差 0、回転を含む幾何でも)。
+| 構成 | 修正前 | 修正後 |
+|---|---|---|
+| 重心 + pyramid[2,1] | 84.9mm | **1.6mm** ← 既定 |
+| 重心 + pyramid[4,2,1] | 320.9mm | 2.3mm |
+| 初期値なし + pyramid[4,2,1] | 153.3mm | 3.9mm |
+| 重心 + 単一解像度 | — | 6.8mm |
+| 初期値なし + 単一解像度 | 48.0mm | 11.6mm |
 
-**当面の実用手段**: 手動 alignment (3.57) で当たりを付けてから「Refine with auto」。
-正解付近から単一解像度なら 13.1mm に収まることは実測済み。auto-register が 2mm 未満しか
-動かなかったときは、その旨と手動調整への誘導を出すようにしてある。
+所要 1 秒前後。**多重解像度も重心初期化も有効** (以前「有害」と書いたのは誤り)。
 
-**次に試すなら**: MI を捨て、CT↔PET で共通して確かな特徴である **体輪郭**を使う指標
-(閾値マスク同士の Dice / 表面距離) を検討する。強度の対応が弱いモダリティ間では
-輪郭ベースの方が素直。
+metmri (脳 MR + PET、別装置で重心が 210mm 離れている) でも
+`node scripts/reg-metmri.mjs` で確認済み: 重心で 210mm を消し、MI で精密化して
+±5/10/20mm・±2/5° の **30 摂動すべてで悪化する極小**、95mm ずらしても 12.7mm まで復帰。
+
+**アルゴリズムは「① 重心で粗く → ② MI で精密に」の 2 段**。粗探索
+(`coarseTranslationSearch`) は使っていない (重心で十分寄るため)。
+
+**検証スクリプト**
+```bash
+node scripts/reg-eval.mjs      # Hirata: 構成ごとの mTRE 表
+node scripts/reg-metmri.mjs    # metmri: 極小チェック + 収束半径
+node scripts/affine-check.mjs  # world↔voxel の検算 (数秒、DICOM 不要)
+```
 
 ### 3.6. MR↔PET registration の初期化 (2026-07)
 

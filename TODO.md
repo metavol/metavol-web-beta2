@@ -62,6 +62,11 @@ URL クリック → ロード → 見て閉じる
 
 ## 未着手 / 継続中
 
+### ~~★最優先: 画像重ね合わせ (registration)~~ ✅ 解決 (2026-08)
+
+幾何を壊す 2 つのバグ (`applyRigidToVolume` の正規化 / `estimateIntensityRange` の姿勢依存) が
+真因だった。修正後 Hirata で平均 mTRE 1.6mm、metmri でも収束を確認。詳細は **CLAUDE.md 3.58**。
+
 - **マスクロード round-trip**: `niftiReader.ts` は実装済だが、SegmentationPanel からの読込フローが segmentation store に反映されるか未検証。書いて読み戻す e2e テストが必要
 - **composable 切り出し**: `DicomView.vue` (~1900行) を `useSphereROI` / `usePolygonROI` / `useDebug` 等に分解
 - **バンドル 500KB 超**: `vite build` 時 warning。manual chunk 分割（vendor / nifti / dcmjs-codecs を分離）

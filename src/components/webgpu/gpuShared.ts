@@ -103,6 +103,8 @@ export const getMipBindGroupLayout = (device: any): any => {
             { binding: 3, visibility: 0x4, storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension: '2d' } },
             { binding: 4, visibility: 0x4, texture: { sampleType: 'uint', viewDimension: '3d' } },
             { binding: 5, visibility: 0x4, buffer: { type: 'read-only-storage' } },
+            // CT 寝台除去用 body mask (0=体外)。MIP/sMIP でも寝台を消せるようにする。
+            { binding: 6, visibility: 0x4, texture: { sampleType: 'uint', viewDimension: '3d' } },
         ],
     });
     cachedMipLayoutDev = device;

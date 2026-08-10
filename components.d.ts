@@ -13,6 +13,7 @@ declare module 'vue' {
     DicomTagDialog: typeof import('./src/components/DicomTagDialog.vue')['default']
     DicomView: typeof import('./src/components/DicomView.vue')['default']
     ImageBox: typeof import('./src/components/ImageBox.vue')['default']
+    LlmChatPanel: typeof import('./src/components/llm/LlmChatPanel.vue')['default']
     SegmentationPanel: typeof import('./src/components/SegmentationPanel.vue')['default']
     SeriesList: typeof import('./src/components/SeriesList.vue')['default']
     Sidebar: typeof import('./src/components/Sidebar.vue')['default']

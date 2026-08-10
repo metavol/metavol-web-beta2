@@ -41,6 +41,23 @@ export const captureRegistrationSnapshot = (vol: Volume): RegistrationSnapshot =
     currentParams: [...IDENTITY_PARAMS] as unknown as RigidParams,
 });
 
+// 3x3 回転部だけを掛ける。**長さを変えないこと** が肝。
+//
+// 以前は THREE の `transformDirection` を使っていたが、あれは回転後に **正規化** する。
+// vectorX/Y/Z は「voxel を 1 進めたとき world で何 mm 動くか」= 長さが voxel pitch そのもの
+// なので、正規化すると **全部 1mm 角の volume に化ける**。
+// 実測 (metmri の MR): pitch 6.42mm の軸が 1.00 になっていた。
+// applyRigidToVolume は auto-register / 手動調整 / snapshot 復元のすべてが通るため、
+// 位置合わせを 1 回でも掛けた時点で幾何が壊れ、以後 MI も表示も当てにならなくなっていた。
+const rotateKeepingLength = (v: THREE.Vector3, m: THREE.Matrix4): THREE.Vector3 => {
+    const e = m.elements;   // column-major
+    return new THREE.Vector3(
+        e[0] * v.x + e[4] * v.y + e[8]  * v.z,
+        e[1] * v.x + e[5] * v.y + e[9]  * v.z,
+        e[2] * v.x + e[6] * v.y + e[10] * v.z,
+    );
+};
+
 // Apply rigid params to volume: position は full 変換、vec は 3x3 回転のみ
 export const applyRigidToVolume = (
     vol: Volume,
@@ -53,10 +70,10 @@ export const applyRigidToVolume = (
     const origVy = new THREE.Vector3(...snapshot.originalVectorY);
     const origVz = new THREE.Vector3(...snapshot.originalVectorZ);
     vol.imagePosition.copy(origPos.applyMatrix4(m));
-    // direction は rotation のみ (translation 無関係)
-    vol.vectorX.copy(origVx.transformDirection(m));
-    vol.vectorY.copy(origVy.transformDirection(m));
-    vol.vectorZ.copy(origVz.transformDirection(m));
+    // direction は rotation のみ (translation 無関係)。長さ = voxel pitch は保つ。
+    vol.vectorX.copy(rotateKeepingLength(origVx, m));
+    vol.vectorY.copy(rotateKeepingLength(origVy, m));
+    vol.vectorZ.copy(rotateKeepingLength(origVz, m));
     snapshot.currentParams = [...p] as unknown as RigidParams;
 };
 

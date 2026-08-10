@@ -103,32 +103,46 @@ const sampleTrilinear = (vol: Volume, w: THREE.Vector3): number | null => {
     return c0 + (c1 - c0) * fz;
 };
 
-// fixed と moving 両方の intensity range を推定 (5%-95% percentile)。
-// 最初に 1 度計算して使い回す。
+// volume 全体から分位点で強度レンジを取る (**姿勢に依存しない**)。
+export const volumePercentileRange = (vol: Volume, lo = 0.05, hi = 0.95): [number, number] => {
+    const stride = Math.max(1, Math.floor(vol.voxel.length / 20000));
+    const vals: number[] = [];
+    for (let i = 0; i < vol.voxel.length; i += stride) vals.push(vol.voxel[i]);
+    vals.sort((a, b) => a - b);
+    const p = (q: number) => vals[Math.min(vals.length - 1, Math.max(0, Math.floor(vals.length * q)))] ?? 0;
+    const a = p(lo), b = p(hi);
+    return [a, b > a ? b : a + 1];
+};
+
+// fixed と moving の intensity range を推定。
+//
+// **moving は volume 全体から取ること。** 以前は fixed と同じ world 点で moving を
+// 標本化していたが、その時点ではまだ位置が合っていない。別装置由来のデータは
+// 初期状態で **まったく重ならない** (実測 metmri: overlap 0/4000) ため moving 側の
+// レンジが min=max=0 に潰れ、以後どの姿勢でも全 voxel が最終ビンに入って
+// **MI が恒等的に 0** になっていた (重心で 3897/4000 重ねた後も 0 のまま)。
+// fixed 側は sample が必ず fixed 内にあるので従来どおり sample から取ってよい。
 export const estimateIntensityRange = (
     fixed: Volume,
     moving: Volume,
     samples: Float32Array,
 ): MIStats => {
     const fVals: number[] = [];
-    const mVals: number[] = [];
     const tmp = new THREE.Vector3();
     const nSamples = samples.length / 3;
     for (let i = 0; i < nSamples; i++) {
         tmp.set(samples[i*3], samples[i*3+1], samples[i*3+2]);
         const fv = sampleTrilinear(fixed, tmp);
         if (fv != null) fVals.push(fv);
-        const mv = sampleTrilinear(moving, tmp);
-        if (mv != null) mVals.push(mv);
     }
     fVals.sort((a, b) => a - b);
-    mVals.sort((a, b) => a - b);
     const pct = (arr: number[], q: number) => arr.length === 0 ? 0 : arr[Math.min(arr.length - 1, Math.max(0, Math.floor(arr.length * q)))];
+    const [mLo, mHi] = volumePercentileRange(moving, 0.05, 0.95);
     return {
         fixedMin: pct(fVals, 0.05),
         fixedMax: pct(fVals, 0.95),
-        movingMin: pct(mVals, 0.05),
-        movingMax: pct(mVals, 0.95),
+        movingMin: mLo,
+        movingMax: mHi,
     };
 };
 

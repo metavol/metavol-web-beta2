@@ -112,6 +112,21 @@
               </template>
               <v-list-item-title>Remove CT bed</v-list-item-title>
               <v-list-item-subtitle v-if="!segStore.ctVolumeRef">CT volume required</v-list-item-subtitle>
+              <v-list-item-subtitle v-else>Keeps the largest connected structure</v-list-item-subtitle>
+            </v-list-item>
+            <!-- 接触している台/寝台は連結成分では分けられないので、高さで落とす手段を持たせる。
+                 (実測: kitty は本体・台座・背板が 1 つの連結成分になる) -->
+            <v-list-item v-if="!segStore.ctBodyMask" :disabled="!segStore.ctVolumeRef" @click.stop>
+              <template v-slot:prepend><v-icon icon="mdi-arrow-collapse-down" size="small" /></template>
+              <v-list-item-title>Also cut bottom</v-list-item-title>
+              <v-list-item-subtitle>For objects resting on a stand</v-list-item-subtitle>
+              <template v-slot:append>
+                <input class="mv-mini-num" type="number" min="0" step="1"
+                       :value="segStore.ctBedCutBottomMm"
+                       @click.stop
+                       @change="(e: Event) => segStore.setCtBedCutBottomMm(Number((e.target as HTMLInputElement).value))" />
+                <span class="mv-mini-unit">mm</span>
+              </template>
             </v-list-item>
             <v-list-item v-else @click.stop="onToggleBodyMask">
               <template v-slot:prepend>
@@ -200,6 +215,14 @@
                 <v-icon icon="mdi-web" size="small" />
               </template>
               <v-list-item-title>Browser support</v-list-item-title>
+            </v-list-item>
+
+            <v-list-item @click="llmOpen = !llmOpen">
+              <template v-slot:prepend>
+                <v-icon icon="mdi-robot-outline" size="small" />
+              </template>
+              <v-list-item-title>{{ llmOpen ? 'Hide assistant' : 'Assistant (local LLM)…' }}</v-list-item-title>
+              <v-list-item-subtitle>Chat with a model running on this machine via Ollama</v-list-item-subtitle>
             </v-list-item>
 
             <!-- 左サイドバーから移設 (シリーズ一覧が長くなって到達できなくなったため) -->
@@ -746,6 +769,9 @@
       @recoverSlices="dicomViewRef?.recoverSlices?.()"
     />
 
+    <!-- ローカル LLM (Ollama) チャット。開放しているのは **読み取り専用** の 2 tool のみ。 -->
+    <LlmChatPanel v-model="llmOpen" :tool-context="llmToolContext" />
+
     <DemoOverlay :demo="demo" />
   </v-app>
 </template>
@@ -758,6 +784,7 @@ import { useSegmentationStore } from "./stores/segmentation";
 import DicomTagDialog from "./components/DicomTagDialog.vue";
 import WindowPresetMenu from "./components/WindowPresetMenu.vue";
 import AdvancedToolsDialog from "./components/AdvancedToolsDialog.vue";
+import LlmChatPanel from "./components/llm/LlmChatPanel.vue";
 import DemoOverlay from "./components/demo/DemoOverlay.vue";
 import { useDemoPlayer } from "./components/demo/useDemoPlayer";
 import { buildDemoApi } from "./components/demo/demoApi";
@@ -1041,6 +1068,14 @@ const canShowTags = computed<boolean>(() => {
 const browserSupportOpen = ref(false);
 // Advanced tools (phantom / experiments / series priority) — 左サイドバーから移設
 const advancedOpen = ref(false);
+// ローカル LLM チャット (Ollama)。右下フローティングなのでレイアウトは押しのけない。
+const llmOpen = ref(false);
+// LLM に渡す読み取り専用の窓口。実体は DicomView 側 (状態を持っているのはあちら)。
+// 呼び出しのたびに dicomViewRef を引き直すので、遅延マウントでも取りこぼさない。
+const llmToolContext = {
+  listSeries:   () => dicomViewRef.value?.llmListSeries?.() ?? { error: 'viewer not ready' },
+  describeView: () => dicomViewRef.value?.llmDescribeView?.() ?? { error: 'viewer not ready' },
+};
 // app-bar の Window preset ボタンが出し分けに使う。選択 box が変わるたびに追従させたいので
 // dicomViewRef 経由の computed にする (exposed な computed はそのまま値として読める)。
 const selectedBoxModality = computed<string>(() => dicomViewRef.value?.selectedBoxModality ?? '');
@@ -1280,6 +1315,21 @@ const onInspectNiftiRaw = (idx: number) => {
 }
 
 /* Hamburger menu subheader (Preprocessing 等) */
+.mv-mini-num {
+  width: 52px;
+  background: var(--mv-surface-2, #222b36);
+  border: 1px solid var(--mv-border, #2a3441);
+  border-radius: 3px;
+  color: var(--mv-text, #e8eef2);
+  font-size: 11px;
+  padding: 2px 4px;
+  text-align: right;
+}
+.mv-mini-unit {
+  font-size: 10px;
+  color: var(--mv-text-muted, #5a6877);
+  margin-left: 4px;
+}
 .mv-menu-subheader {
   font-size: 9px !important;
   letter-spacing: 0.08em;

@@ -4,6 +4,7 @@ import type { Volume } from '../components/Volume';
 import { connectedComponents26, floodFillAssignLabel, extractCtBodyMask, sphereStatsInPet } from '../components/segmentation/maskOps';
 import { writeNiftiUint16, triggerDownload } from '../components/segmentation/niftiWriter';
 import { evictVolumeTexture } from '../components/webgpu/volumeCache';
+import { surfaceThresholdFor } from '../components/surfaceThreshold';
 
 export interface LabelEntry {
     id: number;
@@ -158,6 +159,8 @@ interface State {
     ctBodyMask: Uint8Array | null;
     ctBodyMaskEnabled: boolean;     // 表示時に適用するか (toggle)
     ctBodyMaskVersion: number;      // 表示更新トリガ用
+    // 体マスクから「下から N mm」を落とす (寝台/台座の除去)。0 = 使わない。
+    ctBedCutBottomMm: number;
 
     // Crosshair: 全 Box で共有する焦点位置 (world 座標)。null = 表示しない。
     crosshairWorld: THREE.Vector3 | null;
@@ -250,6 +253,7 @@ export const useSegmentationStore = defineStore('segmentation', {
         registrationVersion: 0,
 
         ctBodyMask: null,
+        ctBedCutBottomMm: 0,
         ctBodyMaskEnabled: false,
         ctBodyMaskVersion: 0,
 
@@ -1016,16 +1020,75 @@ export const useSegmentationStore = defineStore('segmentation', {
 
         // ===== CT 寝台除去 =====
         // 現在の ctVolumeRef から体マスクを抽出して保存。toggle ON で表示適用。
-        computeCtBodyMask(threshold: number = -300): boolean {
+        // threshold 未指定なら **データから決める**。
+        // 既定の -300HU は人体 CT (皮膚 ≒ 0HU) 前提で、体表の吸収が低い被写体では
+        // 体そのものを体外と誤判定して穴だらけになる (実測: sample-data/kitty は体表が
+        // -600HU 付近で、-300 だと殻が削れて輪郭が荒れた)。
+        // surfaceThresholdFor は Otsu で背景と被写体を分けるので、そのまま体マスクにも使える。
+        computeCtBodyMask(threshold?: number, cutBottomMm?: number): boolean {
             const ct = this.ctVolumeRef;
             if (!ct) return false;
+            if (threshold == null) threshold = surfaceThresholdFor(ct).threshold;
+            if (cutBottomMm == null) cutBottomMm = this.ctBedCutBottomMm;
             const t0 = performance.now();
             this.ctBodyMask = extractCtBodyMask(ct.voxel, ct.nx, ct.ny, ct.nz, threshold);
+            // **接触している寝台/台座は連結成分では分けられない。**
+            // 実測 (sample-data/kitty): 本体・台座・背板が 1 成分 (22.25%) で、
+            // 2 番目以降は 50 voxel 以下のノイズしかなかった。人体 CT では患者と寝台の間に
+            // 空気の隙間があるので最大成分＝患者になるが、被写体が台に載っていると成立しない。
+            // そこで「下から N mm を落とす」を併用する。CT では寝台は必ず下側なので、
+            // 単純だが外しにくい。0 なら従来どおり (連結成分のみ)。
+            if (cutBottomMm > 0) this.cutBodyMaskBottom(ct, cutBottomMm);
             this.ctBodyMaskEnabled = true;
             this.ctBodyMaskVersion++;
             const t1 = performance.now();
-            console.log(`[ct-bed-removal] body mask computed in ${(t1 - t0).toFixed(0)}ms (threshold=${threshold} HU)`);
+            console.log(`[ct-bed-removal] body mask computed in ${(t1 - t0).toFixed(0)}ms (threshold=${threshold!.toFixed(0)} HU)`);
             return true;
+        },
+
+        // body mask の下端 cutBottomMm を体外にする。
+        // 「下」は world -Z 方向 (患者座標で足側 / 画像で下)。
+        cutBodyMaskBottom(ct: Volume, cutBottomMm: number) {
+            const m = this.ctBodyMask;
+            if (!m) return;
+            const t0 = performance.now();
+            const { nx, ny, nz } = ct;
+            // world z は k, j, i の線形関数なので **増分で回す**。
+            // voxel ごとに関数呼び出し + 3 回の積和をすると 2900 万 voxel × 2 周で
+            // 秒単位かかり、UI が固まる (実測: 描画待ちと区別できないほど遅かった)。
+            const zk = ct.vectorZ.z, zj = ct.vectorY.z, zi = ct.vectorX.z;
+            const z0 = ct.imagePosition.z;
+
+            let minZ = Infinity;
+            for (let k = 0; k < nz; k++) {
+                const zRow0 = z0 + zk * k;
+                for (let j = 0; j < ny; j++) {
+                    const base = k * nx * ny + j * nx;
+                    let z = zRow0 + zj * j;
+                    for (let i = 0; i < nx; i++, z += zi) {
+                        if (m[base + i] !== 0 && z < minZ) minZ = z;
+                    }
+                }
+            }
+            if (!Number.isFinite(minZ)) return;
+            const cut = minZ + cutBottomMm;
+            let removed = 0;
+            for (let k = 0; k < nz; k++) {
+                const zRow0 = z0 + zk * k;
+                for (let j = 0; j < ny; j++) {
+                    const base = k * nx * ny + j * nx;
+                    let z = zRow0 + zj * j;
+                    for (let i = 0; i < nx; i++, z += zi) {
+                        if (m[base + i] !== 0 && z < cut) { m[base + i] = 0; removed++; }
+                    }
+                }
+            }
+            console.log(`[ct-bed-removal] cut bottom ${cutBottomMm}mm (below z=${cut.toFixed(1)}): `
+                + `${removed} voxels removed in ${(performance.now() - t0).toFixed(0)}ms`);
+        },
+
+        setCtBedCutBottomMm(mm: number) {
+            this.ctBedCutBottomMm = Math.max(0, mm);
         },
 
         toggleCtBodyMaskEnabled() {

@@ -38,6 +38,8 @@ import { readDicomPixels, readDicomPixelsAsInt16, autoWindowFromPixels } from '.
 import * as DecompressJpegLossless from "./decompressJpegLossless";
 import { getSeriesTransferSyntaxInfo } from "./transferSyntax";
 import { isPrimaryForFusion, isRgbSeries } from "./seriesClassify";
+import { surfaceThresholdFor } from "./surfaceThreshold";
+import { guessModalityFromVoxels } from "./modalityGuess";
 import { loadPriorityRules, scoreSeries } from "./seriesPriorityRules";
 import { buildClutLegend, type ClutLegend } from "./clutLegend";
 import { ensureWasmCodecsReady, isWasmCodecsReady } from "./wasmCodec";
@@ -1509,10 +1511,35 @@ const onSetInterpolation = (i: number, payload: { layer: 'base' | 'overlay'; mod
   showImage(i);
 };
 
+// この volume に適用すべき CT 寝台除去マスクを返す。
+// Pinia Proxy 回避のため seriesUID で照合する (voxel 参照同一でも可)。
+const ctBodyMaskForVolume = (vol: Volume.Volume | undefined | null): Uint8Array | undefined => {
+  if (!vol || !segStore.ctBodyMaskEnabled || !segStore.ctBodyMask) return undefined;
+  const ctUid = segStore.ctVolumeRef?.metadata?.seriesUID;
+  const uid = vol.metadata?.seriesUID;
+  // seriesUID を持たない volume (NIfTI 等) は voxel 参照で照合する
+  const same = (!!ctUid && ctUid === uid) || segStore.ctVolumeRef?.voxel === vol.voxel;
+  return same ? (segStore.ctBodyMask as Uint8Array) : undefined;
+};
+
 // sMIP / VR パラメータ getter / setter (titlebar 歯車 popover)
-const getBoxMipThreshold = (i: number): number | undefined => {
+const getBoxMipThreshold = (i: number): number | null | undefined => {
   if (!isAnyVolumeBox(i)) return undefined;
   return (imageBoxInfos.value[i] as VolumeImageBoxInfo).mip?.thresholdSurfaceMip;
+};
+// 自動閾値の算出結果 (スライダのレンジと "auto" 表示に使う)
+const getBoxMipAutoInfo = (i: number) => {
+  if (!isAnyVolumeBox(i)) return null;
+  const info = imageBoxInfos.value[i] as VolumeImageBoxInfo;
+  const vol = seriesList[info.currentSeriesNumber]?.volume;
+  return vol ? surfaceThresholdFor(vol) : null;
+};
+const getBoxMipShade = (i: number) => {
+  if (!isAnyVolumeBox(i)) return null;
+  const m = (imageBoxInfos.value[i] as VolumeImageBoxInfo).mip;
+  if (!m) return null;
+  return { on: m.shadeSurface !== false, ambient: m.shadeAmbient ?? 0.25,
+           specular: m.shadeSpecular ?? 0.35, depthCue: m.shadeDepthCue ?? 0.35 };
 };
 const getBoxMipDepth = (i: number): number | undefined => {
   if (!isAnyVolumeBox(i)) return undefined;
@@ -1524,12 +1551,15 @@ const getBoxMipAlphaScale = (i: number): number | undefined => {
 };
 const onSetMipParam = (
   i: number,
-  payload: { key: 'thresholdSurfaceMip' | 'depthSurfaceMip' | 'alphaScale'; value: number },
+  payload: { key: 'thresholdSurfaceMip' | 'depthSurfaceMip' | 'alphaScale'
+                 | 'shadeSurface' | 'shadeAmbient' | 'shadeSpecular' | 'shadeDepthCue';
+             value: number | null | boolean },
 ) => {
   if (!isAnyVolumeBox(i)) return;
   const info = imageBoxInfos.value[i] as VolumeImageBoxInfo;
   if (!info.mip) return;
-  info.mip[payload.key] = payload.value;
+  // thresholdSurfaceMip = null は「自動に戻す」の意味なのでそのまま入れる
+  (info.mip as any)[payload.key] = payload.value;
   showImage(i);
 };
 
@@ -2377,7 +2407,7 @@ const onBoxAutoRegister = async (boxId: number, opts?: { fromCurrent?: boolean }
 
   boxRegisterBusy.value = boxId;
   try {
-    const [{ registerMrToPt, estimateInitialParams }, tf] = await Promise.all([
+    const [{ registerMrToPt, centroidInitParams }, tf] = await Promise.all([
       import('./registration/registerMrPt'),
       import('./registration/transform'),
     ]);
@@ -2416,15 +2446,23 @@ const onBoxAutoRegister = async (boxId: number, opts?: { fromCurrent?: boolean }
     const stats = mi.estimateIntensityRange(fixed, moving, samples);
     const scoreOf = (p: any) => mi.computeNegativeMI(fixed, moving, samples, stats, p);
 
+    // ===== ① 重心で粗く合わせる → ② MI で精密に合わせる =====
+    //
+    // 別装置由来のデータは world 座標系が噛み合っておらず、初期状態では **まったく重ならない**
+    // (実測 metmri: MR と PT の重心が 210mm 離れ、MI サンプルの overlap は 0/4000)。
+    // 重なりが無ければ MI は評価すらできない (0 が返る) ので、まず重心で寄せる必要がある。
+    // 重心合わせは二値の体マスクの幾何重心どうしなので modality に依らず比較できる。
+    //
+    // 粗探索 (coarseTranslationSearch) は使わない。重心で十分寄るうえ、評価回数が増えるだけ。
     const startScore = scoreOf(startParams);
-    const start: any = startParams;
-    // **重心合わせ + 粗探索 (estimateInitialParams) は使わない。**
-    // Hirata20260728 の実測で、この推定は毎回 320〜340mm 飛ばしていた
-    // (正解が分かっている同一 FoR ペアで検証。scripts/reg-eval.mjs)。
-    // しかも「推定が現状より悪ければ採用しない」ガードが効かない — MI がその
-    // 320mm ずれた姿勢を正解姿勢より高く評価するため。指標が信用できない以上、
-    // 初期値を大きく動かす段階は入れない。
-    void estimateInitialParams;
+    let start: any = startParams;
+    if (!opts?.fromCurrent) {
+      const centroid = centroidInitParams(fixed, moving);
+      // 重心の方が MI 的に良いときだけ採用する。
+      // 重なりが無い姿勢では MI が 0 を返し、実際に重なった姿勢の負の値より必ず大きい
+      // (= 悪い) ので、この比較で自然に「寄せた方」が選ばれる。
+      if (scoreOf(centroid) < startScore) start = centroid;
+    }
 
     const res = registerMrToPt(fixed, moving, start);
     // **最終結果が開始位置より悪ければ適用しない。** registration が状況を悪化させないための保険。
@@ -2459,6 +2497,92 @@ const onBoxResetRegister = async (boxId: number) => {
   pushRegUndo(moving);
   setVolumeRegistration(moving, [0, 0, 0, 0, 0, 0]);
   show();
+};
+
+// ===== LLM に開放する読み取り専用ツールの実体 =====
+//
+// 定義 (JSON schema) は components/llm/tools.ts。ここは状態を持つ側なので実装だけ置く。
+// **返す JSON は小さく保つこと。** 4B クラスのモデルでは、16 series 分の冗長な情報だけで
+// 文脈を食い潰して指示に従えなくなる。数値は丸め、UID のような長い文字列は返さない。
+// **番号は 1 始まり**で返す。0 始まりだと小さいモデルが「PET が 2 枚」のように
+// 誤読する (実測: qwen2.5:3b が box 0/1 の 2 box を「CT 1 枚 + PET 2 枚」と答えた)。
+// 将来 LLM から操作させるときは、この 1 始まりを内部の 0 始まりへ戻すこと。
+const llmListSeries = () => {
+  const list = seriesSummaries.value;
+  // 要約文を **先に** 置く。小さいモデルは配列を数え直すのが苦手なので、
+  // 数える作業をこちらで済ませて、モデルには言い換えだけさせる。
+  const summary = list.length === 0
+    ? 'No series are loaded.'
+    : `${list.length} series ${list.length === 1 ? 'is' : 'are'} loaded: `
+      + list.map((s, i) => `(${i + 1}) ${s.modality} "${s.description || 'no description'}", ${s.fileCount} slices`)
+            .join('; ') + '.';
+  return {
+    summary,
+    count: list.length,
+    series: list.map((s, i) => ({
+      no: i + 1,
+      modality: s.modality,
+      description: s.description || '(no description)',
+      slices: s.fileCount,
+      matrix: s.matrixSize,
+      voxelMm: s.voxelSize,
+      source: s.sourceType,
+      reconstructed: !!s.hasVolume,
+    })),
+  };
+};
+
+const llmDescribeView = () => {
+  const n = tileN.value ?? 0;
+  const boxes: Record<string, unknown>[] = [];
+  const phrases: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const info = boxInfoAt(i) as any;
+    if (!info) continue;
+    const rendering = getBoxRendering(i);
+    const paging = getBoxPaging(i);
+    const fused = isBoxFused(i);
+    const shows = seriesSummaries.value[info.currentSeriesNumber]?.description || `series ${info.currentSeriesNumber + 1}`;
+    // rendering と modality を 1 つの語にまとめる。別々に出すと
+    // 「CT が native で PT が 2 枚」のように取り違えられる。
+    const kind = fused
+      ? `fusion of ${getBoxModalityLabel(i)} with "${seriesSummaries.value[info.currentSeriesNumber1]?.description ?? '?'}"`
+      : `${getBoxModalityLabel(i)} ${rendering === 'native' ? 'slice' : rendering.toUpperCase()}`;
+    const slice = paging ? `, slice ${paging.index - paging.min + 1}/${paging.max - paging.min + 1}` : '';
+    const sel = i === selectedImageBoxId.value ? ' (selected)' : '';
+    phrases.push(`box ${i + 1} shows ${kind} "${shows}"${slice}${sel}`);
+
+    const b: Record<string, unknown> = {
+      no: i + 1,
+      selected: i === selectedImageBoxId.value,
+      shows,
+      modality: getBoxModalityLabel(i),
+      rendering,                       // native | mpr | mip | smip | vr
+      fused,
+    };
+    if (fused) b.overlay = seriesSummaries.value[info.currentSeriesNumber1]?.description ?? '?';
+    if (rendering !== 'native') b.plane = getBoxCurrentPlane(i);
+    if (paging) b.slice = `${paging.index - paging.min + 1}/${paging.max - paging.min + 1}`;
+    if (info.myWC != null && info.myWW != null) b.window = { wc: Math.round(info.myWC), ww: Math.round(info.myWW) };
+    boxes.push(b);
+  }
+  const mask = segStore.finalMask ? { present: true, labels: segStore.labels.map(l => l.name) }
+                                  : { present: false };
+  const summary = boxes.length === 0
+    ? 'No image boxes are displayed.'
+    : `${boxes.length} image ${boxes.length === 1 ? 'box is' : 'boxes are'} on screen: `
+      + phrases.join('; ') + '.'
+      + (mask.present ? ' A segmentation mask is loaded.' : ' No segmentation mask yet.');
+  return {
+    summary,
+    boxCount: boxes.length,
+    syncPaging: !!syncImageBox.value,
+    selectedBox: selectedImageBoxId.value + 1,
+    petLoaded: !!segStore.petVolumeRef,
+    ctLoaded: !!segStore.ctVolumeRef,
+    segmentation: mask,
+    boxes,
+  };
 };
 
 // ===== 手動 alignment =====
@@ -3805,9 +3929,15 @@ const doSort = () => {
       const pos = new THREE.Vector3(-af[0][3], -af[1][3], af[2][3]);
 
       const niftiIdx = seriesList.length;
-      // ファイル名から modality を推定 (003PT00.nii → 'PT' 等)。
-      // 推定不能なら 'OTHER' で fallback、UI 側 Set as PT/CT/MR ボタンで上書き可能。
-      const inferredModality = detectModalityFromFilename(f.filename) ?? 'OTHER';
+      // modality 推定: ファイル名 (003PT00.nii → 'PT') を優先し、
+      // ヒントが無ければ **voxel 値の分布**から判定する (kitty.nii のように名前で分からない場合)。
+      // 分布からは CT だけが確度高く言える (空気 -1000 の指紋)。PT/MR は互いに区別できないので
+      // 推定せず 'OTHER' のままにする。UI の Set as PT/CT/MR で上書き可能。
+      const guessed = guessModalityFromVoxels(f.pixelData);
+      const inferredModality = detectModalityFromFilename(f.filename) ?? guessed.modality ?? 'OTHER';
+      if (!detectModalityFromFilename(f.filename)) {
+        console.log(`[modality] ${f.filename}: ${inferredModality} — ${guessed.reason}`);
+      }
       seriesList.push({
         myDicom: null,
         volume:{
@@ -4659,9 +4789,22 @@ const showImage = (i:number) => {
       const overlayForMip = (info.currentSeriesNumber === petIdx)
         ? buildMipMaskOverlay(i)
         : undefined;
+      // 表面投影の閾値は **null なら volume の分布から自動決定**する。
+      // 固定値は modality/被写体に依存して当たらない (kitty は体表が -900HU 付近)。
+      const vol0 = seriesList[info.currentSeriesNumber].volume!;
+      const surfThresh = info.mip!.thresholdSurfaceMip ?? surfaceThresholdFor(vol0).threshold;
       drawPromise = imb.value![i].drawNiftiMip(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,
-        angle, info.mip!.thresholdSurfaceMip, info.mip!.depthSurfaceMip, clut,
-        info.mip!.isSurface, overlayForMip, mipFastBoxes.has(i));
+        angle, surfThresh, info.mip!.depthSurfaceMip, clut,
+        info.mip!.isSurface, overlayForMip, mipFastBoxes.has(i),
+        { on: info.mip!.shadeSurface !== false,
+          ambient: info.mip!.shadeAmbient ?? 0.25,
+          specular: info.mip!.shadeSpecular ?? 0.35,
+          depthCue: info.mip!.shadeDepthCue ?? 0.35,
+          minRun: info.mip!.surfMinRun ?? 3 },
+        { x: vol0.vectorX.length(), y: vol0.vectorY.length(), z: vol0.vectorZ.length() },
+        // CT 寝台除去は MPR / fusion だけでなく MIP/sMIP にも適用する。
+        // (「CT と認識されたのに remove bed が効かない」の実体はこれが渡っていなかったこと)
+        ctBodyMaskForVolume(vol0));
       }
   }else{ // fusion
     const info = info1 as FusedVolumeImageBoxInfo;
@@ -6549,6 +6692,9 @@ defineExpose({
   selectedBoxModality,
   phantomNema,
   phantomWholeBody,
+  // LLM assistant (読み取り専用ツール) の実体
+  llmListSeries,
+  llmDescribeView,
   // App-bar ハンバーガー用: Segmentation panel の save/load パススルー
   segLoadMask: () => segPanelRef.value?.loadMask?.(),
   segExportPdf: () => segPanelRef.value?.exportPdf?.(),
@@ -6752,6 +6898,8 @@ defineExpose({
         :interpolation1="getBoxInterpolation1(i-1)"
         :mip-threshold="getBoxMipThreshold(i-1)"
         :mip-depth="getBoxMipDepth(i-1)"
+        :mip-shade="getBoxMipShade(i-1)"
+        :mip-auto-info="getBoxMipAutoInfo(i-1)"
         :mip-alpha-scale="getBoxMipAlphaScale(i-1)"
         :vr-tf-preset-id="getBoxVrTfPresetId(i-1)"
         :vr-tf-presets="vrTfPresetsView"
@@ -6782,7 +6930,7 @@ defineExpose({
         :active-window-layer="getBoxActiveWindowLayer(i-1)"
         @set-active-window-layer="(l: 'base' | 'overlay') => onSetActiveWindowLayer(i-1, l)"
         @set-interpolation="(p: { layer: 'base'|'overlay'; mode: 'nearest'|'bilinear' }) => onSetInterpolation(i-1, p)"
-        @set-mip-param="(p: { key: 'thresholdSurfaceMip' | 'depthSurfaceMip' | 'alphaScale'; value: number }) => onSetMipParam(i-1, p)"
+        @set-mip-param="(p: any) => onSetMipParam(i-1, p)"
         @set-vr-tf-preset="(id: string) => onSetVrTfPreset(i-1, id)"
         @set-vr-tf-points="(pts: { v: number; a: number }[]) => onSetVrTfPoints(i-1, pts)"
         @set-vr-shading="(p: { key: 'enabled'|'ambient'|'diffuse'|'specularInt'|'specularPower'; value: number | boolean }) => onSetVrShading(i-1, p)"

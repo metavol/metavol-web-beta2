@@ -177,6 +177,18 @@ export default defineConfig({
   },
   server: {
     port: 3000,
+    proxy: {
+      // ローカルの Ollama へ中継する。ブラウザから直接 http://localhost:11434 を叩くと
+      // origin が違うため CORS の設定 (OLLAMA_ORIGINS) に依存してしまうので、
+      // dev では same-origin の /ollama 経由にして依存を消す。
+      // 本番 (GitHub Pages) には proxy が無いので、その場合は設定で
+      // http://localhost:11434 を直接指定する (Ollama 側で OLLAMA_ORIGINS の許可が必要)。
+      '/ollama': {
+        target: 'http://127.0.0.1:11434',
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/ollama/, ''),
+      },
+    },
   },
   build: {
     rollupOptions: {

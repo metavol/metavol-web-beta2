@@ -10,6 +10,7 @@
 import { getGpuDevice } from './gpuContext';
 import { getVolumeTexture } from './volumeCache';
 import { getMaskTexture, getDummyMaskTexture } from './maskCache';
+import { getBodyMaskTexture, getDummyBodyMaskTexture } from './bodyMaskCache';
 import { MIP_SHADER_WGSL } from './mipShader';
 import { getClutBuffer, ensureOffscreen, getMipBindGroupLayout } from './gpuShared';
 import { usePerfStore } from '../../stores/perf';
@@ -18,7 +19,7 @@ interface PipelineCache {
     device: any;
     pipeline: any;
     bindLayout: any;
-    uniformBuf: any;        // 112 byte uniform (Params struct)
+    uniformBuf: any;        // 160 byte uniform (Params struct)
 }
 
 let pipelineCache: PipelineCache | null = null;
@@ -36,7 +37,7 @@ const ensurePipeline = async (): Promise<PipelineCache | null> => {
         compute: { module, entryPoint: 'main' },
     });
     const uniformBuf = device.createBuffer({
-        size: 112,
+        size: 160,
         usage: 0x40 | 0x8,  // UNIFORM | COPY_DST
     });
     pipelineCache = { device, pipeline, bindLayout, uniformBuf };
@@ -66,6 +67,17 @@ export interface GpuMipParams {
     isSurface: boolean;
     surfThresh: number;
     surfDepth: number;
+    // 表面陰影 (shaded surface projection)。isSurface のときだけ効く。
+    shadeSurface?: boolean;
+    shadeAmbient?: number;    // 0..1  既定 0.25
+    shadeSpecular?: number;   // 0..1  既定 0.35
+    shadeDepthCue?: number;   // 0..1  既定 0.35 (奥ほど暗く)
+    // 勾配の異方性補正用の voxel pitch (mm)。未指定なら等方とみなす。
+    voxelPitch?: { x: number; y: number; z: number };
+    // 表面と認めるのに必要な「視線方向の連続ヒット数」。1 = 従来 (単発で採用)。
+    surfMinRun?: number;
+    // CT 寝台除去用 body mask (0=体外)。volume と同じ格子であること。
+    bodyMask?: Uint8Array;
     clut: number[][];
     overlay?: GpuMipOverlay;  // 未指定ならマスクなし MIP
     targetCanvas: HTMLCanvasElement;  // 描画先 2D canvas (offscreen キャッシュ key)
@@ -102,8 +114,14 @@ export const gpuRenderMip = async (
         labelClutBuf = clutBuf;       // 使われないので何でも OK
     }
 
-    // Uniform: Params 112 bytes
-    const ubuf = new ArrayBuffer(112);
+    // 寝台除去 body mask。未指定なら dummy を bind (結果に影響しない)。
+    const hasBodyMask = !!p.bodyMask && p.bodyMask.length === p.nx * p.ny * p.nz;
+    const bodyMaskTex = hasBodyMask
+        ? getBodyMaskTexture(device, p.bodyMask!, p.nx, p.ny, p.nz)
+        : getDummyBodyMaskTexture(device);
+
+    // Uniform: Params 160 bytes (shade / aspect / outAndMode2 の vec4 を 3 本追加)
+    const ubuf = new ArrayBuffer(160);
     const i32 = new Int32Array(ubuf);
     const f32 = new Float32Array(ubuf);
     i32[0] = p.nx; i32[1] = p.ny; i32[2] = p.nz; i32[3] = 0;
@@ -122,6 +140,17 @@ export const gpuRenderMip = async (
     f32[25] = p.surfDepth;
     f32[26] = overlayAlpha;
     f32[27] = labelClutLen;
+    f32[28] = p.shadeSurface ? 1 : 0;
+    f32[29] = p.shadeAmbient  ?? 0.25;
+    f32[30] = p.shadeSpecular ?? 0.35;
+    f32[31] = p.shadeDepthCue ?? 0.35;
+    // 勾配を mm 基準にするための voxel pitch。kitty は 0.117/0.117/0.5 と z が 4 倍粗く、
+    // これを無視すると法線が z 方向に潰れて陰影が横縞になる。
+    f32[32] = p.voxelPitch?.x ?? 1;
+    f32[33] = p.voxelPitch?.y ?? 1;
+    f32[34] = p.voxelPitch?.z ?? 1;
+    f32[35] = Math.max(1, Math.round(p.surfMinRun ?? 3));
+    i32[36] = hasBodyMask ? 1 : 0;
     device.queue.writeBuffer(uniformBuf, 0, ubuf);
 
     const swapTex = off.ctx.getCurrentTexture();
@@ -137,6 +166,7 @@ export const gpuRenderMip = async (
             { binding: 3, resource: swapView },
             { binding: 4, resource: maskView },
             { binding: 5, resource: { buffer: labelClutBuf } },
+            { binding: 6, resource: bodyMaskTex.createView({ dimension: '3d' }) },
         ],
     });
 

@@ -14,8 +14,20 @@ import * as Volume from './Volume';
 export const makeMipState = (isSurface = false) => ({
     mipAngle: 0,
     isSurface,
-    thresholdSurfaceMip: 0.3,
-    depthSurfaceMip: 3,
+    // **null = 未設定 → volume から自動決定する。**
+    // 固定既定値 (旧: 0.3) は PET の SUV 前提で、HU スケールのデータでは意味を成さない
+    // (kitty は体表が -900HU 付近なので 0.3 では何も拾えない、あるいは骨だけになる)。
+    thresholdSurfaceMip: null as number | null,
+    // 0 = 当たった面そのものを描く純粋な表面投影。>0 ならそこから奥へ MIP。
+    depthSurfaceMip: 0,
+    // 表面陰影。形が見えるのは陰影のおかげなので既定 ON。
+    shadeSurface: true,
+    shadeAmbient: 0.25,
+    shadeSpecular: 0.35,
+    shadeDepthCue: 0.35,
+    // 体表と空気の差が小さいデータではノイズ 1 voxel でヒット位置が跳ねるので、
+    // 連続して閾値を超えたときだけ表面とみなす。
+    surfMinRun: 3,
 });
 
 export type ImageBoxInfoBase = {
@@ -54,8 +66,16 @@ export type VolumeImageBoxInfo = ImageBoxInfoBase & {
     mip: {
         mipAngle: number,
         isSurface: boolean,
-        thresholdSurfaceMip: number,
+        // null = 自動 (volume の分布から決める)。surfaceThresholdFor() 参照。
+        thresholdSurfaceMip: number | null,
         depthSurfaceMip: number,
+        // 表面陰影 (shaded surface projection)
+        shadeSurface?: boolean,
+        shadeAmbient?: number,
+        shadeSpecular?: number,
+        shadeDepthCue?: number,
+        // 表面と認めるのに必要な視線方向の連続ヒット数 (既定 3)
+        surfMinRun?: number,
         // VR opacity ramp の倍率 (default 0.06)。alphaScale ↑ で不透明、↓ で透けやすい。
         // VR にも MIP にも mip オブジェクトを共用してるのでここに置く。
         alphaScale?: number,

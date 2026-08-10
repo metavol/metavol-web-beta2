@@ -223,17 +223,20 @@ export interface RegOptions {
     samples?: number[];     // 各レベルの sample 数 (factors と同じ長さ)
 }
 // Hirata20260728 (CT TRANSAXIAL+ × PET TRANSAXIAL、同一 FoR を正解として既知量ずらして戻す)
-// での実測 (平均 mTRE、開始誤差の平均は 49.1mm):
-//   初期値推定 + pyramid[4,2,1] (旧既定)  320.9mm   ← 毎回 300mm 超えて壊す
-//   初期値推定なし + pyramid[4,2,1]       153.3mm
-//   初期値推定なし + pyramid[2,1]          84.9mm
-//   初期値推定なし + 単一解像度            48.0mm   ← 最良 (= ほぼ「動かさない」)
-//   初期値推定 + 単一解像度               346.2mm
-// 段階を足すほど悪化する。とくに **多重解像度は全身 PET/CT では有害** (最粗レベルで
-// 解剖の対応が失われ、偽の最適に落ちてから戻れない)。
-// 実害を止めるため既定は単一解像度にしてある。scripts/reg-eval.mjs で再測定できる。
+// での実測 (平均 mTRE、開始誤差 26.9〜70.8mm)。**2026-08 に幾何を壊す 2 つのバグを直した後**の値:
+//   重心 + pyramid[2,1]      1.6mm   ← 最良 (既定)
+//   重心 + pyramid[4,2,1]    2.3mm
+//   初期値なし + pyramid     3.9mm
+//   重心 + 単一解像度        6.8mm
+//   初期値なし + 単一解像度  11.6mm
+// 多重解像度は **有効**。初期値 (重心合わせ) も有効。所要 1 秒前後。
+//
+// 注意: これ以前の測定 (旧 CLAUDE.md 3.58 の「MI は全身 PET/CT で成立しない」320mm 等) は
+// applyRigidToVolume の正規化バグ (voxel pitch 破壊) と estimateIntensityRange の
+// 姿勢依存バグ (MI が恒等的に 0) の上で取ったもので、**すべて無効**。
+// 再測定は scripts/reg-eval.mjs。
 export const DEFAULT_REG_OPTIONS: Required<RegOptions> = {
-    normalized: false, bodyOnly: false, factors: [1], samples: [12000],
+    normalized: false, bodyOnly: false, factors: [2, 1], samples: [8000, 10000],
 };
 
 export const registerMrToPt = (

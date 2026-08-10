@@ -76,8 +76,13 @@ const prop = defineProps<{
   interpolation?: 'nearest' | 'bilinear';
   interpolation1?: 'nearest' | 'bilinear';
   // sMIP / VR の現在値 (titlebar 歯車 popover の表示用)。MIP / 通常スライスでは null/undefined。
-  mipThreshold?: number;
+  // null = 自動 (親が volume の分布から決めた値を mipAutoInfo で渡す)
+  mipThreshold?: number | null;
   mipDepth?: number;
+  // 表面陰影の設定
+  mipShade?: { on: boolean; ambient: number; specular: number; depthCue: number } | null;
+  // 自動閾値の算出結果とデータの値域 (スライダのレンジに使う)
+  mipAutoInfo?: { threshold: number; backgroundPeak: number; range: [number, number] } | null;
   mipAlphaScale?: number;
   // VR Phase A: opacity transfer function preset id (vrTf.TF_PRESETS から)
   vrTfPresetId?: string;
@@ -140,7 +145,12 @@ const emit = defineEmits<{
   // VolumeBox は layer='base' のみ送る。FusionBox は base / overlay 両方を別々に切替可能。
   (e: 'setInterpolation', payload: { layer: 'base' | 'overlay'; mode: 'nearest' | 'bilinear' }): void;
   // sMIP / VR のレンダリングパラメータ更新 (titlebar 歯車 popover)
-  (e: 'setMipParam', payload: { key: 'thresholdSurfaceMip' | 'depthSurfaceMip' | 'alphaScale'; value: number }): void;
+  // thresholdSurfaceMip は null を渡せる (= 自動に戻す)。shade* は表面陰影の設定。
+  (e: 'setMipParam', payload: {
+    key: 'thresholdSurfaceMip' | 'depthSurfaceMip' | 'alphaScale'
+       | 'shadeSurface' | 'shadeAmbient' | 'shadeSpecular' | 'shadeDepthCue';
+    value: number | null | boolean;
+  }): void;
   // VR Phase A: TF preset 切替
   (e: 'setVrTfPreset', presetId: string): void;
   // VR D15: 直接 control points を更新 (editor 経由)。preset id は親側で 'custom' に。
@@ -301,6 +311,17 @@ const overflowEl = ref<HTMLElement | null>(null);
 const overflowOpen = ref(false);
 // 広くなったら開きっぱなしを畳む (アイコンは元の位置に戻るのでパネルが空になる)
 watch(isCompact, (c) => { if (!c) overflowOpen.value = false; });
+
+// 表面投影スライダのレンジ。データの実値域 (自動閾値算出で使った範囲) に合わせる。
+const surfMin = computed(() => prop.mipAutoInfo ? prop.mipAutoInfo.range[0] : 0);
+const surfMax = computed(() => prop.mipAutoInfo ? prop.mipAutoInfo.range[1] : 20);
+const surfStep = computed(() => {
+  const span = surfMax.value - surfMin.value;
+  return span > 200 ? 5 : span > 20 ? 1 : 0.1;   // HU なら 5 刻み、SUV なら 0.1 刻み
+});
+// null (自動) のときは算出値を表示する
+const effMipThreshold = computed(() =>
+  prop.mipThreshold ?? prop.mipAutoInfo?.threshold ?? 0);
 
 const pagingSliderValue = computed(() => {
   const p = prop.paging;
@@ -728,7 +749,12 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
     p00:THREE.Vector3, v01:THREE.Vector3,v10:THREE.Vector3,
     angle:number, thresh:number, depth:number, clut: number[][], isSurface: boolean,
     overlay?: MaskOverlay,
-    fast: boolean = false) {
+    fast: boolean = false,
+    // 表面陰影 (shaded surface projection) の設定と、勾配補正用の voxel pitch
+    shade?: { on: boolean; ambient: number; specular: number; depthCue: number; minRun?: number },
+    voxelPitch?: { x: number; y: number; z: number },
+    // CT 寝台除去用 body mask (0=体外)。MIP/sMIP でも寝台を消すために受け取る。
+    bodyMask?: Uint8Array) {
 
       const time0 = performance.now();
 
@@ -751,6 +777,13 @@ const drawNiftiMip = async function(pix: Float32Array | Int16Array,
             angle, wc, ww,
             isSurface,
             surfThresh: thresh, surfDepth: depth,
+            shadeSurface: !!shade?.on,
+            shadeAmbient: shade?.ambient,
+            shadeSpecular: shade?.specular,
+            shadeDepthCue: shade?.depthCue,
+            voxelPitch,
+            surfMinRun: shade?.minRun,
+            bodyMask,
             clut,
             overlay: overlay ? {
               mask: overlay.mask,
@@ -1782,11 +1815,17 @@ defineExpose({init, show, show2, showRgb, showDirect,
                         <v-card-text class="pa-3">
                             <!-- sMIP: slider + 数値入力併設 (細かい値を直接打てる) -->
                             <template v-if="prop.currentPlane === 'smip'">
-                                <div class="mv-tb-popover-label">Threshold</div>
+                                <div class="mv-tb-popover-label">
+                                    Surface threshold
+                                    <button class="mv-tb-auto" title="Recompute from this volume's histogram"
+                                            @click="emit('setMipParam', { key: 'thresholdSurfaceMip', value: null })">Auto</button>
+                                </div>
+                                <!-- レンジは **データの実値域**。0..20 固定だと SUV 以外では使えない
+                                     (kitty は体表が -900HU 付近で、0..20 のスライダでは触れない)。 -->
                                 <div class="mv-tb-slider-row">
                                     <v-slider
-                                        :model-value="prop.mipThreshold ?? 0.3"
-                                        :min="0" :max="20" :step="0.1"
+                                        :model-value="effMipThreshold"
+                                        :min="surfMin" :max="surfMax" :step="surfStep"
                                         density="compact" hide-details color="primary"
                                         class="mv-tb-slider-grow"
                                         @update:model-value="(v: number | number[]) => emit('setMipParam', { key: 'thresholdSurfaceMip', value: Array.isArray(v) ? v[0] : v })"
@@ -1794,16 +1833,22 @@ defineExpose({init, show, show2, showRgb, showDirect,
                                     <input
                                         type="number"
                                         class="mv-tb-num-input"
-                                        :value="Number((prop.mipThreshold ?? 0.3).toFixed(2))"
-                                        step="0.1" min="0"
+                                        :value="Number(effMipThreshold.toFixed(surfStep < 1 ? 2 : 0))"
+                                        :step="surfStep"
                                         @change="(e: Event) => emit('setMipParam', { key: 'thresholdSurfaceMip', value: Number((e.target as HTMLInputElement).value) })"
                                     />
                                 </div>
-                                <div class="mv-tb-popover-label mt-3">Depth (voxels)</div>
+                                <div v-if="prop.mipThreshold == null" class="mv-tb-popover-hint">
+                                    auto — background peak {{ Math.round(prop.mipAutoInfo?.backgroundPeak ?? 0) }}
+                                </div>
+
+                                <div class="mv-tb-popover-label mt-3">
+                                    Depth (voxels) — 0 = surface only
+                                </div>
                                 <div class="mv-tb-slider-row">
                                     <v-slider
-                                        :model-value="prop.mipDepth ?? 3"
-                                        :min="1" :max="40" :step="1"
+                                        :model-value="prop.mipDepth ?? 0"
+                                        :min="0" :max="40" :step="1"
                                         density="compact" hide-details color="primary"
                                         class="mv-tb-slider-grow"
                                         @update:model-value="(v: number | number[]) => emit('setMipParam', { key: 'depthSurfaceMip', value: Array.isArray(v) ? v[0] : v })"
@@ -1811,11 +1856,41 @@ defineExpose({init, show, show2, showRgb, showDirect,
                                     <input
                                         type="number"
                                         class="mv-tb-num-input"
-                                        :value="Math.round(prop.mipDepth ?? 3)"
-                                        step="1" min="1"
+                                        :value="Math.round(prop.mipDepth ?? 0)"
+                                        step="1" min="0"
                                         @change="(e: Event) => emit('setMipParam', { key: 'depthSurfaceMip', value: Math.round(Number((e.target as HTMLInputElement).value)) })"
                                     />
                                 </div>
+
+                                <div class="mv-tb-popover-label mt-3">Shading</div>
+                                <label class="mv-tb-check">
+                                    <input type="checkbox" :checked="prop.mipShade?.on !== false"
+                                           @change="(e: Event) => emit('setMipParam', { key: 'shadeSurface', value: (e.target as HTMLInputElement).checked })" />
+                                    <span>Shade the surface (gradient normals)</span>
+                                </label>
+                                <template v-if="prop.mipShade?.on !== false">
+                                    <div class="mv-tb-slider-row mt-1">
+                                        <span class="mv-tb-mini">ambient</span>
+                                        <v-slider :model-value="prop.mipShade?.ambient ?? 0.25"
+                                                  :min="0" :max="1" :step="0.05"
+                                                  density="compact" hide-details color="primary" class="mv-tb-slider-grow"
+                                                  @update:model-value="(v: number | number[]) => emit('setMipParam', { key: 'shadeAmbient', value: Array.isArray(v) ? v[0] : v })" />
+                                    </div>
+                                    <div class="mv-tb-slider-row">
+                                        <span class="mv-tb-mini">specular</span>
+                                        <v-slider :model-value="prop.mipShade?.specular ?? 0.35"
+                                                  :min="0" :max="1" :step="0.05"
+                                                  density="compact" hide-details color="primary" class="mv-tb-slider-grow"
+                                                  @update:model-value="(v: number | number[]) => emit('setMipParam', { key: 'shadeSpecular', value: Array.isArray(v) ? v[0] : v })" />
+                                    </div>
+                                    <div class="mv-tb-slider-row">
+                                        <span class="mv-tb-mini">depth cue</span>
+                                        <v-slider :model-value="prop.mipShade?.depthCue ?? 0.35"
+                                                  :min="0" :max="1" :step="0.05"
+                                                  density="compact" hide-details color="primary" class="mv-tb-slider-grow"
+                                                  @update:model-value="(v: number | number[]) => emit('setMipParam', { key: 'shadeDepthCue', value: Array.isArray(v) ? v[0] : v })" />
+                                    </div>
+                                </template>
                             </template>
                             <!-- VR: opacity TF preset + alpha scale slider/数値 (Phase A) -->
                             <template v-else>
@@ -2299,6 +2374,37 @@ defineExpose({init, show, show2, showRgb, showDirect,
 
 /* タイトルバー overflow パネル: 狭い box で溢れたアイコン列の退避先。
    titlebar のすぐ下に重ね、アイコンは折り返して並べる。 */
+/* 表面投影パラメータ popover 用 */
+.mv-tb-auto {
+  float: right;
+  border: 1px solid var(--mv-border-strong, #3a4a5c);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--mv-accent, #00d4aa);
+  font-size: 9px;
+  padding: 0 5px;
+  cursor: pointer;
+}
+.mv-tb-auto:hover { background: rgba(0, 212, 170, 0.18); }
+.mv-tb-popover-hint {
+  font-size: 9px;
+  color: var(--mv-text-muted, #5a6877);
+  margin-top: 2px;
+}
+.mv-tb-check {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  color: var(--mv-text-dim, #8fa0b0);
+}
+.mv-tb-mini {
+  font-size: 9px;
+  color: var(--mv-text-muted, #5a6877);
+  width: 54px;
+  flex: 0 0 auto;
+}
+
 .mv-tb-overflow {
   position: absolute;
   top: 22px;              /* .mv-titlebar の高さ */

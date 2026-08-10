@@ -104,12 +104,15 @@ try {
     // **パイプライン構成の比較。** 指標 (MI/NMI) ではなく、初期値推定とピラミッドの
     // 有無で切る。診断で「guess が数百 mm 飛ばす」「ピラミッドが正解から離す」と出たため。
     const O = { normalized: false, bodyOnly: false };
+    // 2026-08 再測定: applyRigidToVolume の正規化バグ (voxel pitch 破壊) と
+    // estimateIntensityRange の姿勢依存バグ (MI が恒等的に 0) を直した後の比較。
+    // 以前の結論 (CLAUDE.md 3.58) はこの 2 つのバグの上に立てたもので信頼できない。
     const variants = [
-      { name: 'A guess + pyr[4,2,1] (current)', guess: true,  o: { ...O } },
-      { name: 'B no-guess + pyr[4,2,1]',        guess: false, o: { ...O } },
-      { name: 'C no-guess + pyr[2,1]',          guess: false, o: { ...O, factors: [2,1], samples: [8000,8000] } },
-      { name: 'D no-guess + single[1]',         guess: false, o: { ...O, factors: [1],   samples: [12000] } },
-      { name: 'E guess + single[1]',            guess: true,  o: { ...O, factors: [1],   samples: [12000] } },
+      { name: 'A centroid + pyr[4,2,1]',   guess: true,  o: { ...O } },
+      { name: 'B no-init + pyr[4,2,1]',    guess: false, o: { ...O } },
+      { name: 'C centroid + pyr[2,1]',     guess: true,  o: { ...O, factors: [2,1], samples: [8000,8000] } },
+      { name: 'D centroid + single[1]',    guess: true,  o: { ...O, factors: [1],   samples: [12000] } },
+      { name: 'E no-init + single[1]',     guess: false, o: { ...O, factors: [1],   samples: [12000] } },
     ];
 
     const rows = [];
@@ -117,7 +120,7 @@ try {
       for (const pb of perturbs) {
         tf.applyRigidToVolume(M, snap, pb.p);       // わざとずらす
         const t0 = performance.now();
-        const start = v.guess ? reg.estimateInitialParams(F, M, v.o) : [0,0,0,0,0,0];
+        const start = v.guess ? reg.centroidInitParams(F, M) : [0,0,0,0,0,0];
         const res = reg.registerMrToPt(F, M, start, undefined, undefined, v.o);
         const ms = Math.round(performance.now() - t0);
         rows.push({ variant: v.name, perturb: pb.name,
