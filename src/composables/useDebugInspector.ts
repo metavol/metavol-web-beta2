@@ -2,6 +2,7 @@ import { ref, type Ref } from 'vue';
 import * as THREE from '@/lib/threeMath';
 import { readDicomPixels } from '../components/dicomPixels';
 import { useSegmentationStore } from '../stores/segmentation';
+import { evictVolumeTexture } from '../components/webgpu/volumeCache';
 
 // DicomView の Voxel inspector (デバッグ機能) を切り出した composable。
 // DicomView.vue が肥大化していたため、hover 情報収集・マスク層読み取り・shift+click 編集を分離。
@@ -252,6 +253,11 @@ export function useDebugInspector(ctx: DebugInspectorCtx) {
       return true;
     }
     target.voxel[idx] = newVal;
+    // **GPU cache を捨てること。** volumeCache の key は voxel TypedArray の**参照**なので、
+    // 中身を 1 セル書き換えても cache hit してしまい、texture が再アップロードされない。
+    // 症状は「inspector の数値だけ変わって画像が変わらない」で、CPU mode では正しく見えるため
+    // 気付きにくい (CLAUDE.md 既知バグ 5)。デバッグ機能なので再アップロードのコストは許容する。
+    evictVolumeTexture(target.voxel);
     console.log(`[debug edit] series ${chosenIdx} (${i},${j},${k}): ${cur} → ${newVal}`);
     ctx.show();
     return true;

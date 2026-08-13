@@ -60,14 +60,57 @@ URL クリック → ロード → 見て閉じる
 
 ---
 
+## 手動検証待ち (ユーザが手を離せるとき / 2026-08-12 時点)
+
+コードは入っていて型チェック・ビルド・スクリプト検証は通っているが、**実際の画面で人の目による
+確認が済んでいない**もの。スクリプトで代替できない (見た目・操作感の判断が要る) 項目だけを挙げる。
+
+- [ ] **registration の適用可否ゲート** — hirata2 で auto-register が実行されず理由が出ること。
+      metmri / Hirata20260728 では従来どおり動くこと。(上の registration 項目に詳細)
+- [ ] **bed removal (cut bottom 22mm)** — kitty で寝台が消え、体表が削れていないこと。
+      Sidebar → Advanced → CT bed cut のスライダで調整できること。
+- [ ] **surface projection (sMIP)** — kitty で体表が滑らかに出ること。閾値自動 (Otsu -672) が妥当か。
+      縞・ノイズが出ていないか。
+- [ ] **LLM tool calling** — Ollama 起動状態で「シリーズを教えて」「今の表示は？」に正しく答えるか。
+      qwen2.5:3b で 15〜17s かかる往復が実用に耐えるか。
+- [ ] **マスク round-trip の UI 外殻** — 中核の往復はスクリプトで検証済 (差分 0)。
+      残るのはファイル選択ダイアログ、sidecar JSON の同時選択、PT seriesUID 不一致時の
+      confirm ダイアログの 3 点。
+- [ ] **paging の `invert: true` 分岐** — スライス順が逆のシリーズで ↑ が常に頭側になるか。
+      実データで逆順のシリーズが手元にあるか自体が未確認。
+
 ## 未着手 / 継続中
 
-### ~~★最優先: 画像重ね合わせ (registration)~~ ✅ 解決 (2026-08)
+### ★最優先: 画像重ね合わせ (registration) — **部分解決** (2026-08)
 
-幾何を壊す 2 つのバグ (`applyRigidToVolume` の正規化 / `estimateIntensityRange` の姿勢依存) が
-真因だった。修正後 Hirata で平均 mTRE 1.6mm、metmri でも収束を確認。詳細は **CLAUDE.md 3.58**。
+幾何を壊す 2 つのバグ (`applyRigidToVolume` の正規化 / `estimateIntensityRange` の姿勢依存) を
+修正し、**視野が同等なペアでは機能するようになった** (Hirata mTRE 1.6mm、metmri 収束確認)。
+詳細は **CLAUDE.md 3.58**。
 
-- **マスクロード round-trip**: `niftiReader.ts` は実装済だが、SegmentationPanel からの読込フローが segmentation store に反映されるか未検証。書いて読み戻す e2e テストが必要
+**ただし視野が大きく食い違うペアは未解決** (CLAUDE.md 3.59)。hirata2 (CT=胸部 413mm ×
+PET=全身 1148mm) では MI / NMI / 体内限定 / 形状の **5 指標すべてが正解を指さない**。
+現状は `assessFeasibility` が z 方向の広がり比 1.6 倍以上を検出して**自動位置合わせを実行しない**。
+
+- [ ] **手動検証 (ユーザ)**: hirata2 を開いて CT に PET を fuse → auto-register が実行されず
+      理由ダイアログが出ること / 手動 alignment で合わせられること。
+      metmri と Hirata20260728 では従来どおり動くこと。
+      検証補助: `node scripts/reg-feasibility-check.mjs --case hirata2`
+- [ ] **有望な解法が見つかった (2026-08-12、未実装)**: **肺プロファイル相関** (CLAUDE.md 3.595)。
+      CT の視野内で world z ごとに「体シルエット内の抜けている割合」を出し、CT/PET で相関を取る。
+      **hirata2 で誤差 5mm、Hirata20260728 でも 5mm。3.59 で 50〜60mm 外していた症例が入る。**
+      自己試験にも合格。`node scripts/reg-lung-sweep.mjs --case <症例>`
+      - [ ] 製品に入れる前: x/y と回転をどうするか決める (プロファイルは z しか決めない)
+      - [ ] 製品に入れる前: **別患者で確認**。今の 2 症例は CT が同一シリーズだった
+      - [ ] 入れ方の判断 (ユーザ): 現行ゲート「視野比 1.6 倍以上なら実行しない」を置き換えるか、
+            それとも「手動調整の補助として z 候補を提示する」に留めるか
+- [ ] **本命の解法 (より一般)**: 解剖ランドマークベース (TotalSegmentator の臓器ラベル同士)。
+      肺プロファイルは肺が両方に丸ごと写っている症例に限られる。→ 下の TotalSegmentator 項目と直結
+
+- ~~**マスクロード round-trip**~~ ✅ 検証済 (2026-08-12) — `node scripts/mask-roundtrip.mjs`。
+  Hirata の PET 256x490x146 で writeNiftiUint16 → readNiftiMask → `store.loadMaskFromNifti` の往復が
+  **差分 0 voxel**、多ラベル (2 種 × 106,668) 保持、voxel pitch 誤差 0、sidecar の threshold/labels 復元、
+  dims 不一致の拒否まで確認。**未カバー**: `<input type=file>` の選択ダイアログと
+  `onLoadMaskFiles` の外殻 (sidecar JSON パース、PT seriesUID 不一致の confirm)。ここは手動検証側。
 - **composable 切り出し**: `DicomView.vue` (~1900行) を `useSphereROI` / `usePolygonROI` / `useDebug` 等に分解
 - **バンドル 500KB 超**: `vite build` 時 warning。manual chunk 分割（vendor / nifti / dcmjs-codecs を分離）
 

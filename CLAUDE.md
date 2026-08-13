@@ -323,7 +323,8 @@ sticky レイアウト。よく使う保存と mask opacity は常に見える�
 - **有効化**: URL `?debug=1` で起動時 ON、または **Ctrl+Shift+D** トグル
 - ON 時は画面右下に赤い `DEBUG` バッジ
 - **voxel inspector** (`DebugInspector.vue`): マウスホバーで全シリーズの voxel 値テーブルを表示。ドラッグ中は抑止
-- **voxel 編集**: Shift+左クリックで `prompt()` ダイアログ。`Volume.voxel[idx]` を直接書換 → `show()`
+- **voxel 編集**: Shift+左クリックで `prompt()` ダイアログ。`Volume.voxel[idx]` を直接書換 →
+  `evictVolumeTexture(voxel)` (GPU cache 破棄。無いと画像が変わらない。既知バグ 5 参照) → `show()`
 - 実装は `composables/useDebugInspector.ts`（`updateDebugHover` / `handleDebugEditClick` / debug ref 群）。`debugMode` は defineModel なので DicomView 側に残り、composable に渡す。`seriesList` は reassign される let なので getter (`getSeriesList`) 経由で渡す
 
 ## DicomView.vue の composable 分割（肥大化対策・進行中）
@@ -651,6 +652,113 @@ node scripts/reg-metmri.mjs    # metmri: 極小チェック + 収束半径
 node scripts/affine-check.mjs  # world↔voxel の検算 (数秒、DICOM 不要)
 ```
 
+### 3.59. **視野が食い違うペアには自動位置合わせを掛けないこと (2026-08)**
+
+3.58 の 2 バグを直しても、**一方が他方の一部しか写していないペアでは強度ベースが原理的に破綻する**。
+`assessFeasibility` (registerMrPt.ts) が z 方向の広がり比 **1.6 倍以上**を検出し、
+`onBoxAutoRegister` は実行せず理由を出して手動調整へ誘導する。重心初期化も同条件で無効化する。
+
+**実測 (hirata2: CT "Lung" 413mm × PET TRANSAXIAL 1148mm、比 2.8×)**
+
+目視 (冠状断の融合画像) では **読み込み時点 (identity) がほぼ正解**。自動位置合わせを掛けると
+tz=+48.6mm 動いて肝臓が右下肺野へ食い込み、明確に悪化した。tz を -60〜+80mm で掃引した結果:
+
+| 指標 | 最小/最大の tz | 判定 |
+|---|---|---|
+| MI  全体サンプル | +55mm | NG |
+| MI  体内限定 | +55mm | NG |
+| NMI 全体サンプル | +50mm | NG |
+| NMI 体内限定 | +50mm | NG |
+| 形状 (体断面積プロファイル相関) | -60mm (探索端。-20〜+45 は 0.168〜0.177 で平坦) | NG |
+
+**正解付近 (tz≒0) に極小すら無く、間違った方向へ単調に改善する。**
+
+- **原因**: PET を頭側へずらすと CT の胸部視野に PET の腹部 (肝・腎・脾で情報量が多い) が入る。
+  胸部の PET は肺で抜けて情報量が乏しい。MI は「対応の正しさ」ではなく
+  **「情報量の多い領域が視野に入っているか」**を測ってしまう。
+  **重なり量は変わらないので NMI でも消えない。**
+- **形状指標が効かない理由**: 胸部は体断面積の変化が乏しく、z を識別する特徴が出ない。
+- **重心合わせも無効**: 視野が違えば両者の体重心は別の解剖学的高さを指す (tz=+159.8mm と出た)。
+  metmri (脳 MR 193mm × 脳 PET 165mm、比 1.17×) で 210mm のズレを正しく消せたのとは前提が違う。
+
+**「複数の最適化経路を用意して最良を選ぶ」は、この症例では機能しない。** 実際に 8 通りの初期値から
+走らせたが全て同じ解に収束した (7.4s、改善ゼロ)。**選択基準そのものが正解を指さない**ため、
+経路を増やしても届かない。ここを直すには目的関数を変えるしかない。
+
+**本命の解法は解剖ランドマークベース** (TotalSegmentator の臓器ラベル同士を合わせる)。
+強度でも体輪郭でも視野非対称に耐えられない。TODO の TotalSegmentator 項目と直結。
+
+**検証スクリプト**
+```bash
+node scripts/reg-feasibility-check.mjs --case hirata2   # ゲートの分岐確認
+node scripts/reg-metric-sweep.mjs                       # MI/NMI × 全体/体内 の tz 掃引
+node scripts/reg-shape-sweep.mjs                        # 形状指標の tz 掃引
+node scripts/reg-hirata2-visual.mjs                     # 冠状断の融合画像を出して目視
+```
+
+**教訓: 自作の代理指標を信用しないこと。** このセッションで body-mask Dice / z プロファイル相関 v1 /
+v2 の 3 つを作り、3 つとも壊れていた (感度不足 / ±245mm 探索での偽ピーク / 相互に矛盾)。
+全身 PET/CT の位置合わせは **冠状断の融合画像を見るのが最も直接的**。指標を新しく作ったら、
+既知量ずらして検出できるかの**自己試験**を必ず先に通すこと。
+
+### 3.595. **肺プロファイル相関 — 視野非対称でも z が決まる指標 (2026-08 実測)**
+
+3.59 で 5 指標すべてが失敗したが、**肺をランドマークにすると正解を指す**ことを実測で確認した。
+まだ製品には組み込んでいない (下の「未解決」参照)。検証は `node scripts/reg-lung-sweep.mjs --case <症例>`。
+
+**指標の定義**
+
+fixed (CT) の world bbox 内だけを走査し、world z ごとに次を計算して z 方向のプロファイルにする:
+
+  lungFrac(z) = 体シルエット内で「抜けている」voxel の割合
+
+体シルエットは **各走査行の左右端の内側** とする (これをやらないと体外の空気が肺に混ざる)。
+両者を z スコア化して相関を取る。**相関が最大の並進が答え。**
+
+**しきい値の決め方 — ここを 2 回間違えた**
+
+| | 体 | 肺 |
+|---|---|---|
+| CT | HU > -300 | **HU < -400 (物理値で決め打ち)** |
+| PT | p97.5 × 0.25 | **体内 voxel の下位 25% 点 (順位)** |
+
+- **PET を絶対値で決めてはいけない**: 最初 p97.5×0.04 = 0.041 にしたが、肺の SUV は 0.4〜0.6 なので
+  まるごと「体」に分類され、プロファイルが雑音になった (hirata2 の tz=0 で相関 -0.11)。
+- **CT を順位で決めてはいけない**: 体内下位 25% は **-118HU = 脂肪**。全身 CT では脂肪の分布が
+  肺と全く違うので PET の抜けとは別物を測る (Hirata20260728 の tz=0 で相関 -0.07 = 無相関)。
+  肺実質は -700〜-900HU なので -400HU で脂肪と明確に分かれる。
+- 教訓: **物理的に確定した値があるならそれを使い、無い側だけ順位で決める。**
+
+**実測 (tz を -60〜+80mm 掃引。どちらも正解は tz = 0)**
+
+| 症例 | 視野比 | ピーク | 相関 | 誤差 |
+|---|---|---|---|---|
+| hirata2 (CT 胸部 × PET 全身) | 2.8× | **tz = +5mm** | 0.522 | **5mm** |
+| Hirata20260728 (同一 FoR) | ~1× | **tz = -5mm** | 0.245 | **5mm** |
+
+どちらも単峰で、既知量をずらすと同量だけピークが動く**自己試験に合格**している。
+**3.59 で 50〜60mm 外していた症例が 5mm に入る。**
+
+**併せて試して捨てたもの**
+
+- **mean-in-body プロファイル** (体シルエット内の平均値 vs z): hirata2 では効いたが
+  Hirata20260728 では全域で負相関 (単調減少) だった。CT の HU と PET の集積は
+  全身では同じ向きに動かない (骨盤は HU 高・集積中等度など)。z スコア化しても符号は直らない。**不採用。**
+- **肺マスクの重心合わせ**: PET の肺マスクが 23,000〜26,000ml (CT は 6,770ml で正しい) と 4 倍に膨れ、
+  重心が体の中央へ引かれて 163〜187mm ずれた。「体内下位 25%」を **全身に適用する**と
+  脚や腕の低集積部まで拾うため。**プロファイル法が効くのは fixed の視野内に限定しているから**で、
+  この限定を外すと成立しない。**不採用** (`scripts/reg-lung-centroid.mjs` に実験を残してある)。
+
+**未解決 — 製品に入れる前に決めること**
+
+1. **z しか決まらない**。プロファイルは 1 次元なので x/y と回転は別途必要。
+   幸い実害が出ていたのは z (hirata2 で 48.6mm) で、x/y は小さかった (-2.1 / 13.2mm)。
+   3 軸それぞれにプロファイルを作る案は未検証。
+2. **検証が 2 症例**。しかも CT はどちらも同じ "Lung" シリーズ (重心・体積が完全一致した)。
+   実質 1 つの CT に対する 2 つの PET でしか見ていない。**別患者での確認が要る。**
+3. 現状の既定は 3.59 のゲート (視野比 1.6 倍以上なら自動位置合わせを実行しない) のまま。
+   この指標に置き換えるかはユーザ判断。
+
 ### 3.6. MR↔PET registration の初期化 (2026-07)
 
 MI + Nelder-Mead は **局所探索**なので初期値が全て。`onRegisterMrPt` は
@@ -673,12 +781,15 @@ PET 高集積部の MR 信号が周囲の 3.54 倍 (257.4 vs 72.8)。
 - `nifti-reader-js` の affine からは Volume は作れるが modality は不明 → PET/CT 検出が動かない。
 - 回避: ユーザに「PET として登録」「CT として登録」ボタンを提供する（未実装）。
 
-### 5. GPU mode で voxel inspector の Shift+Click 編集が画像に反映されない
+### 5. GPU mode で voxel inspector の Shift+Click 編集が画像に反映されない (解決済み 2026-08)
 - 症状: Voxel inspector で Shift+Click → prompt() で値を入力 → `Volume.voxel[idx]` には書き込まれ、inspector 表示も更新されるが、画面の画像は変わらない (色が変化しない)。
-- 原因: GPU レンダリングパスは `volumeCache` (`src/components/webgpu/volumeCache.ts`) で voxel TypedArray を WebGPU テクスチャにアップロードしてキャッシュしている。voxel を 1 セルだけ書き換えても、cache key (= TypedArray 参照) が同じなので texture が再アップロードされない。
-- 影響範囲: 開発デバッグ用機能 (一般ユーザは使わない)。CPU mode (Force CPU) なら正しく反映される。
-- 対応方針: 当面 known issue として放置。修正するなら voxel 編集時に `volumeCache.invalidate(target)` を呼ぶ、または `Volume.dataVersion: number` フィールドを追加して cache key に含める。前者が安全。
-- ワークアラウンド: 編集前に Renderer mode を Force CPU に切り替える。
+- 原因: GPU レンダリングパスは `volumeCache` (`src/components/webgpu/volumeCache.ts`) で voxel TypedArray を WebGPU テクスチャにアップロードしてキャッシュしている。voxel を 1 セルだけ書き換えても、**cache key = TypedArray の参照**なので cache hit してしまい texture が再アップロードされない。
+- **修正**: `handleDebugEditClick` (`composables/useDebugInspector.ts`) の書き込み直後に
+  `evictVolumeTexture(target.voxel)` を呼ぶ。デバッグ機能なので再アップロードのコストは許容する。
+- **同種の罠**: voxel の中身を書き換える新コードを足すときは必ず evict すること。CPU mode では
+  正しく見えるので気付きにくい。既存の呼び出し箇所は scramble/recover (DicomView) と
+  SUV mode 切替 (segmentation store) の 2 つ。**幾何 (registration) の変更では evict 不要**
+  (texture は voxel しか持たないため。3.57 参照)。
 
 ### 6. 大型 CT volume が GPU mode で真っ黒になる (解決済み 2026-07-18)
 - **症状**: 大型 CT (例 `512×512×345`, Float32 で ~362MB) を含む症例で PET Standard すると、

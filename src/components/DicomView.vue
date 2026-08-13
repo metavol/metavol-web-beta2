@@ -2407,7 +2407,7 @@ const onBoxAutoRegister = async (boxId: number, opts?: { fromCurrent?: boolean }
 
   boxRegisterBusy.value = boxId;
   try {
-    const [{ registerMrToPt, centroidInitParams }, tf] = await Promise.all([
+    const [{ registerMrToPt, centroidInitParams, assessFeasibility }, tf] = await Promise.all([
       import('./registration/registerMrPt'),
       import('./registration/transform'),
     ]);
@@ -2446,21 +2446,33 @@ const onBoxAutoRegister = async (boxId: number, opts?: { fromCurrent?: boolean }
     const stats = mi.estimateIntensityRange(fixed, moving, samples);
     const scoreOf = (p: any) => mi.computeNegativeMI(fixed, moving, samples, stats, p);
 
-    // ===== ① 重心で粗く合わせる → ② MI で精密に合わせる =====
+    // ===== 適用可否の判定 → ① 重心で粗く → ② MI で精密に =====
     //
-    // 別装置由来のデータは world 座標系が噛み合っておらず、初期状態では **まったく重ならない**
-    // (実測 metmri: MR と PT の重心が 210mm 離れ、MI サンプルの overlap は 0/4000)。
-    // 重なりが無ければ MI は評価すらできない (0 が返る) ので、まず重心で寄せる必要がある。
-    // 重心合わせは二値の体マスクの幾何重心どうしなので modality に依らず比較できる。
-    //
-    // 粗探索 (coarseTranslationSearch) は使わない。重心で十分寄るうえ、評価回数が増えるだけ。
+    // **視野が大きく食い違うペアでは自動位置合わせを走らせない。**
+    // hirata2 (CT=胸部のみ × PET=全身) の実測では、MI/NMI/形状のどの指標も正解を指さず、
+    // 走らせると 48mm 悪化した (読み込み時点ではほぼ合っていた)。詳細は
+    // registration/registerMrPt.ts の assessFeasibility のコメント。
+    const feas = assessFeasibility(fixed, moving);
+    if (!feas.ok && !opts?.fromCurrent) {
+      alert([
+        'Auto-registration was not run.',
+        '',
+        feas.reason,
+        '',
+        'Use "Adjust alignment manually" instead. In this situation the images are often',
+        'already close as acquired, and automatic registration tends to make them worse.',
+      ].join('\n'));
+      return;
+    }
     const startScore = scoreOf(startParams);
     let start: any = startParams;
-    if (!opts?.fromCurrent) {
+    if (!opts?.fromCurrent && feas.centroidUsable) {
+      // 重心合わせは **視野が同等のときだけ** 有効。
+      // 一方が他方の一部しか写していないと、両者の体重心は別の解剖学的高さを指す
+      // (実測 hirata2: tz=+159.8mm と出た)。
       const centroid = centroidInitParams(fixed, moving);
-      // 重心の方が MI 的に良いときだけ採用する。
-      // 重なりが無い姿勢では MI が 0 を返し、実際に重なった姿勢の負の値より必ず大きい
-      // (= 悪い) ので、この比較で自然に「寄せた方」が選ばれる。
+      // 重なりが無い姿勢では MI が 0 を返し、重なった姿勢の負の値より必ず大きい (= 悪い)
+      // ので、この比較で自然に「寄せた方」が選ばれる。
       if (scoreOf(centroid) < startScore) start = centroid;
     }
 

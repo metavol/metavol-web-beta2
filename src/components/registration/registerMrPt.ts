@@ -302,3 +302,48 @@ export const registerMrToPt = (
         iterationsTotal: totalIter,
     };
 };
+
+// ===== 自動位置合わせの適用可否判定 =====
+//
+// **強度ベース (MI/NMI) は「視野が大きく食い違うペア」では原理的に破綻する。**
+// hirata2 (CT=胸部のみ 412mm × PET=全身 1148mm) の実測:
+//   - MI / NMI / 体内サンプル限定の 4 通りすべてが tz≒+50〜55mm で最小になり、
+//     目視の正解 (tz≒0) に極小すら無い。曲線は間違った方向へ単調に改善する。
+//   - 原因: PET を頭側へずらすと CT の胸部視野に PET の腹部 (肝・腎・脾で情報量が多い) が
+//     入る。胸部の PET は肺で抜けて情報量が乏しいので、MI は「対応の正しさ」ではなく
+//     「情報量の多い領域が視野に入っているか」を測ってしまう。重なり量は変わらないため
+//     NMI でも消えない。
+//   - 形状ベース (体断面積プロファイル相関) も試したが、胸部は断面積の変化が乏しく平坦で
+//     識別力が無かった。
+//   - **重心合わせも無効**: 視野が違えば体重心は別の解剖学的高さを指す (tz=+159.8mm と出た)。
+//
+// したがって、この構成では「自動で合わせる」より **手を出さない方が正しい**。
+// 実測では読み込み時点でほぼ合っており (DICOM 患者座標が概ね揃っているため)、
+// 自動位置合わせを走らせると 48mm 悪化した。
+export interface FeasibilityResult {
+    ok: boolean;
+    /** 重心合わせを初期値に使ってよいか (視野が同等のときだけ有効) */
+    centroidUsable: boolean;
+    reason: string;
+}
+
+/** world z 方向の広がり (mm) */
+const zExtent = (v: Volume): number =>
+    Math.abs(v.nx * v.vectorX.z) + Math.abs(v.ny * v.vectorY.z) + Math.abs(v.nz * v.vectorZ.z);
+
+export const assessFeasibility = (fixed: Volume, moving: Volume): FeasibilityResult => {
+    const ef = zExtent(fixed), em = zExtent(moving);
+    if (ef <= 0 || em <= 0) return { ok: false, centroidUsable: false, reason: 'degenerate geometry' };
+    const ratio = Math.max(ef, em) / Math.min(ef, em);
+    // 視野の広がりが 1.6 倍以上違う = 一方が他方の一部しか写していない。
+    // このとき重心は別の解剖を指し、MI は「情報量の多い領域を引き込む」方向に流れる。
+    if (ratio >= 1.6) {
+        return {
+            ok: false, centroidUsable: false,
+            reason: `field of view differs too much (${Math.round(ef)}mm vs ${Math.round(em)}mm, `
+                  + `ratio ${ratio.toFixed(1)}×). Intensity-based registration is unreliable here.`,
+        };
+    }
+    // 視野が同等なら重心も MI も使える (metmri の脳 MR×PET で確認済み)
+    return { ok: true, centroidUsable: true, reason: `comparable field of view (ratio ${ratio.toFixed(2)}×)` };
+};
