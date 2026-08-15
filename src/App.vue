@@ -51,6 +51,12 @@
               <template v-slot:prepend><v-icon icon="mdi-vector-rectangle" size="small" /></template>
               <v-list-item-title>Export ROIs…</v-list-item-title>
             </v-list-item>
+            <!-- DICOM -> NIfTI 変換 (全シリーズ)。1 シリーズだけなら左のシリーズカードの "..." から。 -->
+            <v-list-item @click="onConvertAllToNifti">
+              <template v-slot:prepend><v-icon icon="mdi-file-swap-outline" size="small" /></template>
+              <v-list-item-title>Convert all series to NIfTI…</v-list-item-title>
+              <v-list-item-subtitle>One .zip with .nii.gz + .json per series</v-list-item-subtitle>
+            </v-list-item>
 
             <v-divider />
 
@@ -126,6 +132,27 @@
                        @click.stop
                        @change="(e: Event) => segStore.setCtBedCutBottomMm(Number((e.target as HTMLInputElement).value))" />
                 <span class="mv-mini-unit">mm</span>
+              </template>
+            </v-list-item>
+            <!-- オプション B: 6 面それぞれから削る crop box。
+                 下面カット (上の Also cut bottom) は zMin と同じ値を指すので、
+                 ここでも Z- として出す。台座が下でない場合 (kitty の背板など) に使う。 -->
+            <v-list-item v-if="!segStore.ctBodyMask" :disabled="!segStore.ctVolumeRef" @click.stop>
+              <template v-slot:prepend><v-icon icon="mdi-crop" size="small" /></template>
+              <v-list-item-title>Crop margins</v-list-item-title>
+              <v-list-item-subtitle>Trim each side of the bounding box</v-list-item-subtitle>
+              <div class="mv-crop-grid" @click.stop>
+                <label v-for="f in cropFaces" :key="f.key" class="mv-crop-cell">
+                  <span class="mv-crop-lab">{{ f.label }}</span>
+                  <input class="mv-mini-num mv-crop-num" type="number" min="0" step="1"
+                         :value="segStore.ctCropMarginsMm[f.key]"
+                         @click.stop
+                         @change="(e: Event) => segStore.setCtCropMargin(f.key, Number((e.target as HTMLInputElement).value))" />
+                </label>
+              </div>
+              <template v-slot:append>
+                <v-btn size="x-small" variant="text" title="Reset all crop margins"
+                       @click.stop="segStore.clearCtCropMargins()">Clear</v-btn>
               </template>
             </v-list-item>
             <v-list-item v-else @click.stop="onToggleBodyMask">
@@ -1129,6 +1156,18 @@ const onLoadSnapshot = () => {
 // Segmentation の save/load をハンバーガーから (旧フッターから移設)。
 // Save NIfTI / Clear edits は store action 直呼び、Load mask / Export PDF は
 // DicomView 経由で SegmentationPanel のハンドラをパススルー。
+// 体マスクの crop box (オプション B) の 6 面。
+// 表示順は「面内 (X/Y) → 体軸 (Z)」。Z- は上の Also cut bottom と同じ値を指す。
+const cropFaces = [
+  { key: 'xMin' as const, label: 'X-' }, { key: 'xMax' as const, label: 'X+' },
+  { key: 'yMin' as const, label: 'Y-' }, { key: 'yMax' as const, label: 'Y+' },
+  { key: 'zMin' as const, label: 'Z-' }, { key: 'zMax' as const, label: 'Z+' },
+];
+
+// DICOM -> NIfTI 変換 (全シリーズ)。実体は DicomView 側 (seriesList を持っているため)。
+// 1 シリーズだけなら左サイドバーのシリーズカード "..." → Export as NIfTI。
+const onConvertAllToNifti = () => { dicomViewRef.value?.exportAllSeriesAsNifti?.(true); };
+
 const onSaveNiftiMask = () => { segStore.saveMaskAsNifti(); };
 const onClearEditsFromMenu = () => { segStore.clearManualEdits(); dicomViewRef.value?.redraw?.(); };
 const onLoadMaskFromMenu = () => { dicomViewRef.value?.segLoadMask?.(); };
@@ -1325,6 +1364,19 @@ const onInspectNiftiRaw = (idx: number) => {
   padding: 2px 4px;
   text-align: right;
 }
+.mv-crop-grid {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  gap: 2px 6px;
+  margin: 2px 0 0 0;
+}
+.mv-crop-cell { display: flex; align-items: center; gap: 3px; }
+.mv-crop-lab {
+  font-size: 10px;
+  color: var(--mv-text-muted, #5a6877);
+  width: 14px;
+}
+.mv-crop-num { width: 44px; }
 .mv-mini-unit {
   font-size: 10px;
   color: var(--mv-text-muted, #5a6877);

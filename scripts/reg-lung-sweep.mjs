@@ -104,29 +104,60 @@ try {
     const XY = 4;
 
     // 1 つの volume について z ごとの (lungFrac, meanInBody) を返す。
-    // 体シルエットは **行ごとの左右端の内側** を体内とみなす (凸包の粗い代用)。
-    // こうしないと体外の空気が「肺」に混ざる。
+    //
+    // 体シルエットは **行と列の両方で体に挟まれている** ことを要求する。
+    // 当初は行 (x 方向) の左右端の内側だけを体内としていたが、これは**全身 CT で破綻する**。
+    // 脚の間の空気は左右の脚に挟まれているので「体内」と判定され、HU < -400 なので
+    // まるごと「肺」に数えられる。腕と体幹の隙間も同じ。
+    // 実測 (cervicalca, 全身 CT 1725mm): CT の肺マスクが **36,181ml** に膨れた
+    // (実際の肺は 5,000ml 程度)。これで肺の信号が埋もれ、指標が正解を指さなくなった。
+    // 列 (y 方向) にも同じ条件を課すと、脚の間を通る列には体がまったく無いので除外される。
+    // 肺は胸壁 (x) と胸骨・脊椎 (y) の両方に挟まれるので残る。
+    const nxs = Math.floor((x1 - x0) / XY) + 1;
+    const nys = Math.floor((y1 - y0) / XY) + 1;
+    const val = new Float32Array(nxs * nys);
+    const has = new Uint8Array(nxs * nys);
     const profile = (vol, th, params) => {
       const Tinv = params ? tf.makeRigidMatrix(params).clone().invert() : null;
       const w = new THREE.Vector3(), w2 = new THREE.Vector3();
       const lungFrac = [], meanBody = [];
-      const row = [];   // 1 行ぶんの値を貯める
       for (const z of zs) {
-        let inside = 0, gas = 0, sum = 0;
-        for (let y = y0; y <= y1; y += XY) {
-          row.length = 0;
-          let lo = -1, hi = -1, n = 0;
-          for (let x = x0; x <= x1; x += XY, n++) {
-            w.set(x, y, z);
+        // ① 1 スライスぶんを一度サンプルして 2D 格子に貯める
+        val.fill(0); has.fill(0);
+        for (let jy = 0; jy < nys; jy++) {
+          const y = y0 + jy * XY, rb = jy * nxs;
+          for (let ix = 0; ix < nxs; ix++) {
+            w.set(x0 + ix * XY, y, z);
             let v;
             if (Tinv) { w2.copy(w).applyMatrix4(Tinv); v = sampleNN(vol, w2); } else v = sampleNN(vol, w);
-            row.push(v);
-            if (v != null && v > th.body) { if (lo < 0) lo = n; hi = n; }
-          }
-          if (lo < 0 || hi <= lo) continue;
-          for (let t = lo; t <= hi; t++) {
-            const v = row[t];
             if (v == null) continue;
+            val[rb + ix] = v; has[rb + ix] = 1;
+          }
+        }
+        // ② 行ごと / 列ごとの体の端を求める
+        const rowLo = new Int32Array(nys).fill(-1), rowHi = new Int32Array(nys).fill(-1);
+        for (let jy = 0; jy < nys; jy++) {
+          const rb = jy * nxs;
+          for (let ix = 0; ix < nxs; ix++) {
+            if (has[rb + ix] && val[rb + ix] > th.body) { if (rowLo[jy] < 0) rowLo[jy] = ix; rowHi[jy] = ix; }
+          }
+        }
+        const colLo = new Int32Array(nxs).fill(-1), colHi = new Int32Array(nxs).fill(-1);
+        for (let ix = 0; ix < nxs; ix++) {
+          for (let jy = 0; jy < nys; jy++) {
+            const p = jy * nxs + ix;
+            if (has[p] && val[p] > th.body) { if (colLo[ix] < 0) colLo[ix] = jy; colHi[ix] = jy; }
+          }
+        }
+        // ③ 行と列の**両方**の内側だけを体内とみなす
+        let inside = 0, gas = 0, sum = 0;
+        for (let jy = 0; jy < nys; jy++) {
+          if (rowLo[jy] < 0) continue;
+          const rb = jy * nxs;
+          for (let ix = rowLo[jy]; ix <= rowHi[jy]; ix++) {
+            if (!has[rb + ix]) continue;
+            if (colLo[ix] < 0 || jy < colLo[ix] || jy > colHi[ix]) continue;
+            const v = val[rb + ix];
             inside++; sum += v;
             if (v < th.air) gas++;
           }

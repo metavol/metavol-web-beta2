@@ -44,7 +44,7 @@ import { loadPriorityRules, scoreSeries } from "./seriesPriorityRules";
 import { buildClutLegend, type ClutLegend } from "./clutLegend";
 import { ensureWasmCodecsReady, isWasmCodecsReady } from "./wasmCodec";
 import { Volume, voxelToWorld, worldToVoxel, volumeCenterWorld } from "./Volume.ts";
-import { writeNiftiFloat32, buildVolumeSidecarJson } from "./niftiVolumeWriter";
+import { writeNiftiVolumeAsync, niftiBaseName, buildVolumeSidecarJson } from "./niftiVolumeWriter";
 import { triggerDownload } from "./segmentation/niftiWriter";
 import { solve } from "./linalg";
 import * as THREE from '@/lib/threeMath';
@@ -1737,30 +1737,93 @@ const onBackToDicom = (i: number) => {
 // PT は SUV 単位 (voxel に suvFactor 適用済み)、CT は HU、MR は raw。
 // Volume が無いシリーズ (DicomSlice 未 MPR) は mpr_ で先に生成する。
 // .nii と .json sidecar (modality / suvFactor / metadata) を 2 ファイル同時ダウンロード。
-const onTitlebarSaveVolumeNifti = (i: number) => {
+// box のタイトルバーからの書き出し。**シリーズ一覧からの変換と同じ経路に寄せてある**
+// (gzip 既定・命名規則を 1 箇所に集約するため)。定義順の都合で exportSeriesAsNifti は
+// この下にあるが、呼び出しは runtime なので問題ない。
+const onTitlebarSaveVolumeNifti = async (i: number) => {
   if (i < 0 || i >= imageBoxInfos.value.length) return;
-  const info = imageBoxInfos.value[i];
-  const sIdx = info?.currentSeriesNumber;
+  const sIdx = imageBoxInfos.value[i]?.currentSeriesNumber;
   if (sIdx == null || sIdx < 0 || sIdx >= seriesList.length) return;
-  const series = seriesList[sIdx];
-  if (!series.volume) {
-    // ensureVolume_: box[sIdx] を巻き込まず volume だけ生成
-    if (!ensureVolume_(sIdx)) {
-      alert('Failed to build Volume from this series.');
-      return;
-    }
+  const ok = await exportSeriesAsNifti(sIdx, true);
+  if (!ok) alert('Failed to build a Volume from this series, so it cannot be exported.');
+};
+
+// ===== DICOM -> NIfTI 変換 =====
+//
+// **シリーズ一覧 (左サイドバー) の "..." から呼ぶ。box に出していなくても変換できる**のが要点。
+// 以前は box のタイトルバー経由 (onTitlebarSaveVolumeNifti) しか無く、
+// 「変換したいだけ」なのに一度 box に表示する必要があった。
+//
+// 出力は volume + sidecar JSON の 2 ファイル。voxel は `dicom2volume` を通した後の値なので
+//   PT = SUV / CT = HU / MR = raw。**元の生画素ではない**ことは sidecar の `unit` に書いてある。
+// **必ず 1 回のダウンロードにまとめること (zip)。**
+// ブラウザは**ユーザ操作を伴わない 2 件目以降のダウンロードを落とす**。実測で、
+// .nii.gz は出るのに sidecar の .json が来なかった (900ms 空けても駄目だった)。
+// 変換は「非同期で作ってから落とす」ので必ず gesture の外になる。だから 1 ファイルにする。
+// これで「全シリーズ変換すると 32 個ダウンロードされる」問題も同時に消える。
+const buildNiftiZipEntries = async (
+  indices: number[],
+  gzip: boolean,
+): Promise<{ entries: Record<string, [Uint8Array, { level: 0 | 6 }]>; ok: number }> => {
+  const entries: Record<string, [Uint8Array, { level: 0 | 6 }]> = {};
+  let ok = 0;
+  for (const index of indices) {
+    if (index < 0 || index >= seriesList.length) continue;
+    // box を巻き込まずに volume だけ作る
+    if (!seriesList[index].volume && !ensureVolume_(index)) continue;
+    const vol = seriesList[index].volume;
+    if (!vol) continue;
+    const { blob, ext } = await writeNiftiVolumeAsync(vol, { gzip });
+    const base = niftiBaseName(vol, `series-${index}`);
+    // **.nii.gz は既に圧縮済みなので zip 側は無圧縮 (level 0) にする。**
+    // 二重圧縮は時間だけ食って縮まない。sidecar の JSON は小さいので普通に縮める。
+    entries[`${base}${ext}`] = [new Uint8Array(await blob.arrayBuffer()), { level: gzip ? 0 : 6 }];
+    entries[`${base}.json`] = [new TextEncoder().encode(buildVolumeSidecarJson(vol)), { level: 6 }];
+    ok++;
   }
-  const vol = series.volume;
-  if (!vol) { alert('No volume to export.'); return; }
+  return { entries, ok };
+};
 
-  const niftiBlob = writeNiftiFloat32(vol);
-  const sidecarBlob = new Blob([buildVolumeSidecarJson(vol)], { type: 'application/json' });
+const downloadNiftiZip = async (
+  entries: Record<string, [Uint8Array, { level: 0 | 6 }]>,
+  zipName: string,
+): Promise<void> => {
+  const { zipSync } = await import('fflate');
+  const zipped = zipSync(entries);
+  triggerDownload(new Blob([zipped as BlobPart], { type: 'application/zip' }), zipName);
+};
 
-  const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
-  const uidTail = (vol.metadata?.seriesUID ?? `series-${sIdx}`).slice(-32);
-  const baseName = `${uidTail}_${ts}`.replace(/[^A-Za-z0-9._-]/g, '_');
-  triggerDownload(niftiBlob,   `${baseName}.nii`);
-  triggerDownload(sidecarBlob, `${baseName}.json`);
+const exportSeriesAsNifti = async (index: number, gzip: boolean): Promise<boolean> => {
+  const { entries, ok } = await buildNiftiZipEntries([index], gzip);
+  if (!ok) return false;
+  const vol = seriesList[index].volume!;
+  await downloadNiftiZip(entries, `${niftiBaseName(vol, `series-${index}`)}.zip`);
+  return true;
+};
+
+const onExportSeriesNifti = async (payload: { index: number; gzip: boolean }) => {
+  const ok = await exportSeriesAsNifti(payload.index, payload.gzip);
+  if (!ok) alert('Could not build a volume from this series, so it cannot be exported.');
+};
+
+/**
+ * volume を持てる全シリーズを 1 つの zip に変換する。
+ * **全部を同時にメモリに載せる**ので、大きい症例では数 GB になりうる。件数を出して確認を取る。
+ */
+const exportAllSeriesAsNifti = async (gzip = true) => {
+  const targets: number[] = [];
+  for (let i = 0; i < seriesList.length; i++) {
+    if (seriesList[i].volume || seriesList[i].myDicom) targets.push(i);
+  }
+  if (targets.length === 0) { alert('No series to export.'); return; }
+  if (!confirm(`Convert ${targets.length} series to NIfTI and download them as one .zip?
+
+`
+             + 'All series are held in memory while the archive is built, so this can take a while.')) return;
+  const { entries, ok } = await buildNiftiZipEntries(targets, gzip);
+  if (!ok) { alert('No series could be converted.'); return; }
+  await downloadNiftiZip(entries, `metavol-nifti-${targets.length}series.zip`);
+  if (ok < targets.length) alert(`Converted ${ok} of ${targets.length} series (the rest had no usable volume).`);
 };
 
 // 矩形 ROI (store の RectROI) → JSON 表現。voxel 座標。series UID も埋める。
@@ -6752,6 +6815,8 @@ defineExpose({
   // Snapshot file (replaces former share-URL): full session save/load
   downloadSnapshotFile,
   loadSnapshotFile,
+  // DICOM -> NIfTI 変換 (app-bar の Save メニューから全シリーズ一括)
+  exportAllSeriesAsNifti,
   // NIfTI header viewer 用
   getNiftiHeaderForSeries: (idx: number) => {
     if (idx < 0 || idx >= seriesList.length) return null;
@@ -6788,6 +6853,7 @@ defineExpose({
     <sidebar
       :series-summaries="seriesSummaries"
       @setModality="onSetSeriesModality"
+      @exportNifti="onExportSeriesNifti"
       @setActiveForSeg="onSetActiveForSeg"
       @inspectRaw="(p: { index: number }) => inspectNiftiRaw(p.index)"
       @viewHeader="(p: { index: number }) => onViewNiftiHeader(p.index)"

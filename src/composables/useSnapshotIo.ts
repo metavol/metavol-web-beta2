@@ -1,4 +1,5 @@
 import { type Ref } from 'vue';
+import { gzipSync, gunzipSync } from 'fflate';
 import { TF_PRESETS } from '../components/vrTf';
 import { type SerializedViewState, type SerializedBoxState } from '../components/viewStateUrl';
 import { useSegmentationStore, type RectROI } from '../stores/segmentation';
@@ -6,8 +7,12 @@ import { useSegmentationStore, type RectROI } from '../stores/segmentation';
 // DicomView の「View state URL / Snapshot file (session save/load)」機能を切り出した composable。
 // これがアプリ唯一の「フルセッション保存」(App-bar のカメラアイコン)。1 つの .json に、
 // view 状態 (layout / window / CLUT / plane / MIP) と、(有効なら) PET segmentation 状態
-// (labels / threshold / sphere + **mask voxel を base64 で同梱**: finalMask/thresholdMask/
+// (labels / threshold / sphere + **mask voxel を gzip + base64 で同梱**: finalMask/thresholdMask/
 // manualEdits) と、矩形 ROI をまとめる。復元は applySnapshotJson が view + mask + ROI を戻す。
+//
+// **mask は必ず圧縮すること (v2)。** 生の base64 (v1) だと Hirata の PET 256x490x146 で
+// 1 ファイル 139.7MB になり、読み戻しでページが落ちた。mask は非ゼロが 1.2% しかないので
+// gzip が桁で効く。読み込みは v1 も受ける (フォールバックは maskFromSnapshot)。
 // (旧 .mvs zip は不完全 (boxState 空) だったため廃止し、これに一本化した。)
 // rectRoiToJson / importRectRoisFromJson は rect ROI export とも共有されるため DicomView に残し、
 // ここには getter/関数として渡される。
@@ -26,7 +31,15 @@ export interface RectRoiJson {
 
 interface MetavolSnapshotFile {
   schema: 'metavol-snapshot';
-  v: 1;
+  /**
+   * 1 = mask を **生の base64** で持つ (〜2026-08)。
+   * 2 = mask を **gzip してから base64**。読み込みは 1 も 2 も受ける。
+   *
+   * **v1 は実用にならなかった。** 実測 (Hirata の PET 256x490x146): mask 3 本 × 36.6MB を
+   * 素の base64 にすると **139.7MB** の .mvs になり、読み戻しでページが落ちた。
+   * mask は非ゼロが 1.2% しかないので gzip が極めてよく効く。
+   */
+  v: 1 | 2;
   ts: number;
   view: SerializedViewState;
   segmentation: {
@@ -38,9 +51,14 @@ interface MetavolSnapshotFile {
     labels: Array<{ id: number; name: string; color: [number, number, number] }>;
     currentLabelId: number;
     sphere: { centerWorld: [number, number, number]; radiusMm: number } | null;
+    // v1: 生の base64 (読み込みのみ対応、書き出しはしない)
     finalMask_b64?: string;
     thresholdMask_b64?: string;
     manualEdits_b64?: string;
+    // v2: gzip -> base64
+    finalMask_gz_b64?: string;
+    thresholdMask_gz_b64?: string;
+    manualEdits_gz_b64?: string;
   } | null;
   // 矩形 ROI は PET volume 非依存 (DX 1 枚画像でも置ける) ため top-level に持つ。
   rectRois?: RectRoiJson[];
@@ -129,6 +147,21 @@ export function useSnapshotIo(ctx: SnapshotIoCtx) {
     return u8.buffer;
   };
 
+  // gzip してから base64。**mask は非ゼロが数 % しかないので圧縮が桁で効く。**
+  const ab2gzb64 = (buf: ArrayBuffer | undefined): string | undefined => {
+    if (!buf) return undefined;
+    return ab2b64(gzipSync(new Uint8Array(buf)).buffer as ArrayBuffer);
+  };
+  const gzb642ab = (s: string | undefined): ArrayBuffer | undefined => {
+    if (!s) return undefined;
+    const raw = b642ab(s);
+    if (!raw) return undefined;
+    return gunzipSync(new Uint8Array(raw)).buffer as ArrayBuffer;
+  };
+  /** v2 (gzip) を優先し、無ければ v1 (生 base64) にフォールバックする。 */
+  const maskFromSnapshot = (gz: string | undefined, raw: string | undefined): ArrayBuffer | undefined =>
+    gz ? gzb642ab(gz) : b642ab(raw);
+
   const buildSnapshotJson = (): string => {
     const view = serializeCurrentViewState();
     const segPayload = segStore.serializeForPersistence();
@@ -143,14 +176,14 @@ export function useSnapshotIo(ctx: SnapshotIoCtx) {
         labels: segPayload.labels.map(l => ({ id: l.id, name: l.name, color: [l.color[0], l.color[1], l.color[2]] as [number, number, number] })),
         currentLabelId: segPayload.currentLabelId,
         sphere: segPayload.sphere,
-        finalMask_b64: ab2b64(segPayload.finalMask),
-        thresholdMask_b64: ab2b64(segPayload.thresholdMask),
-        manualEdits_b64: ab2b64(segPayload.manualEdits),
+        finalMask_gz_b64: ab2gzb64(segPayload.finalMask),
+        thresholdMask_gz_b64: ab2gzb64(segPayload.thresholdMask),
+        manualEdits_gz_b64: ab2gzb64(segPayload.manualEdits),
       };
     }
     const file: MetavolSnapshotFile = {
       schema: 'metavol-snapshot',
-      v: 1,
+      v: 2,
       ts: Date.now(),
       view,
       segmentation,
@@ -170,7 +203,8 @@ export function useSnapshotIo(ctx: SnapshotIoCtx) {
     if (!parsed || parsed.schema !== 'metavol-snapshot') {
       return { ok: false, reason: 'Not a metavol-snapshot file.' };
     }
-    if (parsed.v !== 1) {
+    // v1 (生 base64) と v2 (gzip) の両方を受ける。書き出しは常に v2。
+    if (parsed.v !== 1 && parsed.v !== 2) {
       return { ok: false, reason: `Unsupported snapshot version: ${parsed.v}` };
     }
     const view = parsed.view as SerializedViewState | undefined;
@@ -186,9 +220,9 @@ export function useSnapshotIo(ctx: SnapshotIoCtx) {
     if (parsed.segmentation) {
       const s = parsed.segmentation;
       const r = segStore.restoreFromPersistence({
-        thresholdMask: b642ab(s.thresholdMask_b64),
-        manualEdits: b642ab(s.manualEdits_b64),
-        finalMask: b642ab(s.finalMask_b64),
+        thresholdMask: maskFromSnapshot(s.thresholdMask_gz_b64, s.thresholdMask_b64),
+        manualEdits: maskFromSnapshot(s.manualEdits_gz_b64, s.manualEdits_b64),
+        finalMask: maskFromSnapshot(s.finalMask_gz_b64, s.finalMask_b64),
         dims: s.dims,
         threshold: s.threshold,
         thresholdUnit: s.thresholdUnit,
@@ -253,8 +287,15 @@ export function useSnapshotIo(ctx: SnapshotIoCtx) {
 
   const applyViewState = (state: SerializedViewState) => {
     if (!state || state.bs.length === 0) return;
-    // tileN を合わせる
-    const newTileN = Math.min(state.t, state.bs.length);
+    // **表示 box 数 (tileN) も戻すこと。**
+    // 以前はここで newTileN を計算するだけで **代入していなかった**ため、
+    // 保存時 16 box のスナップショットを 1 box の状態で読み込んでも 1 box のままだった
+    // (ログだけ "16 boxes" と出るので気付きにくい。実測 `npm run check:snapshot`)。
+    //
+    // **imageBoxInfos の長さを超えて tileN を上げないこと。** 超えると配列に穴 (undefined) が
+    // でき、template から呼ばれる判定関数が throw して **render が丸ごと停止**する
+    // (CLAUDE.md 2.8)。だから bs.length ではなく **現に存在する box 数**でも頭打ちにする。
+    const newTileN = Math.min(state.t, state.bs.length, ctx.imageBoxInfos.value.length);
     for (let i = 0; i < newTileN; i++) {
       const sb = state.bs[i];
       const info = ctx.imageBoxInfos.value[i] as any;
@@ -289,6 +330,8 @@ export function useSnapshotIo(ctx: SnapshotIoCtx) {
       }
     }
     if (state.sync != null) ctx.syncImageBox.value = state.sync;
+    // box の中身を入れ終えてから tileN を動かす (先に増やすと未設定の box が 1 フレーム見える)
+    if (newTileN > 0) ctx.tileN.value = newTileN;
     ctx.show();
     console.log(`[state] applied view state: ${newTileN} boxes`);
   };

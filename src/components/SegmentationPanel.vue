@@ -1014,8 +1014,8 @@ defineExpose({
                         divided
                         class="mv-suv-mode-toggle"
                     >
-                        <v-btn value="voxbase" size="x-small" title="整数秒に切り捨て (Vox-BASE と一致)。一般ユーザ向け既定。">Vox-BASE</v-btn>
-                        <v-btn value="precise" size="x-small" title="小数秒まで使用 (物理的により正確)。">Precise</v-btn>
+                        <v-btn value="voxbase" size="x-small" title="Truncate decay time to whole seconds (matches Vox-BASE). Default.">Vox-BASE</v-btn>
+                        <v-btn value="precise" size="x-small" title="Use fractional seconds (physically more accurate).">Precise</v-btn>
                     </v-btn-toggle>
                 </div>
                 <div class="mv-suv-details-row">
@@ -1046,7 +1046,7 @@ defineExpose({
                     <span>Decay factor</span>
                     <span class="mv-mono">{{ suvMetaSummary.decayFactor.toPrecision(9) }}</span>
                 </div>
-                <div v-if="suvMetaSummary.doseAtRefBq != null" class="mv-suv-details-row" title="Vox-BASE: 補正時刻に減衰補正した総投与量">
+                <div v-if="suvMetaSummary.doseAtRefBq != null" class="mv-suv-details-row" title="Total injected dose, decay-corrected to the correction time (Vox-BASE)">
                     <span>Dose @ corr.</span>
                     <span class="mv-mono">{{ suvMetaSummary.doseAtRefBq.toFixed(1) }} Bq</span>
                 </div>
@@ -1058,7 +1058,7 @@ defineExpose({
                     <span>Units</span>
                     <span class="mv-mono">{{ suvMetaSummary.units ?? '—' }}</span>
                 </div>
-                <div class="mv-suv-details-row" title="Vox-BASE: 体重によるSUVのためのリスケール傾斜">
+                <div class="mv-suv-details-row" title="Rescale slope used for body-weight SUV (Vox-BASE)">
                     <span>SUV slope</span>
                     <span class="mv-mono">{{ suvMetaSummary.suvFactor != null ? suvMetaSummary.suvFactor.toPrecision(9) : '—' }}</span>
                 </div>

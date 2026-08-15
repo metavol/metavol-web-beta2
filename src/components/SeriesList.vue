@@ -43,6 +43,7 @@ const emit = defineEmits<{
     (e: 'setActiveForSeg', payload: { index: number; modality: 'PT' | 'CT' }): void;
     (e: 'inspectRaw', payload: { index: number }): void;
     (e: 'viewHeader', payload: { index: number }): void;
+    (e: 'exportNifti', payload: { index: number; gzip: boolean }): void;
 }>();
 
 // Drag start: custom mime に series index を載せる。
@@ -197,8 +198,22 @@ const sliceLabelFor = (s: { index: number }): string | null => {
                         <v-list-item-title>Inspect raw bytes</v-list-item-title>
                         <v-list-item-subtitle>Bypass affine — show storage order</v-list-item-subtitle>
                     </v-list-item>
-                    <v-list-item v-if="s.sourceType === 'DICOM'" disabled>
-                        <v-list-item-title class="text-caption text-disabled">No actions for DICOM</v-list-item-title>
+                    <!-- DICOM -> NIfTI 変換。**box に出していないシリーズでも変換できる**ことが肝。
+                         以前はここが "No actions for DICOM" で、変換は box のタイトルバー経由しか
+                         なかった。既定は .nii.gz (Float32 なので CT は素だと数百 MB になる)。 -->
+                    <v-list-item @click="emit('exportNifti', { index: s.index, gzip: true })">
+                        <template v-slot:prepend>
+                            <v-icon icon="mdi-download-outline" size="small" />
+                        </template>
+                        <v-list-item-title>Export as NIfTI (.nii.gz)</v-list-item-title>
+                        <v-list-item-subtitle>Downloads a .zip with the image + sidecar</v-list-item-subtitle>
+                    </v-list-item>
+                    <v-list-item @click="emit('exportNifti', { index: s.index, gzip: false })">
+                        <template v-slot:prepend>
+                            <v-icon icon="mdi-download" size="small" />
+                        </template>
+                        <v-list-item-title>Export as NIfTI (.nii)</v-list-item-title>
+                        <v-list-item-subtitle>Uncompressed image inside the .zip</v-list-item-subtitle>
                     </v-list-item>
                 </v-list>
             </v-menu>

@@ -33,11 +33,18 @@ defineProps<{
   }>;
 }>();
 
+// **SeriesList のイベントはここで 1 つずつ中継する必要がある。**
+// Sidebar は SeriesList を包んでいるだけだが、コンポーネントのイベントは
+// 親から孫へ自動では伝わらない。DicomView 側で `<sidebar @xxx=...>` と書いても、
+// ここに列挙して転送しなければ **無言で捨てられる** (エラーも出ない)。
+// 実際 exportNifti を足したとき、ここへの追加を忘れてメニューが無反応になった。
+// **SeriesList に emit を足したら必ずここも足すこと。**
 const emit = defineEmits([
   "setModality",
   "setActiveForSeg",
   "inspectRaw",
   "viewHeader",
+  "exportNifti",
 ]);
 </script>
 
@@ -52,6 +59,7 @@ const emit = defineEmits([
         @setActiveForSeg="(p: { index: number; modality: 'PT' | 'CT' }) => emit('setActiveForSeg', p)"
         @inspectRaw="(p: { index: number }) => emit('inspectRaw', p)"
         @viewHeader="(p: { index: number }) => emit('viewHeader', p)"
+        @exportNifti="(p: { index: number; gzip: boolean }) => emit('exportNifti', p)"
       />
     </div>
   </div>

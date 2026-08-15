@@ -5,7 +5,18 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "parity": "node scripts/parity-check.mjs"
+    "parity": "node scripts/parity-check.mjs",
+    "check:ui-lang": "python scripts/check-ui-language.py",
+    "check:affine": "node scripts/affine-check.mjs",
+    "check:render": "node scripts/render-health.mjs",
+    "check:mask": "node scripts/mask-roundtrip.mjs",
+    "check:reg": "node scripts/reg-feasibility-check.mjs --case hirata2",
+    "check": "npm run check:ui-lang && npx vue-tsc --noEmit && node scripts/affine-check.mjs",
+    "check:modality": "node scripts/nifti-modality.mjs",
+    "check:crop": "node scripts/ct-crop-check.mjs",
+    "check:snapshot": "node scripts/snapshot-roundtrip.mjs",
+    "check:d2n": "node scripts/dicom2nifti-check.mjs",
+    "check:d2n-ui": "node scripts/d2n-ui-repro.mjs"
   },
   "dependencies": {
     "@mdi/font": "6.2.95",

@@ -352,7 +352,9 @@ DicomView.vue は god component（6,000 行超）。**挙動を変えずに**行
 `App.vue` の `runLayout(kind)` が `DicomView` の expose した `setup*` を呼ぶ。既存: `triplanarPt` /
 `triplanarFused` / `ptOnly4up` / `compare2up`。**追加 (2026-07): `petCtMipRight`「PET/CT + MIP (3×2)」**。
 
-- `setupPetCtMipRight()` (DicomView.vue)。tileN=3 の 3列×2行グリッドに 5 box を配置:
+- `setupPetCtMipRight()` (DicomView.vue)。**tileN=5** (tileN は「表示 box 数」であって列数ではない。
+  `node scripts/render-health.mjs` で実測: triplanarFused=3 / ptOnly4up=4 / compare2up=2 / petCtMipRight=5)。
+  3列×2行グリッドに 5 box を配置:
   - box0 = **CT axial** (r1c1, WC40/WW400)、box1 = **PET axial** (r1c2, CT と同じ mm/px・中心に整列)、
   - box2 = **PET MIP** (右列 c3, coronal 視軸)。**`rowSpan: 2` で 2 行ぶんの背高 box**。
   - box3 = **Fusion axial** (r2c1)、box4 = **Fusion coronal** (r2c2)。CT base + PET rainbow overlay。
@@ -701,63 +703,68 @@ v2 の 3 つを作り、3 つとも壊れていた (感度不足 / ±245mm 探�
 全身 PET/CT の位置合わせは **冠状断の融合画像を見るのが最も直接的**。指標を新しく作ったら、
 既知量ずらして検出できるかの**自己試験**を必ず先に通すこと。
 
-### 3.595. **肺プロファイル相関 — 視野非対称でも z が決まる指標 (2026-08 実測)**
+### 3.595. **肺プロファイル相関 — 試して**不採用**にした指標 (2026-08 実測)**
 
-3.59 で 5 指標すべてが失敗したが、**肺をランドマークにすると正解を指す**ことを実測で確認した。
-まだ製品には組み込んでいない (下の「未解決」参照)。検証は `node scripts/reg-lung-sweep.mjs --case <症例>`。
+3.59 で 5 指標すべてが失敗したので、**肺をランドマークにする**案を 4 症例で検証した。
+**結論: 定義に対して不安定で、目的関数には使えない。採用しない。**
+以下は「同じ道を二度掘らない」ための記録。実験は `scripts/reg-lung-sweep.mjs` に残してある。
 
 **指標の定義**
 
-fixed (CT) の world bbox 内だけを走査し、world z ごとに次を計算して z 方向のプロファイルにする:
+fixed (CT) の world bbox 内だけを走査し、world z ごとに
+「体シルエット内で**抜けている** voxel の割合」を求めて z 方向のプロファイルにし、
+CT と PET のプロファイルの相関が最大になる並進を答えとする。
 
-  lungFrac(z) = 体シルエット内で「抜けている」voxel の割合
-
-体シルエットは **各走査行の左右端の内側** とする (これをやらないと体外の空気が肺に混ざる)。
-両者を z スコア化して相関を取る。**相関が最大の並進が答え。**
-
-**しきい値の決め方 — ここを 2 回間違えた**
+しきい値は **CT だけ物理値、PET は順位**で決める (ここは 2 回間違えた):
 
 | | 体 | 肺 |
 |---|---|---|
-| CT | HU > -300 | **HU < -400 (物理値で決め打ち)** |
+| CT | HU > -300 | **HU < -400 (物理値)** |
 | PT | p97.5 × 0.25 | **体内 voxel の下位 25% 点 (順位)** |
 
-- **PET を絶対値で決めてはいけない**: 最初 p97.5×0.04 = 0.041 にしたが、肺の SUV は 0.4〜0.6 なので
-  まるごと「体」に分類され、プロファイルが雑音になった (hirata2 の tz=0 で相関 -0.11)。
-- **CT を順位で決めてはいけない**: 体内下位 25% は **-118HU = 脂肪**。全身 CT では脂肪の分布が
-  肺と全く違うので PET の抜けとは別物を測る (Hirata20260728 の tz=0 で相関 -0.07 = 無相関)。
-  肺実質は -700〜-900HU なので -400HU で脂肪と明確に分かれる。
+- PET を絶対値で決めると、肺の SUV 0.4〜0.6 がまるごと「体」に入り雑音になる (相関 -0.11)。
+- CT を順位で決めると下位 25% は **-118HU = 脂肪**。全身 CT では脂肪と肺の分布が全く違う (相関 -0.07)。
 - 教訓: **物理的に確定した値があるならそれを使い、無い側だけ順位で決める。**
 
-**実測 (tz を -60〜+80mm 掃引。どちらも正解は tz = 0)**
+**不採用の理由 — 体シルエットの定義を変えると答えが数十 mm 動く**
 
-| 症例 | 視野比 | ピーク | 相関 | 誤差 |
-|---|---|---|---|---|
-| hirata2 (CT 胸部 × PET 全身) | 2.8× | **tz = +5mm** | 0.522 | **5mm** |
-| Hirata20260728 (同一 FoR) | ~1× | **tz = -5mm** | 0.245 | **5mm** |
+シルエットを「行 (x) の左右端の内側」とするか「行と列 (x と y) の両方の内側」とするかだけで、
+4 症例の結果が入れ替わる。**どちらの定義も 4 症例すべてを通せない** (正解はいずれも tz = 0):
 
-どちらも単峰で、既知量をずらすと同量だけピークが動く**自己試験に合格**している。
-**3.59 で 50〜60mm 外していた症例が 5mm に入る。**
+| 症例 | CT | 行のみ | 行 + 列 |
+|---|---|---|---|
+| hirata2 | 胸部 | +5mm (corr 0.52) | -15mm (corr 0.89) |
+| Hirata20260728 | 胸部 (同一シリーズ) | -5mm (0.25) | +5mm (0.14) |
+| cervicalca | 全身 | **-60mm NG** (0.27) | +15mm (0.31) |
+| dicom | 全身 | 0mm (0.74) | **+40mm NG** (-0.25)  ← 相関が全域で負 |
+
+行のみが破綻する理由は分かっている: 全身 CT では **脚の間や腕と体幹の隙間の空気**が
+「左右の体に挟まれている」ので体内と判定され、HU < -400 なのでまるごと肺に数えられる。
+実測 cervicalca で CT の肺マスクが **36,181ml** (実際の肺は 5,000ml 程度) に膨れていた。
+列条件を足すとこれは消えるが、今度は dicom が壊れる。**理屈で潰しても別の症例が壊れる**ので、
+この方向は打ち止めとした。
 
 **併せて試して捨てたもの**
 
-- **mean-in-body プロファイル** (体シルエット内の平均値 vs z): hirata2 では効いたが
-  Hirata20260728 では全域で負相関 (単調減少) だった。CT の HU と PET の集積は
-  全身では同じ向きに動かない (骨盤は HU 高・集積中等度など)。z スコア化しても符号は直らない。**不採用。**
-- **肺マスクの重心合わせ**: PET の肺マスクが 23,000〜26,000ml (CT は 6,770ml で正しい) と 4 倍に膨れ、
-  重心が体の中央へ引かれて 163〜187mm ずれた。「体内下位 25%」を **全身に適用する**と
-  脚や腕の低集積部まで拾うため。**プロファイル法が効くのは fixed の視野内に限定しているから**で、
-  この限定を外すと成立しない。**不採用** (`scripts/reg-lung-centroid.mjs` に実験を残してある)。
+- **mean-in-body プロファイル** (体シルエット内の平均値 vs z): 症例によって符号が反転する。
+  CT の HU と PET の集積は全身では同じ向きに動かない (骨盤は HU 高・集積中等度など)。
+- **肺マスクの重心合わせ**: PET の肺マスクが 23,000〜26,000ml (CT は 6,770ml) に膨れ、
+  重心が体の中央へ引かれて 163〜187mm ずれた。「体内下位 25%」を**全身に適用する**と
+  脚や腕の低集積部まで拾う。プロファイル法が (多少とも) 効くのは fixed の視野内に限定しているから。
+  実験は `scripts/reg-lung-centroid.mjs`。
 
-**未解決 — 製品に入れる前に決めること**
+**したがって既定は 3.59 のゲートのまま** (視野比 1.6 倍以上なら自動位置合わせを実行しない)。
+視野非対称の症例は **手動 alignment が主**。自動化するなら TotalSegmentator の臓器ラベルなど、
+**しきい値の切り方で結果が動かない**ランドマークが要る。
 
-1. **z しか決まらない**。プロファイルは 1 次元なので x/y と回転は別途必要。
-   幸い実害が出ていたのは z (hirata2 で 48.6mm) で、x/y は小さかった (-2.1 / 13.2mm)。
-   3 軸それぞれにプロファイルを作る案は未検証。
-2. **検証が 2 症例**。しかも CT はどちらも同じ "Lung" シリーズ (重心・体積が完全一致した)。
-   実質 1 つの CT に対する 2 つの PET でしか見ていない。**別患者での確認が要る。**
-3. 現状の既定は 3.59 のゲート (視野比 1.6 倍以上なら自動位置合わせを実行しない) のまま。
-   この指標に置き換えるかはユーザ判断。
+**方法論の教訓 (3.59 の続き)**
+
+- 自己試験 (既知量をずらしてピークが同量動くか) は**必要条件でしかない**。この指標は
+  4 症例すべてで自己試験に合格したが、うち 2 症例で正解を外した。
+  **「感度がある」ことと「正しい点で最大になる」ことは別物。**
+- **2 症例で判断しない。** 最初 hirata2 と Hirata20260728 で「誤差 5mm」と結論しかけたが、
+  この 2 つは **CT が同一シリーズ** (肺体積 6,770ml・重心が完全一致) で、実質 1 つの CT に対する
+  2 つの PET でしかなかった。別患者 (cervicalca / dicom) を入れた途端に崩れた。
 
 ### 3.6. MR↔PET registration の初期化 (2026-07)
 
@@ -777,9 +784,20 @@ MI + Nelder-Mead は **局所探索**なので初期値が全て。`onRegisterMr
 **全て MI が悪化する**こと。実測 (brain MR/PET): 最終 MI -0.72、全摂動で悪化、
 PET 高集積部の MR 信号が周囲の 3.54 倍 (257.4 vs 72.8)。
 
-### 4. NIfTI のみロード時は modality 不明
-- `nifti-reader-js` の affine からは Volume は作れるが modality は不明 → PET/CT 検出が動かない。
-- 回避: ユーザに「PET として登録」「CT として登録」ボタンを提供する（未実装）。
+### 4. NIfTI のみロード時の modality (解決済み 2026-08)
+`nifti-reader-js` の affine からは Volume は作れるが modality は分からない。**3 段で決める**:
+
+1. **ファイル名** — `detectModalityFromFilename` (`003PT00.nii` → PT)
+2. **voxel 値の分布** — `guessModalityFromVoxels` (`modalityGuess.ts`)。**CT だけ**確度高く言える
+   (空気 -1000HU の指紋)。実測 kitty.nii: 空気 46.2%・負値 89.2% → CT。
+   **PT と MR は分布だけでは互いに区別できない**ので `null` を返し 'OTHER' のままにする。
+3. **手動指定** — `SeriesList.vue` の **Set as PT / CT / MR** ボタン
+   (`isUnknownModality` のときだけ出る) → `DicomView.onSetSeriesModality` が
+   metadata を書き換えて `segStore.setPetVolume` / `setCtVolume` / `setMrVolume` を呼ぶ。
+   seriesUID が無い NIfTI には `nii-{index}-{timestamp}` の sentinel を振る
+   (registration の永続化が seriesUID 照合のため)。
+
+検証: `node scripts/nifti-modality.mjs` (kitty で 6 項目すべて PASS を確認済み)。
 
 ### 5. GPU mode で voxel inspector の Shift+Click 編集が画像に反映されない (解決済み 2026-08)
 - 症状: Voxel inspector で Shift+Click → prompt() で値を入力 → `Volume.voxel[idx]` には書き込まれ、inspector 表示も更新されるが、画面の画像は変わらない (色が変化しない)。
@@ -817,6 +835,187 @@ PET 高集積部の MR 信号が周囲の 3.54 倍 (257.4 vs 72.8)。
 - 既存はブラウンベース (`color: brown-darken-4` `#4E342E` 系)。`App.vue` の `myBtn` クラスがツールバーの基準。
 - Vuetify テーマは `plugins/vuetify.ts` で設定（dark default 可）。
 - モダン化を進める場合は dark + アクセント1色（cyan/orange）+ サイドバー幅再設計を推奨（`UI-design` 計画は別ファイル）。
+
+---
+
+## CT 寝台除去 (体マスク) の 3 段構え (2026-08)
+
+`segStore.computeCtBodyMask()` が作る `ctBodyMask` (1=体内 / 0=体外)。3 つを重ねて使う。
+
+1. **最大連結成分** (`extractCtBodyMask`) — 患者と寝台の間に空気の隙間があれば、これだけで足りる。
+   **被写体が台に載っていると成立しない** (実測 kitty: 本体・台座・背板が 1 成分 22.25%、
+   2 番目以降は 50 voxel 以下のノイズのみ)。
+2. **オプション A: 下面から N mm カット** (`ctBedCutBottomMm`)。CT の寝台は必ず下側なので
+   単純だが外しにくい。実測 kitty: 22mm で台座が消え、体マスクが 22.3% → 11.7% に。
+3. **オプション B: 6 面 crop box** (`ctCropMarginsMm`, `cropBodyMaskMargins`)。
+   A を一般化したもので、**A は zMin と同じ値を指す** (両者は setter で同期させてある)。
+   台座が下でない場合 (kitty の背板など) に使う。
+
+- 削る基準は volume の外形ではなく **マスクの world bbox**。だから「体の端から N mm」になる。
+- **world 座標は k, j, i の線形関数なので増分で回すこと。** voxel ごとに関数呼び出し + 積和を
+  すると 2900 万 voxel × 2 周で秒単位かかり UI が固まる。
+- UI は app-bar の Remove CT bed メニュー内 (`App.vue`)。B は 6 個の数値入力 + Clear。
+- 検証: `npm run check:crop` (kitty で 6 面すべて bbox が要求どおり移動することを確認済み)。
+  **「他の面は動かない」は不変条件ではない** — 削った層に他軸の最外郭 voxel が含まれていれば
+  他軸の bbox も内側へ縮む。正しい条件は「**他面は内側にしか動かない**」。
+
+---
+
+## セッション保存のサイズとコスト (2026-08 実測)
+
+保存経路は 2 つあり、**どちらも mask voxel を丸ごと持つ**ので、PET の格子が大きい症例では
+そのまま作ると桁が合わなくなる。実測は Hirata の PET **256x490x146 = 18.3M voxel**
+(mask 1 本 36.6MB、非ゼロは 1.2% だけ)。
+
+**① Snapshot ファイル (.mvs / app-bar のカメラ) — `useSnapshotIo.ts`**
+
+- **v1 (旧) は実用にならなかった**: mask 3 本を生の base64 にして **139.7MB**。
+  読み戻しでページが落ちた (実測)。
+- **v2 (現行) は gzip してから base64**。`fflate` の `gzipSync` / `gunzipSync`。
+  mask は非ゼロが 1.2% しかないので圧縮が桁で効く。
+- **読み込みは v1 / v2 の両方を受ける** (`maskFromSnapshot` が gz を優先し、無ければ生にフォールバック)。
+  書き出しは常に v2。**新しいフィールドを足すときはこの前方/後方互換を壊さないこと。**
+- 実測 (`npm run check:snapshot`): **139.73MB → 0.23MB** (約 600 分の 1)。
+  mask 差分 0、registration は store だけでなく **volume の幾何まで**戻ることを確認済み。
+
+**`applyViewState` は tileN を代入すること (2026-08 修正)**
+
+以前は `newTileN` を計算するだけで **代入していなかった**ので、16 box で保存したスナップショットを
+1 box の状態で読み込んでも 1 box のままだった。ログには "16 boxes" と出るので気付きにくい。
+代入するときは **`imageBoxInfos.value.length` でも頭打ちにすること** — 超えると配列に穴ができ、
+render が丸ごと停止する (2.8)。
+
+**② 自動保存 (IndexedDB) — `useAutoSave.ts` + `stores/persistence.ts`**
+
+- `maskVersion` の変化を **2 秒 debounce** して `serializeForPersistence()` → `saveSession()`。
+  つまり **マスク編集のたびに走る**。実測は `node scripts/autosave-cost.mjs`。
+
+実測 (Hirata の PET 256x490x146、mask 非ゼロ 1.16%):
+
+| | 時間 | サイズ |
+|---|---|---|
+| `serializeForPersistence` (mask コピー) | 30.6 ms | 104.79 MB |
+| IndexedDB 書き込み | 137.4 ms | |
+| **合計** | **168.0 ms** | |
+
+改善案を測った結果:
+
+- **gzip は使えない**: 622 倍に縮む (0.17MB) が **2180ms** かかる。2 秒ごとに走る自動保存では
+  編集が止まる。**一度きりの snapshot 保存でだけ使う** (上の ①)。
+- **`finalMask` を保存しない**: これは採用した (2026-08)。`recomputeFinalMask()` が
+  thresholdMask と manualEdits から**厳密に**導出するので持つ意味が無い。
+  実測 **104.79MB → 69.86MB (33% 減)**、コピー 30.6ms → 25.7ms。
+  ただし **合計の壁時計では改善が見えなかった** (168.0ms → 178.8ms)。IndexedDB の書き込みが
+  支配的で実行ごとに揺れる (137〜153ms) ため。**確かなのは書き込み量とメモリ churn が 1/3 減ること**で、
+  体感速度の改善は主張できない。さらに詰めるなら IndexedDB 書き込み側を見る必要がある。
+  - `serializeForPersistence` は `finalMask: undefined` を返す。
+  - `restoreFromPersistence` は **finalMask が無ければ `recomputeFinalMask()` を呼ぶ**。
+    以前はこの呼び出しが無く、保存された finalMask をそのまま入れていた。
+  - **古い保存データ (finalMask あり) はそのまま使う** (`hadFinal` で分岐)。
+  - 退行検出は `npm run check:snapshot` の「finalMask 完全一致」。導出が厳密でなくなれば落ちる。
+
+---
+
+## DICOM → NIfTI 変換 (2026-08)
+
+`niftiVolumeWriter.ts`。**元の生画素ではなく `dicom2volume` を通した後の値**を書き出す
+(PT = SUV / CT = HU / MR = raw)。単位は sidecar JSON の `unit` に明記される。
+
+**出力は 1 つの .zip にまとめる (image + sidecar)。** ブラウザは**ユーザ操作を伴わない
+2 件目以降のダウンロードを落とす**。変換は非同期に作ってから落とすので必ず gesture の外になり、
+実測で .nii.gz は出たのに sidecar の .json が来なかった (900ms 空けても駄目)。
+zip なら 1 回で済み、「全シリーズ変換で 32 ファイル」問題も同時に消える。
+zip 内の .nii.gz は**既に圧縮済みなので zip 側は無圧縮 (level 0)** にする (二重圧縮は無駄)。
+
+**入口は 3 つ。用途が違う。**
+
+| 入口 | 場所 | 用途 |
+|---|---|---|
+| シリーズカードの「…」→ Export as NIfTI | 左サイドバー | **box に出していないシリーズでも変換できる**。これが主 |
+| app-bar の Save → Convert all series to NIfTI | ハンバーガー | 全シリーズ一括 |
+| box のタイトルバー → Save volume as NIfTI | box | 表示中のものをそのまま |
+
+3 つとも `DicomView.exportSeriesAsNifti()` → `buildNiftiZipEntries()` に集約してある。
+**命名規則・gzip 既定・zip 化を 1 箇所に持たせるため**、新しい入口を足すときもここを通すこと。
+
+**⚠ SeriesList に emit を足したら `Sidebar.vue` にも中継を足すこと。**
+DicomView は `<sidebar @exportNifti=...>` と書くが、SeriesList はその**孫**。
+コンポーネントのイベントは親から孫へ自動では伝わらないので、`Sidebar.vue` の `defineEmits` と
+`<SeriesList @xxx="(p) => emit('xxx', p)">` の**両方**に足さないと**無言で捨てられる**
+(エラーも警告も出ない)。実際これを忘れてメニューが完全に無反応になった。
+
+**datatype は可逆な範囲で自動選択する (`canUseInt16`)**
+
+- 全 voxel が整数かつ Int16 範囲 → **INT16**。CT の HU がこれ。
+- そうでなければ **FLOAT32**。PET の SUV は小数なのでこちら。
+- どちらも **値は 1 つも変わらない** (`npm run check:d2n` の「voxel 値が可逆 差分 0」)。
+- 判定は 43M voxel の全走査になるので **voxel 参照をキーに WeakMap でキャッシュ**する
+  (writer と sidecar で二重に走らせない)。
+
+**性能上の落とし穴 (どちらも実測で踏んだ)**
+
+- **`Int16Array.from(typedArray)` を使わないこと。** iterator 経由になり桁違いに遅い。
+  実測 CT 512x512x165 (43.3M voxel): 書き出しが **84ms → 9305ms**。事前確保 + 素の for で 191ms。
+- **gzip は `CompressionStream` を使うこと。** fflate の `gzipSync` は同期なので
+  同じ CT で **12 秒 UI が固まった**。CompressionStream はブラウザ内部の別スレッドで走る。
+  無い環境だけ fflate に落とす。
+
+**実測 (Hirata20260728)**
+
+| | dims | datatype | サイズ | 所要 (gzip 込み) |
+|---|---|---|---|---|
+| CT Lung | 512x512x165 | INT16 | 165MB → **42.7MB** | 1681ms |
+| PT PET CORONAL | 256x490x146 | FLOAT32 | 69.9MB → **15.7MB** | 1251ms |
+
+**検証は 2 本立て。両方要る。**
+
+- `npm run check:d2n` — 変換の**中身**の検査 (内部関数を直接呼ぶ)
+- `npm run check:d2n-ui` — **人と同じ UI 操作**の検査 (カード → "…" → Export をクリックし、
+  落ちてきた .zip を開いて image と sidecar が入っているか見る)
+
+**中身の検査だけでは足りない。** 上記の Sidebar 中継漏れは `check:d2n` では PASS のまま
+通り抜け、UI では完全に無反応だった。**UI から足した機能は UI から検証すること。**
+
+`npm run check:d2n` の中身 — 書き出した .nii の**ヘッダをライブラリを介さず自前で読み**、
+dims / pixdim / sform_code / **srow から復元した affine が元の imagePosition・vectorX,Y,Z と
+一致するか (LPS↔RAS の符号反転を含む)** / voxel が可逆か / .nii.gz が gunzip で一致するか
+を見る。**アプリと同じ reader で読み戻すと「ライブラリ内で辻褄が合っているだけ」を見逃す**ので、
+バイト位置直読みにしてある。
+
+---
+
+## 検証コマンド (2026-08 整理)
+
+散在していた検証スクリプトに npm の入口を付けた。**DICOM を要らないものだけ**を `npm run check`
+に入れてある (数十秒で終わる)。実データが要るものは個別に叩く。
+
+```bash
+npm run check            # UI 言語ポリシー + 型チェック + affine 往復。DICOM 不要、数十秒
+npm run check:ui-lang    # <template> に日本語が混ざっていないか (CLAUDE.md の UI 言語ポリシー)
+npm run check:affine     # world <-> voxel の往復誤差
+npm run check:render     # ★ render 停止の回帰テスト (下記)。要 dev サーバ + 実データ
+npm run check:mask       # マスクの保存 -> 読み戻しが差分 0 か。要 dev サーバ + 実データ
+npm run check:reg        # registration の適用可否ゲートの分岐確認
+npm run check:modality   # NIfTI の modality 推定 + 手動指定が store まで届くか
+npm run check:crop       # CT 体マスクの crop box (6 面) が bbox どおり削れるか
+npm run check:snapshot   # .mvs の保存 -> 復元が mask 差分 0 / 幾何まで戻るか
+npm run check:d2n        # DICOM -> NIfTI 変換の affine / voxel 可逆性 / .nii.gz
+npm run check:d2n-ui     # ★ 同上を **UI 操作から** (メニュー -> クリック -> zip の中身)
+```
+
+計測用 (合否ではなく数値を見るもの):
+```bash
+node scripts/autosave-cost.mjs      # 自動保存 1 回のコスト (コピー + IndexedDB 書き込み)
+node scripts/axis-orientation.mjs   # 各シリーズの index 軸が world のどこを向いているか
+```
+
+**`check:render` は「2.8 の再発」専用**。template から呼ばれる判定関数が throw すると
+render が毎回失敗して **DOM が一切更新されなくなる**が、Vue は error ではなく **warn** で出すので
+console.error 監視では見逃す。このスクリプトは `console.warn` を包んで Vue warn を捕まえ、
+レイアウト・タイル数を一通り切り替えて **canvas 枚数が追随するか**を確認し、
+`imageBoxInfos` に穴 (undefined) が無いことも見る。**box を増やす経路を触ったら必ず走らせること。**
+
+実データが要るスクリプトは先に `npm run dev` を起動しておく (既定 3000 番)。
 
 ---
 

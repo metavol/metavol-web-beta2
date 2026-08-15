@@ -4,6 +4,17 @@ import type { Volume } from '../components/Volume';
 import { connectedComponents26, floodFillAssignLabel, extractCtBodyMask, sphereStatsInPet } from '../components/segmentation/maskOps';
 import { writeNiftiUint16, triggerDownload } from '../components/segmentation/niftiWriter';
 import { evictVolumeTexture } from '../components/webgpu/volumeCache';
+
+/** 体マスクを world bbox の各面から何 mm 削るか (オプション B の crop box)。 */
+export interface CtCropMarginsMm {
+    xMin: number; xMax: number;
+    yMin: number; yMax: number;
+    zMin: number; zMax: number;
+}
+export const emptyCropMargins = (): CtCropMarginsMm =>
+    ({ xMin: 0, xMax: 0, yMin: 0, yMax: 0, zMin: 0, zMax: 0 });
+export const hasAnyCropMargin = (m: CtCropMarginsMm): boolean =>
+    m.xMin > 0 || m.xMax > 0 || m.yMin > 0 || m.yMax > 0 || m.zMin > 0 || m.zMax > 0;
 import { surfaceThresholdFor } from '../components/surfaceThreshold';
 
 export interface LabelEntry {
@@ -160,7 +171,12 @@ interface State {
     ctBodyMaskEnabled: boolean;     // 表示時に適用するか (toggle)
     ctBodyMaskVersion: number;      // 表示更新トリガ用
     // 体マスクから「下から N mm」を落とす (寝台/台座の除去)。0 = 使わない。
+    // これは ctCropMarginsMm.zMin と同じものを指す (下面だけは使用頻度が高いので別入口を持たせてある)。
     ctBedCutBottomMm: number;
+    // **オプション B: 6 面それぞれから N mm 削る (crop box)。**
+    // 下面カット (オプション A) は「world -Z 面から削る」特殊形。台座が下でない場合
+    // (kitty の背板など) は他の面も要るので一般化してある。すべて 0 なら何もしない。
+    ctCropMarginsMm: CtCropMarginsMm;
 
     // Crosshair: 全 Box で共有する焦点位置 (world 座標)。null = 表示しない。
     crosshairWorld: THREE.Vector3 | null;
@@ -254,6 +270,7 @@ export const useSegmentationStore = defineStore('segmentation', {
 
         ctBodyMask: null,
         ctBedCutBottomMm: 0,
+        ctCropMarginsMm: emptyCropMargins(),
         ctBodyMaskEnabled: false,
         ctBodyMaskVersion: 0,
 
@@ -911,7 +928,14 @@ export const useSegmentationStore = defineStore('segmentation', {
                 savedAt: Date.now(),
                 thresholdMask: cloneBuf(this.thresholdMask),
                 manualEdits:   cloneBuf(this.manualEdits),
-                finalMask:     cloneBuf(this.finalMask),
+                // **finalMask は保存しない。** recomputeFinalMask() が thresholdMask と
+                // manualEdits から厳密に導出できるので、持つ意味が無いうえに実害がある。
+                // これは **マスク編集のたびに 2 秒 debounce で走る** (useAutoSave)。
+                // 実測 (Hirata の PET 256x490x146): 3 本で 104.79MB のコピー 30.6ms +
+                // IndexedDB 書き込み 137.4ms = 168ms。1 本減らすと 33% 削れる。
+                // (gzip も測ったが **2180ms** かかるので自動保存には使えない。
+                //  一度きりの snapshot 保存では使っている。CLAUDE.md「セッション保存のサイズとコスト」)
+                finalMask:     undefined,
                 dims: [pet.nx, pet.ny, pet.nz],
                 voxelSizeMm: [pet.vectorX.length(), pet.vectorY.length(), pet.vectorZ.length()],
                 threshold: this.threshold,
@@ -981,7 +1005,10 @@ export const useSegmentationStore = defineStore('segmentation', {
             };
             restoreInto(this.thresholdMask, payload.thresholdMask);
             restoreInto(this.manualEdits,   payload.manualEdits);
-            restoreInto(this.finalMask,     payload.finalMask);
+            // finalMask は保存していない (導出できるため)。**古い保存データには入っている**ので、
+            // あればそのまま入れ、無ければ下の recomputeFinalMask() に任せる。
+            const hadFinal = !!payload.finalMask;
+            if (hadFinal) restoreInto(this.finalMask, payload.finalMask);
             this.threshold = payload.threshold;
             this.thresholdUnit = payload.thresholdUnit;
             if (Array.isArray(payload.labels) && payload.labels.length > 0) {
@@ -1007,6 +1034,10 @@ export const useSegmentationStore = defineStore('segmentation', {
                     .map(r => ({ seriesUID: r.seriesUID, params: r.params.map(Number) }));
                 this.registrationVersion++;
             }
+            // **finalMask を保存しなくなったので、ここで導出する。**
+            // 以前は保存された finalMask をそのまま入れており、この呼び出しが無かった。
+            // 古い保存データ (finalMask を含む) はそのまま使い、新しいものだけ導出する。
+            if (!hadFinal) this.recomputeFinalMask();
             this.clearHistory();
             this.invalidateComponentMap();
             this.maskVersion++;
@@ -1038,7 +1069,9 @@ export const useSegmentationStore = defineStore('segmentation', {
             // 空気の隙間があるので最大成分＝患者になるが、被写体が台に載っていると成立しない。
             // そこで「下から N mm を落とす」を併用する。CT では寝台は必ず下側なので、
             // 単純だが外しにくい。0 なら従来どおり (連結成分のみ)。
-            if (cutBottomMm > 0) this.cutBodyMaskBottom(ct, cutBottomMm);
+            // オプション A (下面カット) は crop の zMin と同じもの。引数で来たらそちらを優先する。
+            const margins: CtCropMarginsMm = { ...this.ctCropMarginsMm, zMin: cutBottomMm };
+            if (hasAnyCropMargin(margins)) this.cropBodyMaskMargins(ct, margins);
             this.ctBodyMaskEnabled = true;
             this.ctBodyMaskVersion++;
             const t1 = performance.now();
@@ -1046,49 +1079,90 @@ export const useSegmentationStore = defineStore('segmentation', {
             return true;
         },
 
-        // body mask の下端 cutBottomMm を体外にする。
-        // 「下」は world -Z 方向 (患者座標で足側 / 画像で下)。
-        cutBodyMaskBottom(ct: Volume, cutBottomMm: number) {
+        // body mask の **world bbox の各面から N mm** を体外にする (オプション B)。
+        //
+        // 「下から N mm」(オプション A) はこの zMin だけを使う特殊形。CT の寝台は必ず下側なので
+        // 人体ではそれで足りるが、被写体が台に載っていたり背板があると他の面も要る
+        // (実測 kitty: 本体・台座・背板が 1 連結成分になり、連結成分だけでは分けられない)。
+        //
+        // **world 座標は k, j, i の線形関数なので増分で回すこと。** voxel ごとに
+        // 関数呼び出し + 3 回の積和をすると 2900 万 voxel × 2 周で秒単位かかり UI が固まる
+        // (実測: 描画待ちと区別できないほど遅かった)。
+        cropBodyMaskMargins(ct: Volume, margins: CtCropMarginsMm) {
             const m = this.ctBodyMask;
             if (!m) return;
+            if (!hasAnyCropMargin(margins)) return;
             const t0 = performance.now();
             const { nx, ny, nz } = ct;
-            // world z は k, j, i の線形関数なので **増分で回す**。
-            // voxel ごとに関数呼び出し + 3 回の積和をすると 2900 万 voxel × 2 周で
-            // 秒単位かかり、UI が固まる (実測: 描画待ちと区別できないほど遅かった)。
-            const zk = ct.vectorZ.z, zj = ct.vectorY.z, zi = ct.vectorX.z;
-            const z0 = ct.imagePosition.z;
+            const p0 = ct.imagePosition;
+            const vx = ct.vectorX, vy = ct.vectorY, vz = ct.vectorZ;
 
-            let minZ = Infinity;
+            // ---- pass 1: マスクの world bbox ----
+            let minX = Infinity, maxX = -Infinity;
+            let minY = Infinity, maxY = -Infinity;
+            let minZ = Infinity, maxZ = -Infinity;
             for (let k = 0; k < nz; k++) {
-                const zRow0 = z0 + zk * k;
+                const x0 = p0.x + vz.x * k, y0 = p0.y + vz.y * k, z0 = p0.z + vz.z * k;
                 for (let j = 0; j < ny; j++) {
                     const base = k * nx * ny + j * nx;
-                    let z = zRow0 + zj * j;
-                    for (let i = 0; i < nx; i++, z += zi) {
-                        if (m[base + i] !== 0 && z < minZ) minZ = z;
+                    let x = x0 + vy.x * j, y = y0 + vy.y * j, z = z0 + vy.z * j;
+                    for (let i = 0; i < nx; i++, x += vx.x, y += vx.y, z += vx.z) {
+                        if (m[base + i] === 0) continue;
+                        if (x < minX) minX = x; if (x > maxX) maxX = x;
+                        if (y < minY) minY = y; if (y > maxY) maxY = y;
+                        if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
                     }
                 }
             }
-            if (!Number.isFinite(minZ)) return;
-            const cut = minZ + cutBottomMm;
+            if (!Number.isFinite(minX)) return;   // マスクが空
+
+            // ---- pass 2: 各面から margin ぶんを落とす ----
+            const cxLo = minX + margins.xMin, cxHi = maxX - margins.xMax;
+            const cyLo = minY + margins.yMin, cyHi = maxY - margins.yMax;
+            const czLo = minZ + margins.zMin, czHi = maxZ - margins.zMax;
             let removed = 0;
             for (let k = 0; k < nz; k++) {
-                const zRow0 = z0 + zk * k;
+                const x0 = p0.x + vz.x * k, y0 = p0.y + vz.y * k, z0 = p0.z + vz.z * k;
                 for (let j = 0; j < ny; j++) {
                     const base = k * nx * ny + j * nx;
-                    let z = zRow0 + zj * j;
-                    for (let i = 0; i < nx; i++, z += zi) {
-                        if (m[base + i] !== 0 && z < cut) { m[base + i] = 0; removed++; }
+                    let x = x0 + vy.x * j, y = y0 + vy.y * j, z = z0 + vy.z * j;
+                    for (let i = 0; i < nx; i++, x += vx.x, y += vx.y, z += vx.z) {
+                        if (m[base + i] === 0) continue;
+                        if (x < cxLo || x > cxHi || y < cyLo || y > cyHi || z < czLo || z > czHi) {
+                            m[base + i] = 0; removed++;
+                        }
                     }
                 }
             }
-            console.log(`[ct-bed-removal] cut bottom ${cutBottomMm}mm (below z=${cut.toFixed(1)}): `
+            const f = (n: number) => n.toFixed(1);
+            console.log(`[ct-bed-removal] crop margins x[${margins.xMin},${margins.xMax}] `
+                + `y[${margins.yMin},${margins.yMax}] z[${margins.zMin},${margins.zMax}] mm `
+                + `(bbox x ${f(minX)}..${f(maxX)} y ${f(minY)}..${f(maxY)} z ${f(minZ)}..${f(maxZ)}): `
                 + `${removed} voxels removed in ${(performance.now() - t0).toFixed(0)}ms`);
         },
 
+        /** 旧 API 互換。下面だけ削る (オプション A)。 */
+        cutBodyMaskBottom(ct: Volume, cutBottomMm: number) {
+            this.cropBodyMaskMargins(ct, { ...emptyCropMargins(), zMin: cutBottomMm });
+        },
+
+        /** crop の 1 面を設定する。zMin は「下面カット」と同じものなので両方を同期させる。 */
+        setCtCropMargin(face: keyof CtCropMarginsMm, mm: number) {
+            const v = Math.max(0, Number.isFinite(mm) ? mm : 0);
+            this.ctCropMarginsMm = { ...this.ctCropMarginsMm, [face]: v };
+            if (face === 'zMin') this.ctBedCutBottomMm = v;
+        },
+
+        clearCtCropMargins() {
+            this.ctCropMarginsMm = emptyCropMargins();
+            this.ctBedCutBottomMm = 0;
+        },
+
         setCtBedCutBottomMm(mm: number) {
-            this.ctBedCutBottomMm = Math.max(0, mm);
+            // 下面カットは crop の zMin と同じもの。両方を同期させる。
+            const v = Math.max(0, Number.isFinite(mm) ? mm : 0);
+            this.ctBedCutBottomMm = v;
+            this.ctCropMarginsMm = { ...this.ctCropMarginsMm, zMin: v };
         },
 
         toggleCtBodyMaskEnabled() {
