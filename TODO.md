@@ -39,20 +39,25 @@
 
 ---
 
-## 戦略: 3 ペルソナのエンドツーエンド完成
+## 戦略: 4 ペルソナのエンドツーエンド完成
 
 ### Persona 1: PET/CT segmentation (オーソドックスユーザ)
 DICOM ロード → PET Standard → SUV threshold → manual ROI 編集 → MTV/TLG 測定 → NIfTI 保存
 - 現状 90% 完成。Inspector の polygon ROI / Sphere ROI / Labels / Histogram / Save 動線あり
 - 残: lesion 一覧の export 改善、レポート出力 (Phase 2)
 
-### Persona 2: Quick viewer (DICOM/NIfTI さっと見たい)
+### Persona 2: 脳 PET の解剖学的標準化 + VOI テンプレート (2026-08 新設)
+
+正規化 (MATLAB/SPM) は各自の PC。metavol-web は **DICOM→NIfTI** と
+**正規化済み NIfTI + VOI テンプレート → 領域値** を担う。実装済み (CLAUDE.md 参照)。
+
+### Persona 3: Quick viewer (DICOM/NIfTI さっと見たい)
 URL クリック → ロード → 見て閉じる
 - 現状 70% 完成。ファイル D&D / NIfTI auto-detect 動作
 - 残: URL に file リンクを埋めて即ロードする shareable link、アップロード UI 簡素化、ロゴ/シェア boilerplate 削減
 - 「3 秒以内に画像が出る」UX が目標
 
-### Persona 3: PET/MR + radiomics (ヘビーユーザ)
+### Persona 4: PET/MR + radiomics (ヘビーユーザ)
 別撮影 PT/MR ロード → MR-PET register → MR ベースで ROI → ROI 内 PET radiomics 抽出
 - 現状 40% 完成。Auto-register MR↔PET (☰ Preprocessing) 動作、blend slider あり
 - 残: ROI を MRI で描画 → そのまま PET 値抽出する明示的 workflow、radiomics features の export
@@ -77,6 +82,68 @@ CLAUDE.md「DICOM → NIfTI 変換」に詳細。`npm run check:d2n` で affine 
 - [x] **UI から無反応だった不具合を修正** (2026-08-14) — `Sidebar.vue` のイベント中継漏れ。
       内部関数を直接呼ぶ `check:d2n` は PASS していたので気付けなかった。
       **UI 操作から検証する `npm run check:d2n-ui` を追加**した。
+
+## SPM 標準脳変換 + VOI テンプレート解析 (2026-08-17 実装)
+
+CLAUDE.md「SPM 標準脳変換 + VOI テンプレート解析」に詳細。
+`npm run check:voi` (独立実装との突合を含む) と `npm run check:voi-ui` (UI 操作) が両方 PASS。
+
+**動く範囲**: SPM で正規化した NIfTI を drag&drop → ハンバーガーの **VOI analysis…** →
+テンプレート (`labels_Neuromorphometrics.nii` + `.xml`) を読み込み → シリーズを選んで Run →
+136 領域の voxel 数 / 体積 / mean / SD / min / max → CSV 出力。
+
+- [ ] **手動検証 (ユーザ)**: 実際の症例で通し、**数値が SPM/MarsBaR などの既存手段と一致するか**。
+      スクリプトは「アプリ内で自己整合」と「Node の独立実装と一致」までしか保証していない。
+      **外部ツールとの一致は未確認。**
+- [x] **overlay 表示** ✅ (2026-08-17) — 既存のマスク overlay (`MaskOverlay`) を流用。
+      ImageBox は 1 行も変えずに CPU/GPU 両方で描画できた。重ねるのは **labelOf (割り当て結果)** で
+      アトラス原本ではないので、見えているものと表の数値が必ず一致する。
+      `npm run check:voi-ui` が canvas の画素を読んで着色率を検査 (ON 62.4% / OFF 0.0%)。
+      - [ ] 手動検証: 45% 既定だと脳全体が覆われて下の解剖が見づらい。実用上ちょうどよいか、
+            **輪郭表示 (境界だけ描く) モードが要るか**は使ってみての判断待ち。
+- [ ] 参照領域比 (SUVR) — 今回スコープ外。統計は純関数なので上に足せる。
+- [ ] 左右差 / Z スコア / **複数症例のバッチ処理** — 同上。
+- [ ] `scl_slope`/`scl_inter` の適用 (`loadNii`) — **今回のファイルは両方 slope=1 なので
+      発火しない**が、他の SPM 出力 (int16 書き出し等) では値が定数倍ずれる。VOI 専用の
+      loader (`parseNiftiLabelVolume`) では既に適用済み。既存の読み込み経路は未修正。
+
+## Persona 2 (脳 PET + VOI) の満足度向上 (2026-08-19 着手)
+
+**全体フロー**: ① 病院から DICOM → ② metavol-web で .nii 保存 → ③ SPM12 で normalize (`w*.nii`)
+→ ④ metavol-web で開く → ⑤ テンプレート読込 → ⑥ 領域値 → ⑦ CSV
+
+- [x] **⑤ でテンプレートの一致を目視できるようにした** (2026-08-19)。読み込み時に自動解析まで走らせ、
+      overlay・診断・表が即出る。Run を押す手間も 1 つ減った。`npm run check:voi-ui` で検査。
+- [ ] **② の摩擦**: SPM12 は `.nii.gz` を直接読めないのに、メニューは `.nii.gz` を
+      「recommended」と表示している。**Persona 2 の用途では逆**。さらに両方 zip 包装なので
+      「展開 → (gz なら) gunzip → SPM」の手数がかかる。SPM 向けの導線を用意する。
+- [ ] **テンプレートを憶える** (localStorage / IndexedDB)。現状リロードで消え、症例ごとに
+      2 ファイル選択し直し。**繰り返し作業で最も効く。**
+- [ ] **参照領域比 (SUVR)** — 小脳・橋などを基準にした比。臨床でまず要る。
+- [ ] **複数症例のバッチ処理** — 現状 1 症例ずつ。1 枚の CSV (症例 × 領域) に。
+- [ ] 表の行クリックでその領域へジャンプ (Persona 1 の lesion table にはある)。
+- [ ] VOI 結果・テンプレートが **snapshot (.mvs) にも自動保存にも入っていない**。
+- [ ] VOI 領域値が **PDF / PPTX レポートに入らない** (現状 MTV 用のみ)。
+
+## VOI ワークフローの使用感からの指摘 (2026-08-18)
+
+- [x] **modality 不明でも見える window にする** ✅ — 分位点から自動決定 (`volumeWindow.ts`)。
+      Window preset も不明を MR と同じ「Auto/Tight/Wide」に。実測 WC3.03/WW6.05。
+- [x] **VOI 統計を NaN 安全に** ✅ — SPM 出力は視野外が NaN (実測 0.74%)。`nanVoxels` 列を追加。
+- [x] **ファイル名の SPM 接頭辞を飛ばす** ✅ — `wPT_...` → PT。metavol-web→SPM→metavol-web が繋がる。
+- [ ] **w00r.nii のような外部ファイルの PT 自動判定は見送り**。voxel 値では PT/MR を区別できず、
+      正規化を通すと PET の指紋 (大きな負値) も消える (CLAUDE.md 既知バグ 4 に実測表)。
+      現状は `Set as PT` の 1 クリック。**より良い案があれば要検討**:
+      - metavol-web の書き出し側で NIfTI の `descrip` や `intent_name` に modality を埋め、
+        SPM が上書きしないフィールドを探す (SPM は descrip を "Warped" で潰す)
+      - sidecar JSON を SPM 後も手で持ち回る運用にする
+- [ ] **小さい matrix の volume が 1 voxel = 1 画素で開く** (実測: 79x95 の脳が
+      1203x875 の box に 4374 画素ぶんしか占めない)。**「Fit to window」を押しても変わらない**
+      (あれは box の寸法を合わせるもので、画像の拡大率は変えない。実測 4374 → 4374)。
+      現状の拡大手段は **Ctrl+ホイール** (実測 6 回で 4374 → 13636 画素)。
+      → volume box を作るとき、**box に収まる倍率を初期値にする**のが素直。要検討。
+- [x] 実際の Load files… 経路を実行して確認済み (`node scripts/voi-walkthrough.mjs`)。
+      読み込んだ時点で volume box として表示され、自動 window も効く。
 
 ## 手動検証待ち (ユーザが手を離せるとき / 2026-08-12 時点)
 
@@ -159,7 +226,7 @@ PET=全身 1148mm) では MI / NMI / 体内限定 / 形状の **5 指標すべ�
 - **composable 切り出し**: `DicomView.vue` (~1900行) を `useSphereROI` / `usePolygonROI` / `useDebug` 等に分解
 - **バンドル 500KB 超**: `vite build` 時 warning。manual chunk 分割（vendor / nifti / dcmjs-codecs を分離）
 
-### NIfTI 「raw byte array」表示モード (将来実装、Persona 2 向け)
+### NIfTI 「raw byte array」表示モード (将来実装、Persona 3 向け)
 
 NIfTI ヘッダの affine / orientation を **無視**して、ファイル内 byte 配列の物理ストレージ順をそのまま画面に再現するモード。
 - innermost dim (= fastest-varying = pixel データの先頭から連続する軸) を **screen X (左→右)**
@@ -226,7 +293,7 @@ UI 案: NIfTI series card のメニュー or ☰ から "Inspect NIfTI bytes" �
 - ✅ NIfTI mask **load (round-trip)** with seriesUID validation
 - 残: lesion 別 SUV histogram、SUVpeak (1cc sphere centered at SUVmax)、PDF レポート出力
 
-### Persona 2 (Quick viewer) — **完成度 85%**
+### Persona 3 (Quick viewer) — **完成度 85%**
 - ✅ DICOM/NIfTI ファイル D&D
 - ✅ 自動 modality 推定 (NIfTI filename heuristics)
 - ✅ Series card に description / DCM/NII chip / matrix size
@@ -237,7 +304,7 @@ UI 案: NIfTI series card のメニュー or ☰ から "Inspect NIfTI bytes" �
 - 残: NIfTI raw byte view (TODO に詳細)、デモデータの公開リンク
 - 残: MIP / cor / sag への切替がもっとワンアクションで (現在は plane menu)
 
-### Persona 3 (PET/MR + radiomics) — **完成度 70%**
+### Persona 4 (PET/MR + radiomics) — **完成度 70%**
 - ✅ MR-PET registration (☰ Preprocessing → Auto-register、進捗 chip 付き)
 - ✅ Fusion D&D (modality chip drag → 任意 box)
 - ✅ Fusion box の base/overlay 別 CLUT + W/L active layer toggle
@@ -383,7 +450,7 @@ own threshold) → 各骨を独立に剛体移動 → 2D 投影で骨シンチ�
 
 1. **DataBox abstraction Phase 1** (P1-A): `BoxTitlebar.vue` 抽出。機能変化なし refactor
 2. **NOTICES / THIRD_PARTY_LICENSES** (P2-A): `license-checker` で生成、配布物に同梱
-3. **MR ROI UX cue** (Persona 3 仕上げ): 描画開始時に「This ROI will be stored on PET grid」インラインヒント
-4. **公開デモデータ** (Persona 2 仕上げ): `public/demo/*.nii.gz` + `?demo=lung01` mapping
+3. **MR ROI UX cue** (Persona 4 仕上げ): 描画開始時に「This ROI will be stored on PET grid」インラインヒント
+4. **公開デモデータ** (Persona 3 仕上げ): `public/demo/*.nii.gz` + `?demo=lung01` mapping
 5. **バンドル分割** (P2-C): manual chunk
 6. **DicomView.vue composable 化** (P1-B): `useSphereROI` / `usePolygonROI` 等

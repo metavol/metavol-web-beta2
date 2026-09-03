@@ -76,6 +76,93 @@
 
 ---
 
+## 3.5 脳 PET の解剖学的標準化 + VOI 解析（ペルソナ 2）
+
+標準脳への正規化そのものは **MATLAB + SPM12（各自の PC）** で行う。metavol-web が担うのは
+その **前（DICOM → NIfTI）** と **後（正規化済み NIfTI + VOI テンプレート → 領域値）**。
+
+### 全体の流れ
+
+| | 工程 | 場所 |
+|---|---|---|
+| ① | 病院から DICOM をダウンロード | 院内 |
+| ② | metavol-web で開いて **.nii で保存** | metavol-web |
+| ③ | SPM12 で normalize → `w*.nii` | MATLAB |
+| ④ | `w*.nii` を metavol-web で開く | metavol-web |
+| ⑤ | VOI テンプレートを読み込む（→ **その場で解析まで走る**） | metavol-web |
+| ⑥ | overlay と診断で一致を確認 → CSV 出力 | metavol-web |
+
+### ② DICOM → NIfTI
+
+1. **☰ → Load files…**（または drag & drop）で DICOM フォルダを読む
+2. 左サイドバーの対象シリーズの **「…」→ Export as NIfTI (.nii)** を選ぶ
+   - **SPM12 は `.nii.gz` を直接読めない**ので、この用途では**非圧縮 `.nii` を選ぶ**
+   - ダウンロードされるのは `.zip`（画像 + sidecar JSON）。展開して `.nii` を SPM へ
+   - box に出していないシリーズでも変換できる
+3. sidecar JSON には単位（PT なら SUV）や SUV 係数が入る。**書き出す値は生画素ではなく
+   `dicom2volume` 通過後の値**（PT = SUV / CT = HU / MR = raw）
+
+### ④ 正規化済み NIfTI を開く
+
+1. **☰ → Load files…** で `w*.nii` を選ぶ（drag & drop も可）
+2. **読み込んだ時点で 1 box に表示される**。MPR への切り替えなどは不要
+3. window は **volume の分位点から自動**で決まる（modality 不明でも見える）
+4. 必要なら左サイドバーのカードの **Set as: PT** を押す（任意）
+   - 押すと単位表示が **SUV** になり、CSV にも `unit,SUV` が入る
+   - 押さなくても VOI 解析は動く（単位表示が `raw` になるだけ）
+5. 小さく表示されるときは **Ctrl + ホイール**で拡大
+   - ⚠ **「Fit to window」は画像の拡大率を変えない**（box の寸法を合わせる機能）
+
+### ⑤ VOI テンプレートを読み込む
+
+1. **☰ → VOI analysis…** でダイアログを開く
+2. **Load VOI template…** で **2 ファイルを同時に選択**
+   - SPM の `tpm` フォルダの `labels_Neuromorphometrics.nii` と `.xml`
+   - 名前表は CSV / TSV / FreeSurfer LUT でも可
+3. **読み込んだ時点で解析まで自動で走る**。Run を押す必要はない
+   （シリーズを変えて再実行したいときだけ **Run**）
+
+### ⑥ 一致の確認と CSV 出力
+
+**目視（overlay）**: 「Show regions on the image」が既定 ON。ダイアログを閉じるか脇へ寄せると
+画像に領域が色分けで乗っている。**Opacity** で濃さを調整。
+重ねているのは**数値を出したのと同じ割り当て結果**なので、見えているものと表は必ず一致する。
+
+領域は **MTV 測定と同じマスク層**に読み込まれる。読み込まれると**左サイドバーの最上部に
+MASK カード**が現れ、何のマスクか（VOI: Neuromorphometrics … / MTV mask）・対象 PT・
+ラベル数・体積 (mL) が見える。カード上で 表示/非表示（目アイコン）・透過度・
+「…」→ Save mask / Clear mask ができる。さらに右サイドバー（Segmentation パネル）で
+- **Mask スライダ** … 透過度（ダイアログの Opacity と同じ値）
+- **目アイコン** … 領域ごとの表示/非表示（例: 白質だけ消す）
+- **色チップ** … 領域色の変更
+- **☰ → Save mask** … 領域マスクを NIfTI で保存
+がそのまま使える。⚠ マスク層は 1 枚なので、VOI 解析を実行すると実行中の MTV マスクは
+置き換わる（逆も同じ）。
+
+**数値（Alignment check）**: 正常なら次のようになる。
+
+| 項目 | 期待値 |
+|---|---|
+| Image voxels inside template | 100% |
+| Bounding-box overlap | 100% |
+| Regions with no voxels | ごく少数 |
+
+低い場合は正規化されていない可能性があり、警告が出る。
+
+**表と CSV**: 見出しクリックでソート、検索欄で絞り込み（例 `hippocampus` → 左右 2 行）、
+**Hide empty regions** で voxel 0 を隠す。**Export CSV** で
+`id / name / voxels / nan_voxels / volume_ml / mean / sd / min / max` と出典行が出る。
+
+### 最短手順
+
+**☰ → Load files…**（`w*.nii`）→ **☰ → VOI analysis…** → **Load VOI template…** → **Export CSV**
+
+テンプレートはセッション中は保持されるので、2 症例目以降は
+**Load files… → VOI analysis… → Export CSV** だけで済む
+（※ ページをリロードするとテンプレートは消える）。
+
+---
+
 ## 4. マウス & キーボード操作
 
 ### マウス（ツール非依存・常時有効）
@@ -179,6 +266,18 @@
 - 幾何: PET の affine そのまま（origin = ImagePositionPatient、軸 = vectorX/Y/Z）
 - 1 voxel = PET voxel（CT 解像度ではない）
 
+**読み戻しは画像と同じ d&d でよい。** 対象の画像を読み込んだ状態でマスク `.nii` を
+drag & drop（または ☰ → Load files…）すると、格子が一致しラベル値らしい場合に
+「Load it as a MASK on that volume?」と確認が出る。**OK** でマスクとして取り込まれ
+（MASK カード・透過度・per-label 表示がそのまま使える）、**Cancel** なら普通の
+画像 volume として開く。`.nii.json` サイドカーを同時に落とすとラベル名・色も復元される。
+（従来の ☰ → Load mask (NIfTI)… も残っているが、d&d と同じ入口に流れるだけ）
+
+**自動判定に乗らなかった / 間違えて Cancel したとき**: そのファイルは普通の volume として
+左サイドバーに並ぶ。そのカードの **「…」→ Use as mask** を押せば、その場でマスクとして
+取り込み直せる（同じ格子の画像が読み込まれていることが条件。値が整数ラベルでない場合や
+格子が合わない場合は理由が alert で出る）。
+
 ### JSON サイドカー
 - ファイル名: `{seriesUID}_{YYYYMMDDhhmmss}.nii.json`
 - 内容:
@@ -225,8 +324,10 @@
 - store のアクション定義を変えた直後はブラウザを Ctrl+Shift+R でハードリロードすること
 
 ### NIfTI のみのロード
-- modality 情報が無いため PET/CT 自動検出が動かない
-- 現状は DICOM ロード前提の設計（NIfTI 用の手動指定は未実装）
+- NIfTI には modality タグが無いので、**ファイル名 → voxel 値の分布 → 手動指定**の 3 段で決める
+- 名前で分からなければシリーズカードの **Set as: PT / CT / MR** で 1 クリック指定
+  （SPM の `w` などの接頭辞は読み飛ばすので `wPT_….nii` は PT と判定される）
+- **PT と MR は voxel 値では区別できない**（正規化を通すと PET の指紋が消えるため）
 
 ---
 

@@ -582,3 +582,40 @@ export const colorForLabel = (id: number): [number, number, number] => {
     const c = labelClut[id % labelClut.length];
     return [c[0], c[1], c[2]];
 }
+
+// ラベル数が多い overlay (VOI アトラス 136 領域など) 用のカテゴリカル palette。
+//
+// `labelClut` は 17 色しか無く、`id % 17` だと 136 領域では同色が頻繁にぶつかる。
+// **黄金角 (137.508°) で色相を回す**と、連番 id が必ず離れた色相になるので
+// 左右対（Neuromorphometrics は L/R が連番）も隣接領域も区別しやすい。
+// 彩度と明度も id で微妙に振って、色相が一周したときの衝突を緩和する。
+const hslToRgb = (h: number, s: number, l: number): [number, number, number] => {
+    const c = (1 - Math.abs(2 * l - 1)) * s;
+    const hp = ((h % 360) + 360) % 360 / 60;
+    const x = c * (1 - Math.abs((hp % 2) - 1));
+    let r = 0, g = 0, b = 0;
+    if (hp < 1) [r, g, b] = [c, x, 0];
+    else if (hp < 2) [r, g, b] = [x, c, 0];
+    else if (hp < 3) [r, g, b] = [0, c, x];
+    else if (hp < 4) [r, g, b] = [0, x, c];
+    else if (hp < 5) [r, g, b] = [x, 0, c];
+    else [r, g, b] = [c, 0, x];
+    const m = l - c / 2;
+    return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+};
+
+/**
+ * index 0 = 背景 (黒・不透明扱い)、1..maxId に色を振った CLUT を返す。
+ * 4 要素目は visibility (overlay 側が `c[3] ?? 1` で読む)。
+ */
+export const buildCategoricalClut = (maxId: number): number[][] => {
+    const arr: number[][] = [[0, 0, 0, 1]];
+    for (let id = 1; id <= Math.max(1, maxId); id++) {
+        const hue = (id * 137.508) % 360;
+        const sat = 0.60 + 0.20 * ((id % 3) / 2);
+        const lig = 0.52 + (id % 2 ? 0.10 : -0.08);
+        const [r, g, b] = hslToRgb(hue, sat, lig);
+        arr[id] = [r, g, b, 1];
+    }
+    return arr;
+};

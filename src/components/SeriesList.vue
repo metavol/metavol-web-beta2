@@ -44,6 +44,7 @@ const emit = defineEmits<{
     (e: 'inspectRaw', payload: { index: number }): void;
     (e: 'viewHeader', payload: { index: number }): void;
     (e: 'exportNifti', payload: { index: number; gzip: boolean }): void;
+    (e: 'useAsMask', payload: { index: number }): void;
 }>();
 
 // Drag start: custom mime に series index を載せる。
@@ -201,6 +202,18 @@ const sliceLabelFor = (s: { index: number }): string | null => {
                     <!-- DICOM -> NIfTI 変換。**box に出していないシリーズでも変換できる**ことが肝。
                          以前はここが "No actions for DICOM" で、変換は box のタイトルバー経由しか
                          なかった。既定は .nii.gz (Float32 なので CT は素だと数百 MB になる)。 -->
+                    <!-- d&d の自動判定に乗らなかった / Cancel してしまったマスクを手動で取り込み直す。
+                         判定と取り込みは DicomView.onUseSeriesAsMask (失敗理由は alert で出る)。 -->
+                    <v-list-item
+                        v-if="s.sourceType === 'NIFTI' && s.hasVolume"
+                        @click="emit('useAsMask', { index: s.index })"
+                    >
+                        <template v-slot:prepend>
+                            <v-icon icon="mdi-layers-outline" size="small" />
+                        </template>
+                        <v-list-item-title>Use as mask</v-list-item-title>
+                        <v-list-item-subtitle>Treat this volume as a label mask on the matching image</v-list-item-subtitle>
+                    </v-list-item>
                     <v-list-item @click="emit('exportNifti', { index: s.index, gzip: true })">
                         <template v-slot:prepend>
                             <v-icon icon="mdi-download-outline" size="small" />

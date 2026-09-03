@@ -143,6 +143,11 @@ interface State {
     overlayAlpha: number;
     overlayEnabled: boolean;
 
+    // マスクの出自 (Sidebar の MASK カードに表示)。null = マスク無し or 出自不明。
+    // 例: 'MTV mask' / 'VOI: Neuromorphometrics (136 regions)' / 読み込んだファイル名。
+    // マスク層は 1 枚なので「いま載っているのは何か」を常に見えるようにする。
+    maskLabel: string | null;
+
     panelOpen: boolean;
     maskVersion: number;
 
@@ -251,6 +256,8 @@ export const useSegmentationStore = defineStore('segmentation', {
 
         overlayAlpha: 0.5,
         overlayEnabled: true,
+
+        maskLabel: null,
 
         panelOpen: false,
         maskVersion: 0,
@@ -386,6 +393,7 @@ export const useSegmentationStore = defineStore('segmentation', {
                 this.thresholdMask = null;
                 this.manualEdits = null;
                 this.finalMask = null;
+                this.maskLabel = null;
                 this.clearHistory();
                 this.sphere = null;
                 this.polygon = null;
@@ -443,6 +451,7 @@ export const useSegmentationStore = defineStore('segmentation', {
             this.recomputeFinalMask();
             this.invalidateComponentMap();
             const lname = this.labelById(id)?.name ?? `#${id}`;
+            this.maskLabel = 'MTV mask';
             this.commitMaskEdit(`Apply threshold SUV ${threshold} → ${lname}`);
         },
 
@@ -496,6 +505,18 @@ export const useSegmentationStore = defineStore('segmentation', {
             this.recomputeFinalMask();
             this.invalidateComponentMap();
             this.commitMaskEdit('Clear threshold');
+        },
+
+        // マスク層を丸ごと空にする (threshold + manual の両方)。MASK カードの Clear 用。
+        // 破壊的なので履歴も捨てる (undo で戻す対象が無くなるため)。
+        clearMask() {
+            if (this.thresholdMask) this.thresholdMask.fill(0);
+            if (this.manualEdits) this.manualEdits.fill(0);
+            this.clearHistory();
+            this.recomputeFinalMask();
+            this.invalidateComponentMap();
+            this.maskLabel = null;
+            this.maskVersion++;
         },
 
         clearManualEdits() {
@@ -1249,6 +1270,8 @@ export const useSegmentationStore = defineStore('segmentation', {
                 threshold?: number;
                 thresholdUnit?: 'SUV' | 'CNTS';
                 labels?: LabelEntry[];
+                /** MASK カードに出す出自 (ファイル名や 'VOI: <atlas>')。無ければ 'Loaded mask' */
+                name?: string;
             } | null,
         ): { ok: true } | { ok: false; reason: string } {
             const pet = this.petVolumeRef;
@@ -1270,6 +1293,7 @@ export const useSegmentationStore = defineStore('segmentation', {
             this.recomputeFinalMask();
             this.invalidateComponentMap();
             this.maskVersion++;
+            this.maskLabel = sidecar?.name ?? 'Loaded mask';
 
             if (sidecar) {
                 if (typeof sidecar.threshold === 'number' && Number.isFinite(sidecar.threshold)) {

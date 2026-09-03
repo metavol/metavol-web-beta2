@@ -45,6 +45,13 @@ import { buildClutLegend, type ClutLegend } from "./clutLegend";
 import { ensureWasmCodecsReady, isWasmCodecsReady } from "./wasmCodec";
 import { Volume, voxelToWorld, worldToVoxel, volumeCenterWorld } from "./Volume.ts";
 import { writeNiftiVolumeAsync, niftiBaseName, buildVolumeSidecarJson } from "./niftiVolumeWriter";
+import { useVoiStore } from "../stores/voi";
+import { parseLabelFile, parseNiftiLabelVolume, checkVoiTemplate } from "./voi/voiTemplate";
+import { assignVoiLabels, diagnoseOverlap, overlapWarnings } from "./voi/voiResample";
+import { computeVoiStats, voiStatsToCsv } from "./voi/voiStats";
+import { buildCategoricalClut } from "./Clut";
+import { analyzeLabelMaskCandidate } from './segmentation/niftiReader';
+import { autoWindowFromVolume } from "./volumeWindow";
 import { triggerDownload } from "./segmentation/niftiWriter";
 import { solve } from "./linalg";
 import * as THREE from '@/lib/threeMath';
@@ -605,7 +612,7 @@ const loadDemoCase = async (caseId: string) => {
   }
 };
 
-// 外部 URL (?url=https://...) から fetch + loadFiles。Persona 2 (quick viewer) 用 shareable link。
+// 外部 URL (?url=https://...) から fetch + loadFiles。Persona 3 (quick viewer) 用 shareable link。
 // CORS 必須。ホストが Access-Control-Allow-Origin を返さないと fetch 失敗する。
 // 複数 URL を並列 fetch (concurrency=4)、すべて File 化してから一括 loadFiles。
 const loadFromExternalUrls = async (urls: string[]) => {
@@ -1748,6 +1755,130 @@ const onTitlebarSaveVolumeNifti = async (i: number) => {
   if (!ok) alert('Failed to build a Volume from this series, so it cannot be exported.');
 };
 
+// ===== SPM 標準脳変換 + VOI テンプレート解析 =====
+//
+// 役割分担: **MATLAB/SPM は各自の PC**。metavol-web は
+//   ① DICOM -> NIfTI (上の exportSeriesAsNifti)
+//   ② 正規化済み NIfTI + VOI テンプレート -> 領域ごとの数値
+// の 2 つだけを担う。ブラウザ内で正規化はしない。
+//
+// **テンプレートはシリーズ一覧に出さない。** 画像として並ぶと解析対象と取り違える。
+// 専用 store (voiStore) に置き、専用ダイアログから使う。
+const voiStore = useVoiStore();
+
+/** VOI テンプレート (ラベル NIfTI + 名前表) を読み込む。2 ファイルまとめて渡す。 */
+const loadVoiTemplateFiles = async (files: File[]): Promise<{ ok: boolean; message: string }> => {
+  const nii = files.find(f => /\.nii(\.gz)?$/i.test(f.name));
+  const table = files.find(f => /\.(xml|csv|tsv|txt|lut)$/i.test(f.name));
+  if (!nii) return { ok: false, message: 'Select the label volume (.nii or .nii.gz).' };
+  if (!table) return { ok: false, message: 'Select the label name file as well (.xml, .csv, .tsv or .txt).' };
+  try {
+    const { labels, header } = parseLabelFile(new Uint8Array(await table.arrayBuffer()), table.name);
+    const volume = parseNiftiLabelVolume(await nii.arrayBuffer(), nii.name);
+    const check = checkVoiTemplate(volume, labels);
+    voiStore.setTemplate({ volume, labels, header, sourceName: nii.name }, check);
+    const notes: string[] = [];
+    if (check.missingInTable.length) notes.push(`${check.missingInTable.length} label(s) in the volume have no name`);
+    if (check.missingInVolume.length) notes.push(`${check.missingInVolume.length} named label(s) are absent from the volume`);
+    if (check.hasNonInteger) notes.push('the volume contains non-integer values');
+
+    // **読み込んだらそのまま解析まで走らせる。**
+    // overlay は `labelOf` (割り当て結果) が無いと描けず、それを作るのは runVoiAnalysis だけ。
+    // 以前はここで止まっていたので、**テンプレートが画像に合っているかを目視で確かめられなかった**
+    // (Run を押すまで何も重ならない)。ユーザが最初に知りたいのは「合っているか」なので、
+    // 読み込み = 確認、にする。ついでに Persona 1 と同じくクリックも 1 つ減る。
+    // 対象は「選択中 box が映しているシリーズ」を優先し、候補外なら先頭の候補。
+    const cands = voiCandidateSeries();
+    if (cands.length > 0) {
+      const shown = (imageBoxInfos.value[selectedImageBoxId.value] as any)?.currentSeriesNumber;
+      const target = cands.some(c => c.index === shown) ? shown : cands[0].index;
+      runVoiAnalysis(target);
+    }
+
+    return {
+      ok: true,
+      message: `${header.name ?? nii.name}: ${labels.length} regions, ${check.idsInVolume.length} present in the volume`
+             + (notes.length ? ` (${notes.join('; ')})` : ''),
+    };
+  } catch (e: any) {
+    return { ok: false, message: e?.message ?? String(e) };
+  }
+};
+
+/** VOI 解析に使えるシリーズ (volume を持つもの) の一覧。ダイアログの選択肢用。 */
+const voiCandidateSeries = (): Array<{ index: number; label: string }> => {
+  const out: Array<{ index: number; label: string }> = [];
+  for (let i = 0; i < seriesList.length; i++) {
+    const v = seriesList[i].volume;
+    if (!v) continue;
+    const m = v.metadata?.modality ?? '?';
+    const d = v.metadata?.seriesDescription ?? v.metadata?.sourceFilename ?? `Series ${i + 1}`;
+    out.push({ index: i, label: `[${i + 1}] ${m} ${d} (${v.nx}x${v.ny}x${v.nz})` });
+  }
+  return out;
+};
+
+/** 選んだシリーズにテンプレートを重ねて統計を出す。 */
+const runVoiAnalysis = (seriesIndex: number): { ok: boolean; message: string } => {
+  const tpl = voiStore.template;
+  if (!tpl) return { ok: false, message: 'Load a VOI template first.' };
+  if (seriesIndex < 0 || seriesIndex >= seriesList.length) return { ok: false, message: 'Select a series.' };
+  if (!seriesList[seriesIndex].volume && !ensureVolume_(seriesIndex)) {
+    return { ok: false, message: 'Could not build a volume from this series.' };
+  }
+  const img = seriesList[seriesIndex].volume!;
+  const t0 = performance.now();
+  const assign = assignVoiLabels(img, tpl.volume);
+  if (!assign) return { ok: false, message: 'The template geometry is degenerate and cannot be used.' };
+  const diagnostics = diagnoseOverlap(img, tpl.volume, assign);
+  const stats = computeVoiStats(img, assign, tpl.labels);
+  const nonEmpty = stats.filter(s => s.voxels > 0).length;
+  const warnings = overlapWarnings(diagnostics, nonEmpty, tpl.labels.length);
+  const mod = img.metadata?.modality;
+  voiStore.setResults({
+    stats, diagnostics, warnings,
+    labelOf: assign.labelOf, seriesIndex,
+    label: voiCandidateSeries().find(c => c.index === seriesIndex)?.label ?? `Series ${seriesIndex + 1}`,
+    seriesUID: img.metadata?.seriesUID ?? null,
+    unit: mod === 'PT' ? 'SUV' : (mod === 'CT' ? 'HU' : 'raw'),
+    elapsedMs: Math.round(performance.now() - t0),
+  });
+  // **表示は MTV のマスク基盤にそのまま載せる (インターフェース統一)。**
+  // 以前は VOI 専用の overlay 経路を並走させていたが、透過度スライダも per-label の
+  // 表示切替もマスク側にしか無く、「同じ見た目なのに操作が別」になっていた。
+  // 解析対象を PET volume として登録し、割り当て結果を **マスク読込と同じ入口**
+  // (loadMaskFromNifti) から import する。これで SegmentationPanel の透過度・
+  // 表示切替・マスク保存が VOI 領域にもそのまま効く。
+  // 副作用: 実行中の MTV マスクは置き換わる (マスク層は 1 枚。逆も同じ)。
+  segStore.setPetVolume(img);
+  const catClut = buildCategoricalClut(tpl.labels.reduce((m, l) => Math.max(m, l.id), 0));
+  segStore.loadMaskFromNifti(assign.labelOf, [img.nx, img.ny, img.nz], {
+    labels: tpl.labels.map(l => {
+      const c = catClut[l.id] ?? [200, 200, 200, 1];
+      return { id: l.id, name: l.name, color: [c[0], c[1], c[2]] as [number, number, number] };
+    }),
+    name: `VOI: ${tpl.header?.name ?? tpl.sourceName} (${tpl.labels.length} regions)`,
+  });
+  // **結果を入れたら必ず再描画すること。** store に入れるだけでは overlay は出ない
+  // (ImageBox の描画は show() 起点で、store の変化を watch していない)。
+  // 実測: Run 直後は overlay が出ず、別の操作で再描画されるまで気付けなかった。
+  boxStateVersion.value++;
+  show();
+  return { ok: true, message: `${nonEmpty} of ${tpl.labels.length} regions received voxels.` };
+};
+
+const downloadVoiCsv = () => {
+  if (!voiStore.stats.length) return;
+  const csv = '﻿' + voiStatsToCsv(voiStore.stats, {
+    image: voiStore.analyzedLabel,
+    template: voiStore.template?.sourceName,
+    atlas: voiStore.template?.header?.name,
+    unit: voiStore.analyzedUnit,
+  });
+  const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
+  triggerDownload(new Blob([csv], { type: 'text/csv;charset=utf-8' }), `voi_${ts}.csv`);
+};
+
 // ===== DICOM -> NIfTI 変換 =====
 //
 // **シリーズ一覧 (左サイドバー) の "..." から呼ぶ。box に出していなくても変換できる**のが要点。
@@ -2153,19 +2284,13 @@ const presetSelected = (e: string) => {
   if (e === "SUV-0-10000") setWindowForKind(id, 'pt', 5000, 10000);
   // MR は固定 HU のような絶対値が無いので、volume の分位点から自動で決める。
   if (e.startsWith('MR-AUTO')) {
+    // **NaN を除いて分位点を取ること** (SPM 正規化出力は視野外が NaN)。
+    // 素の sort だと NaN が混じった時点で並びが壊れる。共通関数に集約してある。
     const pct = e === 'MR-AUTO-TIGHT' ? 0.05 : e === 'MR-AUTO-WIDE' ? 0.001 : 0.01;
     const info = imageBoxInfos.value[id] as any;
-    const volIdx = info?.currentSeriesNumber ?? -1;
-    const v = seriesList[volIdx]?.volume;
-    if (v) {
-      const stride = Math.max(1, Math.floor(v.voxel.length / 20000));
-      const vals: number[] = [];
-      for (let t = 0; t < v.voxel.length; t += stride) vals.push(v.voxel[t]);
-      vals.sort((a, b) => a - b);
-      const lo = vals[Math.floor(vals.length * pct)] ?? vals[0];
-      const hi = vals[Math.floor(vals.length * (1 - pct))] ?? vals[vals.length - 1];
-      setWindowForKind(id, 'anat', (lo + hi) / 2, Math.max(1, hi - lo));
-    }
+    const v = seriesList[info?.currentSeriesNumber ?? -1]?.volume;
+    const aw = v ? autoWindowFromVolume(v, pct) : null;
+    if (aw) setWindowForKind(id, 'anat', aw.wc, Math.max(1e-6, aw.ww));
   }
   if (e === "Reset") { setWindowForKind(id, 'anat', null, null); setWindowForKind(id, 'pt', null, null); }
   show();
@@ -3961,6 +4086,114 @@ const onSetSeriesModality = (payload: { index: number; modality: 'PT' | 'CT' | '
   show();
 };
 
+
+// D&D された NIfTI をマスクとして取り込めるか試す。取り込んだら true (シリーズ化しない)。
+// 判定は自動 (analyzeLabelMaskCandidate + 格子一致) だが、**採否は必ず確認ダイアログ**。
+// 誤検出 (8-bit 解剖画像等) のコストを Cancel 1 クリックに抑える。
+// OK のときは SegmentationPanel の Load mask と**同じ入口** (loadMaskFromNifti) を通すので、
+// MASK カード・透過度・per-label 表示・Save mask がそのまま効く。
+// 格子 (dims) が一致する既存 volume を探す。petVolumeRef を最優先、次に PT、最後に最初の一致。
+// excludeVoxel はマスク側自身 (series 化済みの場合) を対象から外すため。
+const findMaskTargetSeries = (nx: number, ny: number, nz: number, excludeVoxel?: ArrayLike<number>): number => {
+  const cur = segStore.petVolumeRef;
+  let target = -1;
+  for (let i = 0; i < seriesList.length; i++) {
+    const v = seriesList[i].volume;
+    if (!v || v.nx !== nx || v.ny !== ny || v.nz !== nz) continue;
+    if (excludeVoxel && v.voxel === excludeVoxel) continue;
+    if (cur && v.voxel === cur.voxel) { target = i; break; }
+    if (target < 0) target = i;
+    else if (v.metadata?.modality === 'PT' && seriesList[target].volume?.metadata?.modality !== 'PT') target = i;
+  }
+  return target;
+};
+
+// voxel 列をマスクとして segStore へ取り込む共通処理。d&d 自動判定と手動 Use as mask の両方が通る。
+// **必ず loadMaskFromNifti (マスク読込と同じ入口) を経由する** — MASK カード・透過度・
+// per-label 表示・Save mask がそのまま効くのはこのため。
+const ingestVoxelsAsMask = (
+  voxel: ArrayLike<number>,
+  dims: [number, number, number],
+  name: string,
+  labelIds: number[],
+  sidecar: { labels?: LabelEntry[]; threshold?: number; thresholdUnit?: 'SUV' | 'CNTS'; name?: string } | null,
+  targetIdx: number,
+): boolean => {
+  const tv = seriesList[targetIdx].volume!;
+  // マスクは petVolumeRef の格子に載るので、対象が未登録なら登録する (VOI 実行と同じ扱い)
+  const cur = segStore.petVolumeRef;
+  if (!cur || cur.voxel !== tv.voxel) segStore.setPetVolume(tv);
+
+  const u16 = new Uint16Array(voxel.length);
+  for (let i = 0; i < u16.length; i++) u16[i] = (voxel as any)[i];
+  const res = segStore.loadMaskFromNifti(u16, dims, { ...(sidecar ?? {}), name });
+  if (!res.ok) { alert(res.reason); return false; }
+
+  // sidecar が無ければラベル表を実際の id から生成する (名前 Label N、色は黄金角)。
+  // 既定の Tumor/Non-tumor 表のままだと mask の id と対応せず、色も per-label 切替も嘘になる。
+  if (!sidecar) {
+    const clut = buildCategoricalClut(labelIds[labelIds.length - 1]);
+    segStore.labels = labelIds.map(id => {
+      const c = clut[id] ?? [200, 200, 200, 1];
+      return { id, name: `Label ${id}`, color: [c[0], c[1], c[2]] as [number, number, number], visible: true };
+    });
+    segStore.currentLabelId = labelIds[0];
+  }
+  boxStateVersion.value++;
+  show();
+  return true;
+};
+
+const tryIngestNiiAsMask = (
+  f: Nii,
+  labelIds: number[],
+  sidecars: Array<{ labels?: LabelEntry[]; threshold?: number; thresholdUnit?: 'SUV' | 'CNTS'; name?: string }>,
+): boolean => {
+  const dim = f.niftiHeader.dims;
+  const nx = dim[1], ny = dim[2], nz = dim[3];
+  const target = findMaskTargetSeries(nx, ny, nz);
+  if (target < 0) return false;   // 先に画像が読まれていなければ普通の volume として開く
+
+  const desc = seriesList[target].volume!.metadata?.seriesDescription ?? `Series ${target + 1}`;
+  const ok = window.confirm(
+    `"${f.filename ?? 'file'}" looks like a label mask ` +
+    `(${labelIds.length} label${labelIds.length === 1 ? '' : 's'}, ${nx}x${ny}x${nz} — same grid as "${desc}").\n\n` +
+    'Load it as a MASK on that volume?\n' +
+    'OK = load as mask   /   Cancel = load as a normal image volume');
+  if (!ok) return false;
+
+  const sidecar = sidecars.length > 0 ? sidecars[0] : null;
+  return ingestVoxelsAsMask(f.pixelData, [nx, ny, nz], f.filename ?? sidecar?.name ?? 'Dropped mask',
+                            labelIds, sidecar, target);
+};
+
+// シリーズカードの「…」→ Use as mask。**自動判定に乗らなかった / Cancel してしまった場合の手動経路。**
+// 既に volume として開いたシリーズを、その場でマスクとして取り込み直す (シリーズ自体は残す)。
+// 明示操作なので確認ダイアログは出さない。失敗理由は alert で具体的に伝える。
+const onUseSeriesAsMask = (index: number) => {
+  if (index < 0 || index >= seriesList.length) return;
+  if (!seriesList[index].volume && !ensureVolume_(index)) {
+    alert('Could not build a volume from this series.');
+    return;
+  }
+  const v = seriesList[index].volume!;
+  const name = v.metadata?.sourceFilename ?? v.metadata?.seriesDescription ?? `Series ${index + 1}`;
+  // 手動経路は判定を緩める (異なり値の上限 65535 = 実質無制限)。
+  // 整数・非負・NaN 無しだけは譲れない (Uint16 に落とすと値が変質するため)。
+  const cand = analyzeLabelMaskCandidate(v.voxel, 65535);
+  if (!cand) {
+    alert(`"${name}" cannot be used as a mask: voxel values must be non-negative integers (0-65535) without NaN.`);
+    return;
+  }
+  const target = findMaskTargetSeries(v.nx, v.ny, v.nz, v.voxel);
+  if (target < 0) {
+    alert(`No loaded volume has the same grid (${v.nx}x${v.ny}x${v.nz}).\n` +
+          'Load the image this mask belongs to first, then try again.');
+    return;
+  }
+  ingestVoxelsAsMask(v.voxel, [v.nx, v.ny, v.nz], name, cand.labelIds, null, target);
+};
+
 const doSort = () => {
   // 既存 seriesList を seed: DICOM 系には実 UID を、それ以外には unique sentinel を入れて
   // append load 時に新ファイルが既存と同 SeriesUID なら同 series に統合、別 UID なら新 series 化、
@@ -3976,65 +4209,86 @@ const doSort = () => {
       serieses[i] = `__nondicom_${i}__`;
     }
   }
+  // 同じ drop に含まれる .json (マスクの sidecar) を先に拾っておく。
+  // マスク .nii と一緒に落とされたときにラベル名・色を復元するため。
+  const jsonSidecars: Array<{ labels?: LabelEntry[]; threshold?: number;
+                              thresholdUnit?: 'SUV' | 'CNTS'; name?: string }> = [];
+  for (const f of bagOfFiles) {
+    if (f instanceof Uint8Array && f.length > 2 && f.length < 4 * 1024 * 1024) {
+      try {
+        const j = JSON.parse(new TextDecoder().decode(f));
+        if (j && Array.isArray(j.labels) && j.labels.length > 0) jsonSidecars.push(j);
+      } catch { /* JSON でないファイル */ }
+    }
+  }
+  // NIfTI は **2 パス**で処理する (下記)。ここでは溜めるだけ。
+  const niiPending: Nii[] = [];
+
+  // NIfTI 1 本をシリーズとして登録する (元は bag ループ内のインライン処理)。
+  // マスク取り込みの 2 パス化 (下記) のため関数に切り出した。挙動は不変。
+  const pushNiiAsSeries = (f: Nii) => {
+    const dim = f['niftiHeader']['dims'];
+    const af = f['niftiHeader']['affine'];
+    // NIfTI-1 description (80 char) を seriesDescription に流用。
+    // 空ならカード上は "Series N" にフォールバック。
+    const niftiDesc = ((f['niftiHeader'] as { description?: string })['description'] ?? '').trim();
+
+    // NIfTI affine → 本アプリの world (DICOM LPS) 変換。
+    //
+    // 1) **方向ベクトルは affine の「列」**。af[r][c] は row-major なので、voxel index c を
+    //    1 進めたときの world 変位は (af[0][c], af[1][c], af[2][c])。
+    //    以前は「行」を取っていたため、回転を含む affine で軸が混ざり voxel pitch まで狂った
+    //    (brain MR/PET の qform データで発覚: PET の実ピッチ 0.53/0.53/3.05 が 0.58/0.65/3.02 に化けた)。
+    //    軸平行 (対角 affine) のデータでは行と列が一致するため、これまで表面化しなかった。
+    // 2) **NIfTI は RAS+、本アプリ world は LPS** → x,y 成分の符号を反転 (diag(-1,-1,1))。
+    //    方向ベクトルだけでなく **原点にも同じ変換が要る**。原点を変換していなかったため、
+    //    NIfTI 同士 / NIfTI と DICOM を並べると x,y 方向にずれていた。
+    const affCol = (c: number) => new THREE.Vector3(-af[0][c], -af[1][c], af[2][c]);
+    const vx = affCol(0);
+    const vy = affCol(1);
+    const vz = affCol(2);
+    const pos = new THREE.Vector3(-af[0][3], -af[1][3], af[2][3]);
+
+    const niftiIdx = seriesList.length;
+    // modality 推定: ファイル名 (003PT00.nii → 'PT') を優先し、
+    // ヒントが無ければ **voxel 値の分布**から判定する (kitty.nii のように名前で分からない場合)。
+    // 分布からは CT だけが確度高く言える (空気 -1000 の指紋)。PT/MR は互いに区別できないので
+    // 推定せず 'OTHER' のままにする。UI の Set as PT/CT/MR で上書き可能。
+    const guessed = guessModalityFromVoxels(f.pixelData);
+    const inferredModality = detectModalityFromFilename(f.filename) ?? guessed.modality ?? 'OTHER';
+    if (!detectModalityFromFilename(f.filename)) {
+      console.log(`[modality] ${f.filename}: ${inferredModality} — ${guessed.reason}`);
+    }
+    seriesList.push({
+      myDicom: null,
+      volume:{
+        nx: dim[1],
+        ny: dim[2],
+        nz: dim[3],
+        imagePosition: pos,
+        vectorX: vx,
+        vectorY: vy,
+        vectorZ: vz,
+        voxel: f.pixelData,
+        metadata: {
+          modality: inferredModality,
+          seriesUID: `nii-${niftiIdx}-${Date.now()}`,
+          seriesDescription: niftiDesc || (f.filename ?? undefined),
+          datatypeName: f.datatypeName,
+          niftiHeader: f.niftiHeader,    // header viewer 用に保持
+          sourceFilename: f.filename,
+        },
+      }
+    });
+
+  };
+
   for (const f of bagOfFiles){
 
     if (f instanceof Uint8Array){
       console.log(`otherfile: ${f.length} bytes`);
     }else if ("niftiHeader" in f){
-      const dim = f['niftiHeader']['dims'];
-      const af = f['niftiHeader']['affine'];
-      // NIfTI-1 description (80 char) を seriesDescription に流用。
-      // 空ならカード上は "Series N" にフォールバック。
-      const niftiDesc = ((f['niftiHeader'] as { description?: string })['description'] ?? '').trim();
-
-      // NIfTI affine → 本アプリの world (DICOM LPS) 変換。
-      //
-      // 1) **方向ベクトルは affine の「列」**。af[r][c] は row-major なので、voxel index c を
-      //    1 進めたときの world 変位は (af[0][c], af[1][c], af[2][c])。
-      //    以前は「行」を取っていたため、回転を含む affine で軸が混ざり voxel pitch まで狂った
-      //    (brain MR/PET の qform データで発覚: PET の実ピッチ 0.53/0.53/3.05 が 0.58/0.65/3.02 に化けた)。
-      //    軸平行 (対角 affine) のデータでは行と列が一致するため、これまで表面化しなかった。
-      // 2) **NIfTI は RAS+、本アプリ world は LPS** → x,y 成分の符号を反転 (diag(-1,-1,1))。
-      //    方向ベクトルだけでなく **原点にも同じ変換が要る**。原点を変換していなかったため、
-      //    NIfTI 同士 / NIfTI と DICOM を並べると x,y 方向にずれていた。
-      const affCol = (c: number) => new THREE.Vector3(-af[0][c], -af[1][c], af[2][c]);
-      const vx = affCol(0);
-      const vy = affCol(1);
-      const vz = affCol(2);
-      const pos = new THREE.Vector3(-af[0][3], -af[1][3], af[2][3]);
-
-      const niftiIdx = seriesList.length;
-      // modality 推定: ファイル名 (003PT00.nii → 'PT') を優先し、
-      // ヒントが無ければ **voxel 値の分布**から判定する (kitty.nii のように名前で分からない場合)。
-      // 分布からは CT だけが確度高く言える (空気 -1000 の指紋)。PT/MR は互いに区別できないので
-      // 推定せず 'OTHER' のままにする。UI の Set as PT/CT/MR で上書き可能。
-      const guessed = guessModalityFromVoxels(f.pixelData);
-      const inferredModality = detectModalityFromFilename(f.filename) ?? guessed.modality ?? 'OTHER';
-      if (!detectModalityFromFilename(f.filename)) {
-        console.log(`[modality] ${f.filename}: ${inferredModality} — ${guessed.reason}`);
-      }
-      seriesList.push({
-        myDicom: null,
-        volume:{
-          nx: dim[1],
-          ny: dim[2],
-          nz: dim[3],
-          imagePosition: pos,
-          vectorX: vx,
-          vectorY: vy,
-          vectorZ: vz,
-          voxel: f.pixelData,
-          metadata: {
-            modality: inferredModality,
-            seriesUID: `nii-${niftiIdx}-${Date.now()}`,
-            seriesDescription: niftiDesc || (f.filename ?? undefined),
-            datatypeName: f.datatypeName,
-            niftiHeader: f.niftiHeader,    // header viewer 用に保持
-            sourceFilename: f.filename,
-          },
-        }
-      });
-
+      niiPending.push(f);
     }else{
 
       const suid = f.string("x0020000e") ?? ""; // series instance uid
@@ -4055,6 +4309,23 @@ const doSort = () => {
       seriesList[id].myDicom!.push(f);
     }
 
+  }
+
+  // **NIfTI の 2 パス処理 — 画像もマスクも同じ d&d で読む (2026-08, ユーザ指定)。**
+  // パス 1: ラベルマスクらしくない NIfTI (連続値・負値あり等) を先にシリーズ化する。
+  // パス 2: マスク候補について、格子が一致する既存 volume を探し、確認ダイアログを出す。
+  //         OK ならシリーズ化せず **マスク読込と同じ入口** (loadMaskFromNifti) へ流す。
+  //         Cancel / 一致 volume 無しなら通常どおりシリーズ化する。
+  // 2 パスにするのは、**同じ drop に画像 + マスクが混在**したとき bag 内の順序に依らず
+  // 画像側が先に volume になっている必要があるため。
+  const maskCandidates: Array<{ f: Nii; labelIds: number[] }> = [];
+  for (const f of niiPending) {
+    const cand = analyzeLabelMaskCandidate(f.pixelData);
+    if (cand) maskCandidates.push({ f, labelIds: cand.labelIds });
+    else pushNiiAsSeries(f);
+  }
+  for (const { f, labelIds } of maskCandidates) {
+    if (!tryIngestNiiAsMask(f, labelIds, jsonSidecars)) pushNiiAsSeries(f);
   }
   bagOfFiles=[];
 
@@ -4080,7 +4351,7 @@ const loadFile = async (file: File) => {
 // innermost dim → screen X (左→右)、middle → screen Y (上→下)、outermost → paging。
 // modality / SUV factor も無視 (raw counts そのまま)。
 // WC/WW は voxel min/max を簡易サンプリング (10000 step) で推定。
-// Persona 2 (NIfTI orientation 検証) 用。
+// Persona 3 (NIfTI orientation 検証) 用。
 // NIfTI header dialog 用 reactive state (volume card の "..." メニュー → "View NIfTI header")
 const niftiHeaderDialog = ref<{
   open: boolean;
@@ -4478,8 +4749,16 @@ const promoteBoxToVolume = (boxId: number, seriesIdx: number) => {
   // CT は HU 40/400, PT は SUV 0-6, それ以外は 0/1000 (生 NIfTI 想定)
   const isPt = (m === 'PT' || m === 'PET');
   const isCt = (m === 'CT');
-  const wc = isCt ? 40 : (isPt ? 3 : 0);
-  const ww = isCt ? 400 : (isPt ? 6 : 1000);
+  // **modality が分からない volume に固定 window を当てないこと。**
+  // 以前は CT/PT 以外を一律 WC0/WW1000 にしていたが、SPM 正規化後の脳画像は
+  // 値域が 0〜11 程度しかなく、**ほぼ真っ黒**になる (実測 w00r.nii)。
+  // 絶対的な基準が無い以上、volume の分位点から決めるのが唯一妥当。
+  let wc = isCt ? 40 : (isPt ? 3 : 0);
+  let ww = isCt ? 400 : (isPt ? 6 : 1000);
+  if (!isCt && !isPt) {
+    const aw = autoWindowFromVolume(v);
+    if (aw) { wc = aw.wc; ww = aw.ww; }
+  }
   const clut = isPt ? 1 : 0;  // PT は white2black、それ以外は gray
   imageBoxInfos.value[boxId] = {
     clut,
@@ -4488,12 +4767,33 @@ const promoteBoxToVolume = (boxId: number, seriesIdx: number) => {
     description: v.metadata?.seriesDescription ?? `Series ${seriesIdx}`,
     currentSeriesNumber: seriesIdx,
     centerInWorld: center,
-    vecx: v.vectorX.clone(),
-    vecy: v.vectorY.clone(),
-    vecz: v.vectorZ.clone(),
+    // **voxel 軸をそのまま画面軸にしないこと。**
+    // 以前は vecx/vecy/vecz に v.vectorX/Y/Z を入れていたが、これは
+    // 「voxel の並び順」であって「解剖学的な向き」ではない。
+    // DICOM は LPS 並びなので j 軸が後方を向き、たまたま画面下=後方になって
+    // 正しく見えていただけ。**NIfTI は RAS 並び**なので j 軸は前方を向き、
+    // SPM 正規化出力 (実測 wFDG.nii, srow_y=+2) では画面下=前方、
+    // つまり axial が**前後逆**に表示されていた
+    // (アトラスの前頭極−後頭極を画面下に射影して +165mm = 前頭極が下、と実測)。
+    // 取得断面は保ったまま向きだけ解剖学的に決める。
+    ...planeVectorsWorld(v, nativePlaneOf(v)),
     isMip: false,
     mip: null,
   } as VolumeImageBoxInfo;
+};
+
+/**
+ * volume が「どの断面で撮られたか」を、k 軸 (vectorZ) が最も沿う world 軸で判定する。
+ * axial なら k 軸は S-I、coronal なら A-P、sagittal なら L-R を向く。
+ * これで **取得断面は変えずに** 向きだけ解剖学的に正すことができる。
+ */
+const nativePlaneOf = (v: Volume.Volume): 'axi' | 'cor' | 'sag' => {
+  const z = v.vectorZ;
+  const L = z.length();
+  if (L <= 0) return 'axi';
+  const ax = Math.abs(z.x / L), ay = Math.abs(z.y / L), az = Math.abs(z.z / L);
+  if (az >= ax && az >= ay) return 'axi';
+  return ay >= ax ? 'cor' : 'sag';
 };
 
 const loadFromLocal = (f: File) => {
@@ -4599,7 +4899,11 @@ const detectModalityFromFilename = (basename: string | undefined): 'PT' | 'CT' |
   if (!basename) return null;
   // 拡張子除去 (.nii / .nii.gz / .gz)
   const stem = basename.replace(/\.(nii\.gz|nii|gz)$/i, '');
-  const re = /(?:^|[\d_\-\. /])(PT|PET|CT|MR|MRI)(?:$|[\d_\-\. /])/i;
+  // **SPM が付ける接頭辞を飛ばす。** metavol-web の書き出しは `PT_...` / `CT_...` と
+  // modality で始まるが、SPM を通すと `w` (warped) / `r` (realigned) / `s` (smoothed) /
+  // `m` (bias-corrected) などが前に付き、`wPT_...` となって単語境界に当たらなくなる。
+  // これを飛ばすことで **metavol-web → SPM → metavol-web** の往復が自動で繋がる。
+  const re = /(?:^[a-z]{0,3}|[\d_\-\. /])(PT|PET|CT|MR|MRI)(?:$|[\d_\-\. /])/i;
   const m = stem.match(re);
   if (!m) return null;
   const tag = m[1].toUpperCase();
@@ -4854,8 +5158,11 @@ const showImage = (i:number) => {
             && isThisCt)
           ? segStore.ctBodyMask
           : undefined;
+        // **VOI overlay を優先する。** draw が受け取れる overlay は 1 つだけなので、
+        // VOI 解析中はそちらを見せる (VOI を切れば従来のマスク overlay に戻る)。
+        const sliceOverlay = buildMaskOverlayForBox(i);
         drawPromise = imb.value![i].drawNiftiSlice(pixelData0,nx,ny,nz, wc!, ww!, p00,v01,v10,clut,
-          buildMaskOverlayForBox(i), ctBodyMask, info.interpolation ?? 'bilinear');
+          sliceOverlay, ctBodyMask, info.interpolation ?? 'bilinear');
       }else{
       const angle = info.mip!.mipAngle;
       // MIP の対象 volume が PET と一致する場合のみマスク overlay を渡す
@@ -5663,7 +5970,14 @@ const detectPetCtFromDicom = () => {
     if (m === "CT" && ctIdx < 0) ctIdx = i;
     if (m === "MR" && mrIdx < 0) mrIdx = i;
   }
-  segStore.setPetVolume(petIdx >= 0 ? (seriesList[petIdx].volume ?? null) : null);
+  // **既に有効な petVolumeRef が生きているなら上書きしない。**
+  // d&d マスク取り込み (tryIngestNiiAsMask) は modality OTHER の volume を明示的に
+  // petVolumeRef に据えることがある。ここで無条件に detect 結果 (PT 無し → null) を
+  // 入れ直すと、setPetVolume の破棄で**直前に読み込んだマスクが消える** (実測で踏んだ)。
+  // 参照が seriesList から消えている場合だけ detect 結果で置き換える。
+  const curPet = segStore.petVolumeRef;
+  const curPetAlive = !!curPet && seriesList.some(s => s.volume && s.volume.voxel === curPet.voxel);
+  if (!curPetAlive) segStore.setPetVolume(petIdx >= 0 ? (seriesList[petIdx].volume ?? null) : null);
   segStore.setCtVolume(ctIdx >= 0 ? (seriesList[ctIdx].volume ?? null) : null);
   segStore.setMrVolume(mrIdx >= 0 ? (seriesList[mrIdx].volume ?? null) : null);
 };
@@ -6773,7 +7087,7 @@ defineExpose({
   // App-bar ハンバーガー用: Segmentation panel の save/load パススルー
   segLoadMask: () => segPanelRef.value?.loadMask?.(),
   segExportPdf: () => segPanelRef.value?.exportPdf?.(),
-  // NIfTI raw byte view (Persona 2 デバッグ用)
+  // NIfTI raw byte view (Persona 3 デバッグ用)
   inspectNiftiRaw,
   getNiftiSeriesList,
   // PET Standard ピッカー UI 用 (App.vue):
@@ -6817,6 +7131,13 @@ defineExpose({
   loadSnapshotFile,
   // DICOM -> NIfTI 変換 (app-bar の Save メニューから全シリーズ一括)
   exportAllSeriesAsNifti,
+  // VOI テンプレート解析 (app-bar → VOI analysis ダイアログから)
+  loadVoiTemplateFiles,
+  voiCandidateSeries,
+  runVoiAnalysis,
+  downloadVoiCsv,
+  /** overlay の ON/OFF・不透明度を変えたら再描画する (幾何は変わらないので show だけ) */
+  refreshVoiOverlay: () => { boxStateVersion.value++; show(); },
   // NIfTI header viewer 用
   getNiftiHeaderForSeries: (idx: number) => {
     if (idx < 0 || idx >= seriesList.length) return null;
@@ -6852,8 +7173,10 @@ defineExpose({
   >
     <sidebar
       :series-summaries="seriesSummaries"
+      @redraw="show"
       @setModality="onSetSeriesModality"
       @exportNifti="onExportSeriesNifti"
+      @useAsMask="(p: { index: number }) => onUseSeriesAsMask(p.index)"
       @setActiveForSeg="onSetActiveForSeg"
       @inspectRaw="(p: { index: number }) => inspectNiftiRaw(p.index)"
       @viewHeader="(p: { index: number }) => onViewNiftiHeader(p.index)"

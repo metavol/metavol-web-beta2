@@ -51,6 +51,14 @@
               <template v-slot:prepend><v-icon icon="mdi-vector-rectangle" size="small" /></template>
               <v-list-item-title>Export ROIs…</v-list-item-title>
             </v-list-item>
+            <!-- SPM で標準脳へ正規化した画像に VOI テンプレートを重ねて領域値を出す。
+                 正規化そのもの (MATLAB/SPM) は各自の PC で行う前提。 -->
+            <v-list-item @click="openVoiDialog">
+              <template v-slot:prepend><v-icon icon="mdi-brain" size="small" /></template>
+              <v-list-item-title>VOI analysis…</v-list-item-title>
+              <v-list-item-subtitle>Regional values from an atlas on a normalised image</v-list-item-subtitle>
+            </v-list-item>
+
             <!-- DICOM -> NIfTI 変換 (全シリーズ)。1 シリーズだけなら左のシリーズカードの "..." から。 -->
             <v-list-item @click="onConvertAllToNifti">
               <template v-slot:prepend><v-icon icon="mdi-file-swap-outline" size="small" /></template>
@@ -203,7 +211,7 @@
 
             <v-divider />
 
-            <!-- Inspect NIfTI raw bytes (Persona 2 デバッグ用): NIfTI series が 1 つ以上あるときだけ表示 -->
+            <!-- Inspect NIfTI raw bytes (Persona 3 デバッグ用): NIfTI series が 1 つ以上あるときだけ表示 -->
             <v-menu v-if="niftiSeriesList.length > 0" location="end">
               <template v-slot:activator="{ props: act }">
                 <v-list-item v-bind="act">
@@ -308,6 +316,16 @@
         accept=".json,application/json"
         style="display: none"
         @change="onRoiInputChange"
+      />
+      <!-- VOI テンプレート: ラベル NIfTI と名前表を **同時に** 選ばせる (multiple)。
+           2 回に分けるとどちらを先に選んだかで状態が分岐して面倒になる。 -->
+      <input
+        ref="voiTemplateInput"
+        type="file"
+        multiple
+        accept=".nii,.gz,.xml,.csv,.tsv,.txt,.lut"
+        style="display: none"
+        @change="onVoiTemplateInputChange"
       />
 
       <v-divider vertical class="mx-3" />
@@ -796,6 +814,16 @@
       @recoverSlices="dicomViewRef?.recoverSlices?.()"
     />
 
+    <!-- SPM 標準脳変換 + VOI テンプレート解析。Persona 1 の動線を汚さないよう独立ダイアログ。 -->
+    <VoiAnalysisDialog
+      v-model:open="voiOpen"
+      :candidates="voiCandidates"
+      @loadTemplate="onLoadVoiTemplate"
+      @run="onRunVoi"
+      @exportCsv="dicomViewRef?.downloadVoiCsv?.()"
+      @overlayChanged="dicomViewRef?.refreshVoiOverlay?.()"
+    />
+
     <!-- ローカル LLM (Ollama) チャット。開放しているのは **読み取り専用** の 2 tool のみ。 -->
     <LlmChatPanel v-model="llmOpen" :tool-context="llmToolContext" />
 
@@ -811,6 +839,7 @@ import { useSegmentationStore } from "./stores/segmentation";
 import DicomTagDialog from "./components/DicomTagDialog.vue";
 import WindowPresetMenu from "./components/WindowPresetMenu.vue";
 import AdvancedToolsDialog from "./components/AdvancedToolsDialog.vue";
+import VoiAnalysisDialog from "./components/VoiAnalysisDialog.vue";
 import LlmChatPanel from "./components/llm/LlmChatPanel.vue";
 import DemoOverlay from "./components/demo/DemoOverlay.vue";
 import { useDemoPlayer } from "./components/demo/useDemoPlayer";
@@ -1164,6 +1193,31 @@ const cropFaces = [
   { key: 'zMin' as const, label: 'Z-' }, { key: 'zMax' as const, label: 'Z+' },
 ];
 
+// ===== VOI analysis (SPM 標準脳変換後の領域値) =====
+// 実処理は DicomView 側 (seriesList と Volume を持っているため)。ここは UI の受け皿だけ。
+const voiOpen = ref(false);
+const voiTemplateInput = ref<HTMLInputElement | null>(null);
+const voiCandidates = ref<Array<{ index: number; label: string }>>([]);
+
+const refreshVoiCandidates = () => {
+  voiCandidates.value = dicomViewRef.value?.voiCandidateSeries?.() ?? [];
+};
+const openVoiDialog = () => { refreshVoiCandidates(); voiOpen.value = true; };
+const onLoadVoiTemplate = () => { voiTemplateInput.value?.click(); };
+const onVoiTemplateInputChange = async (e: Event) => {
+  const input = e.target as HTMLInputElement;
+  const files = Array.from(input.files ?? []);
+  input.value = '';
+  if (!files.length) return;
+  const res = await dicomViewRef.value?.loadVoiTemplateFiles?.(files);
+  if (res && !res.ok) alert(res.message);
+  refreshVoiCandidates();
+};
+const onRunVoi = (index: number) => {
+  const res = dicomViewRef.value?.runVoiAnalysis?.(index);
+  if (res && !res.ok) alert(res.message);
+};
+
 // DICOM -> NIfTI 変換 (全シリーズ)。実体は DicomView 側 (seriesList を持っているため)。
 // 1 シリーズだけなら左サイドバーのシリーズカード "..." → Export as NIfTI。
 const onConvertAllToNifti = () => { dicomViewRef.value?.exportAllSeriesAsNifti?.(true); };
@@ -1298,7 +1352,7 @@ const mrRegPercent = computed(() => {
   return Math.min(100, (p.level / p.nLevels) * 100);
 });
 
-// NIfTI raw byte view (Persona 2 / orientation 検証用)
+// NIfTI raw byte view (Persona 3 / orientation 検証用)
 const niftiSeriesList = computed<Array<{ idx: number; description: string }>>(() => {
   const r = dicomViewRef.value;
   if (!r?.getNiftiSeriesList) return [];

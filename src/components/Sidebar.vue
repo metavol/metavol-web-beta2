@@ -8,6 +8,7 @@
 //   - Slice の 4 ボタン → 廃止 (画像右端の縦スライダ / ホイール / カーソルキーで代替済み)
 //   - Advanced       → ハンバーガー → AdvancedToolsDialog
 import SeriesList from './SeriesList.vue';
+import MaskCard from './MaskCard.vue';
 
 defineProps<{
   seriesSummaries?: Array<{
@@ -45,6 +46,8 @@ const emit = defineEmits([
   "inspectRaw",
   "viewHeader",
   "exportNifti",
+  "useAsMask",
+  "redraw",
 ]);
 </script>
 
@@ -53,6 +56,10 @@ const emit = defineEmits([
     <!-- ヘッダ ("SERIES 16") は置かない。ペインの中身がシリーズ一覧しか無いので
          見出しは情報を足しておらず、縦を食うだけ (ユーザ指定)。 -->
     <div class="mv-sidebar-body">
+      <!-- マスクは seriesList に入れず、segStore 直結の専用カードで見せる (理由は MaskCard.vue 冒頭)。
+           シリーズ一覧の上に置くのは「いま何のマスクが載っているか」が VOI/MTV の切り替えで
+           変わるため、スクロールせず見える位置が要るから。 -->
+      <MaskCard @redraw="emit('redraw')" />
       <SeriesList
         :series="seriesSummaries ?? []"
         @setModality="(p: { index: number; modality: 'PT' | 'CT' | 'MR' }) => emit('setModality', p)"
@@ -60,6 +67,7 @@ const emit = defineEmits([
         @inspectRaw="(p: { index: number }) => emit('inspectRaw', p)"
         @viewHeader="(p: { index: number }) => emit('viewHeader', p)"
         @exportNifti="(p: { index: number; gzip: boolean }) => emit('exportNifti', p)"
+        @useAsMask="(p: { index: number }) => emit('useAsMask', p)"
       />
     </div>
   </div>

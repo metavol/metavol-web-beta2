@@ -72,3 +72,43 @@ export const readNiftiMask = (buf: ArrayBuffer): MaskNifti => {
         voxelSizeMm: [dx, dy, dz],
     };
 };
+
+// ---------------------------------------------------------------------------
+// D&D で落ちてきた NIfTI が「ラベルマスク」かどうかの判定 (2026-08)
+// ---------------------------------------------------------------------------
+//
+// 画像もマスクも **同じ d&d** で読み込めるようにするための自動判定。
+// ここで true になっても即マスク扱いにはせず、**必ず確認ダイアログを挟む**
+// (自動判定 + 手動確認。誤検出のコストは Cancel 1 クリックに抑える)。
+//
+// 判定基準 (すべて値ベース。datatype では判定しない — SPM はマスクを float で
+// 書くことがあり、逆に 8-bit の解剖画像もある):
+//   - 全 voxel が 0 以上 65535 以下の整数 (NaN があれば除外 = マスクではない)
+//   - 0 以外の値が 1 つ以上ある
+//   - 異なり値の数が maxDistinct (既定 512) 以下
+//     (Neuromorphometrics 136 / FreeSurfer aseg ~45 は通る。CT/MR の連続値は数千あるので落ちる)
+//
+// 8-bit 解剖画像 (異なり値 ≤256) は通り抜けるが、dims が既存 volume と一致する
+// 場合にしか呼ばれない + 確認ダイアログがあるので実害は小さい。
+export const analyzeLabelMaskCandidate = (
+    voxel: Float32Array | ArrayLike<number>,
+    maxDistinct = 512,
+): { labelIds: number[] } | null => {
+    const seen = new Set<number>();
+    let nonZero = 0;
+    const n = voxel.length;
+    for (let i = 0; i < n; i++) {
+        const v = (voxel as any)[i] as number;
+        if (!Number.isFinite(v)) return null;          // NaN/Inf はマスクにあり得ない
+        if (v < 0 || v > 65535 || !Number.isInteger(v)) return null;
+        if (v !== 0) {
+            nonZero++;
+            if (!seen.has(v)) {
+                seen.add(v);
+                if (seen.size > maxDistinct) return null;
+            }
+        }
+    }
+    if (nonZero === 0 || seen.size === 0) return null;
+    return { labelIds: [...seen].sort((a, b) => a - b) };
+};

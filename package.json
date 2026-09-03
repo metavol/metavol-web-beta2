@@ -16,7 +16,11 @@
     "check:crop": "node scripts/ct-crop-check.mjs",
     "check:snapshot": "node scripts/snapshot-roundtrip.mjs",
     "check:d2n": "node scripts/dicom2nifti-check.mjs",
-    "check:d2n-ui": "node scripts/d2n-ui-repro.mjs"
+    "check:d2n-ui": "node scripts/d2n-ui-repro.mjs",
+    "check:voi": "node scripts/voi-check.mjs",
+    "check:voi-ui": "node scripts/voi-ui-check.mjs",
+    "check:orient": "node scripts/orientation-check.mjs",
+    "check:mask-dnd": "node scripts/mask-dnd-check.mjs"
   },
   "dependencies": {
     "@mdi/font": "6.2.95",

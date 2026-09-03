@@ -766,6 +766,48 @@ CT と PET のプロファイルの相関が最大になる並進を答えとす
   この 2 つは **CT が同一シリーズ** (肺体積 6,770ml・重心が完全一致) で、実質 1 つの CT に対する
   2 つの PET でしかなかった。別患者 (cervicalca / dicom) を入れた途端に崩れた。
 
+### 3.596. NIfTI を表示するとき **voxel 軸をそのまま画面軸にしてはいけない**
+
+2026-08、ユーザ報告「SPM 正規化済みの nii を d&d すると**前後逆**で開く」。
+
+`promoteBoxToVolume`(NIfTI-only シリーズを Volume Box に昇格させる関数) が
+`vecx/vecy/vecz` に `volume.vectorX/Y/Z` を**そのまま**入れていたのが原因。
+これは「voxel の並び順」であって「解剖学的な向き」ではない。
+
+| | j 軸 (vectorY) が向く方向 | 画面下 | 見え方 |
+|---|---|---|---|
+| DICOM (LPS 並び) | 後方 | 後方 | たまたま正しい |
+| **NIfTI (RAS 並び)** | **前方** | **前方** | **前後逆** |
+
+つまり DICOM でずっと正しく見えていたのは偶然で、NIfTI で初めて露呈した。
+
+**判定は主観でなく実測する。** `scripts/orientation-check.mjs` は
+アトラスの**前頭極 (id 120/121) と後頭極 (id 156/157) の world 重心**を取り、
+その差ベクトルを box の `vecy` に射影する。正なら前頭極が画面下 = 前後逆。
+
+実測 (`sample-data/spm-normalized/wFDG.nii`, srow_y=+2):
+
+| | vecy | 前頭極−後頭極 を画面下へ射影 | 判定 |
+|---|---|---|---|
+| 修正前 | (0, **-2.57**, 0) | **+165.3 mm** | 前頭極が下 = **逆** |
+| 修正後 | (0, +2.57, 0) | -165.3 mm | 前頭極が上 = 正 |
+
+左右はどちらも `+51.9 mm` (左海馬−右海馬 を画面右へ射影) で、**前後だけ**が壊れていた。
+片方だけ壊れる型なので、**前後と左右を別々に測る**こと。
+
+**修正**: `nativePlaneOf(v)` で `vectorZ` が最も沿う world 軸から取得断面 (axi/cor/sag) を
+決め、その断面について `planeVectorsWorld(v, plane)` を使う。
+**断面は変えずに向きだけ正す**のが要点 — 一律 `'axi'` にすると coronal 収集の PET が
+axial 再構成で開いてしまい、別の驚きを生む。
+
+`planeVectorsWorld` は元から解剖学的に正しく組まれていた (`6565` 行)。
+**同じ目的の関数が 2 つあり、片方だけ正しい**という形だったので、
+新しく Box を作るコードを書くときは必ず `planeVectorsWorld` 側を使うこと。
+
+なお `sample-data/spm-normalized/` に置く nii はユーザが症例ごとに差し替えるため
+(w00r.nii → wFDG.nii)、スクリプトはファイル名を**ハードコードせず**
+`scripts/sampleData.mjs` の `normalizedNii()` で解決する。
+
 ### 3.6. MR↔PET registration の初期化 (2026-07)
 
 MI + Nelder-Mead は **局所探索**なので初期値が全て。`onRegisterMrPt` は
@@ -787,7 +829,11 @@ PET 高集積部の MR 信号が周囲の 3.54 倍 (257.4 vs 72.8)。
 ### 4. NIfTI のみロード時の modality (解決済み 2026-08)
 `nifti-reader-js` の affine からは Volume は作れるが modality は分からない。**3 段で決める**:
 
-1. **ファイル名** — `detectModalityFromFilename` (`003PT00.nii` → PT)
+1. **ファイル名** — `detectModalityFromFilename` (`003PT00.nii` → PT)。
+   **SPM の接頭辞 (`w`/`r`/`s`/`m` など最大 3 文字) を飛ばす**ので、metavol-web が書き出した
+   `PT_....nii.gz` を SPM に通した `wPT_....nii` も PT と判定できる。
+   = **metavol-web → SPM → metavol-web の往復は自動で繋がる**。
+   誤検出しないことは `Cartilage.nii` / `mrbrain.nii` / `ctx_atlas.nii` などで確認済み。
 2. **voxel 値の分布** — `guessModalityFromVoxels` (`modalityGuess.ts`)。**CT だけ**確度高く言える
    (空気 -1000HU の指紋)。実測 kitty.nii: 空気 46.2%・負値 89.2% → CT。
    **PT と MR は分布だけでは互いに区別できない**ので `null` を返し 'OTHER' のままにする。
@@ -796,6 +842,24 @@ PET 高集積部の MR 信号が周囲の 3.54 倍 (257.4 vs 72.8)。
    metadata を書き換えて `segStore.setPetVolume` / `setCtVolume` / `setMrVolume` を呼ぶ。
    seriesUID が無い NIfTI には `nii-{index}-{timestamp}` の sentinel を振る
    (registration の永続化が seriesUID 照合のため)。
+
+**PT と MR は voxel 値では区別できない — 正規化後はさらに無理 (2026-08 実測)**
+
+手元の 5 本を測った結果:
+
+| ファイル | 実際 | 整数のみ | 負値率 | min / max |
+|---|---|---|---|---|
+| brain_mri_pet/MR00 | MR | true | 0.00% | — |
+| metmri/MR00 | MR | true | 0.02% | — |
+| brain_mri_pet/PT00 | PT | false | 39.8% | -10.6 / 10.5 |
+| metmri/PT00 | PT | false | 32.2% | -6.6 / 3.9 |
+| **spm-normalized/w00r** (現在は wFDG.nii に差し替え済) | **PT** | false | 5.05% | **-0.0034** / 11.1 |
+
+生の PET は **負値が max と同オーダー** (再構成の scatter/randoms 減算) だが、
+**SPM で正規化した w00r の負値は max の 0.03% しかない** = 補間のアンダーシュートであって
+PET の指紋ではない。「整数のみ」も、MR を正規化すれば補間で非整数になるので使えない。
+→ **正規化後の画像から PT/MR を当てる規則は作らない。** 名前で分からなければ 'OTHER' のまま
+ユーザに `Set as PT` を押してもらう (1 クリック)。無理に当てて外す方が害が大きい。
 
 検証: `node scripts/nifti-modality.mjs` (kitty で 6 項目すべて PASS を確認済み)。
 
@@ -984,6 +1048,202 @@ dims / pixdim / sform_code / **srow から復元した affine が元の imagePos
 
 ---
 
+## SPM 標準脳変換 + VOI テンプレート解析 (2026-08)
+
+**役割分担**: 正規化 (MATLAB/SPM) は各自の PC。metavol-web は
+① DICOM → NIfTI 変換 と ② **正規化済み NIfTI + VOI テンプレート → 領域ごとの数値** だけを担う。
+ブラウザ内で正規化はしない。
+
+**入口**: app-bar のハンバーガー → **VOI analysis…**。右 Inspector には入れない
+(あそこは Persona 1 の 4 ステップ動線。136 行の表を差すと主要フローが埋まる)。
+
+**モジュール**
+
+| ファイル | 役割 |
+|---|---|
+| `voi/voiTemplate.ts` | 名前表 (SPM の XML / CSV / LUT) のパース、ラベル volume 読み込み、自己整合検査 |
+| `voi/voiResample.ts` | world 経由の最近傍ラベル割り当て + 重なり診断 |
+| `voi/voiStats.ts` | 領域統計 (**純関数**。バッチや SUVR を後から足せる) |
+| `stores/voi.ts` | テンプレートと結果の保持 |
+
+**segmentation store には載せない。** あちらの mask は PET 格子固定で `loadMaskFromNifti` が
+dims 完全一致を要求する。テンプレートは格子が違うので、載せると MTV 測定の経路を壊す。
+
+**計算の向き — ここが設計の核心**
+
+**画像の格子を主とし、各画像 voxel の中心を world 経由でテンプレートへ写して最近傍でラベルを引く。**
+
+- 画像の値を一切補間しないので **測定値が変質しない**
+- 1 voxel が 1 領域にしか属さないので **二重計上しない**
+- 体積が画像 voxel 単位で出るので SPM/MarsBaR の慣行と一致する
+
+逆向き (画像をテンプレート格子へ resample) は値を補間するので採らない。
+**ラベルの補間も厳禁** (ラベル 3 と 5 の間を補間すると存在しない 4 が生まれる)。
+
+走査は **合成アフィンを 1 本作って増分で回す**。voxel ごとに `worldToVoxel` を呼ぶと
+行列を毎回作り直すので実用速度が出ない (体マスクの crop で同じ轍を踏んだ)。
+実測 79x95x79 → **37ms**。
+
+**実測した前提 (推測しないこと)**
+
+| | アトラス | SPM 既定の正規化出力 |
+|---|---|---|
+| dims | 121x145x121 | 79x95x79 |
+| voxel | **1.5mm** | **2mm** |
+| datatype | UINT8 | FLOAT32 |
+| scl_slope / inter | 1 / 0 | 1 / 0 |
+| sform_code | 4 (MNI_152) | 2 (ALIGNED_ANAT) |
+| world bbox (RAS) | x[-90,90] y[-126,90] z[-72,108] | x[-78,78] y[-112,76] z[-70,86] |
+
+**格子は一致しない**ので world 経由の写像は省略できない。画像 bbox はアトラスに完全に内包される
+関係なので、正しく実装すれば画像 voxel の 100% が判定可能 (実測 100.0%)。
+
+**誤検出の防止** — 正規化されていない画像を渡されたとき、黙って数値を返すのが最悪。
+`diagnoseOverlap` / `overlapWarnings` が常に次を出す:
+テンプレート格子内に落ちた画像 voxel の割合 / ラベルが付いた割合 / bbox 重なり /
+voxel を 1 つも得なかった領域数。閾値を下回れば警告を出す (処理は止めない)。
+
+**ライセンス** — Neuromorphometrics は **CC BY-NC**、Neuromorphometrics, Inc. の
+academic subscription 下の提供物。**アプリに同梱して配布しないこと。**
+ユーザ自身の SPM (`tpm/labels_Neuromorphometrics.nii` + `.xml`) から読み込ませ、
+結果画面に XML ヘッダの出典を表示する。
+
+**文字コード** — SPM の XML は `encoding="ISO-8859-1"` 宣言つき。UTF-8 決め打ちで読まず、
+宣言を見てから `TextDecoder` を選ぶ (`decodeXmlBytes`)。
+
+**検証は 2 本立て。両方要る。**
+
+```bash
+npm run check:voi      # 中核 (自己整合 / 合成データ / **Node 側の独立実装との突合**)
+npm run check:voi-ui   # ★ 人と同じ UI 操作 (メニュー → 読込 → Run → 表 → CSV の中身まで)
+```
+
+実測 (2026-08、`sample-data/spm-atlas` + `spm-normalized/w00r.nii`):
+
+- XML 136 ラベル / volume 136 種、**欠番は両方向とも 0**
+- 合成データ (値 = ラベル ID x 10) で **mean が ID x 10・SD 0、誤差 0**
+  = 高速な合成アフィンが `voxelToWorld`/`worldToVoxel` の素直な往復と一致
+- **Node 側の独立実装と voxel 数・mean・SD すべて差 0** (134 領域)
+- UI 経路: CSV の値が独立計算と一致 (id 44 で voxel 34852、mean 3.830666)
+
+**overlay 表示 (2026-08、二度の設計変更あり) — MTV マスクと完全に同一基盤**
+
+最初は `buildVoiOverlayForBox()` という **VOI 専用の並行経路** (voiStore に独自の
+overlayAlpha/overlayEnabled) を作ったが、ユーザ指摘で撤去した:
+「透過性を上げ下げできない。**MTV のマスクと同じ機能を使って表示してほしい。**
+新機能を足すときは既存機能を流用できないかを常に考えてほしい」。
+同じ見た目の overlay が 2 系統あると、マスクパネルのスライダ・per-label 表示切替・
+マスク保存が**片方にしか効かない**。教訓: **描画コードの流用では足りない。state と UI ごと流用する。**
+
+現在の設計 — `runVoiAnalysis` が割り当て結果を**マスク読込と同じ入口**から import する:
+- `segStore.setPetVolume(解析対象)` → `segStore.loadMaskFromNifti(labelOf, dims, {labels})`
+- labels は XML の 136 領域名 + `buildCategoricalClut()` (黄金角 137.508° で色相を回す。
+  `labelClut` は 17 色しかなく 136 領域では衝突するため) の色
+- これで SegmentationPanel の **透過度スライダ / 目アイコン (per-region 表示) / 色編集 /
+  Save mask / 自動保存 (.mvs)** がすべて VOI 領域にそのまま効く
+- VOI ダイアログ内の Opacity スライダも **segStore.overlayAlpha を直接読み書き**する
+  (独自 state を持たない。マスクパネルのスライダと同じ値が動く)
+- 副作用: **マスク層は 1 枚**なので、VOI 実行中の MTV マスクは置き換わる (逆も同じ)。
+  これは統一の帰結として仕様
+
+**重ねるのは `labelOf` (割り当て結果)。アトラス原本ではない。** アトラスは別格子なので、
+原本を重ねると「見た目は合っているのに計算に使ったのは別物」を見逃す。
+`npm run check:voi-ui` が透過度スライダ (彩度合計が alpha 0.9→0.15 で 0.17 倍) と
+per-label 非表示 (着色画素 2817→2212→2817) まで画素で検査する。
+
+**左サイドバーの MASK カード (`MaskCard.vue`, 2026-08 追加)**
+
+マスク層は 1 枚で VOI/MTV が置き換え合うため、「いま何のマスクが載っているか」を
+スクロール無しで見せる専用カードを SeriesList の上に置く。
+`segStore.maskLabel` (出自: 'MTV mask' / 'VOI: <atlas> (136 regions)' / 読み込みファイル名) +
+紐づく PT + ラベル数 + 体積 (mL) + 目アイコン + 透過度スライダ + Save/Clear メニュー。
+
+- **seriesList には入れない。** マスクは撮影シリーズと違い「生きた派生物」(ブラシごとに
+  書き換わり PET 格子に従属)。普通のシリーズとして挿すと (a) window/CLUT/fusion など
+  ラベルマップに無意味な操作が全部当たる、(b) registration/fusion が依存する series index の
+  不変条件に触る。segStore 直結の別カードにして操作を 表示/透過度/Save/Clear に絞る。
+- 出自の更新箇所: `applyThreshold` → 'MTV mask'、`loadMaskFromNifti` → sidecar.name
+  (VOI は runVoiAnalysis が 'VOI: <atlas>' を渡す。パネルの Load mask はファイル名)、
+  `clearMask`/`setPetVolume`(別 volume) → null。**マスクを作る新しい経路を足したら
+  maskLabel も設定すること** (さもないとカードに古い出自が残る)。
+- 非ゼロ数と使用ラベル数は maskVersion 依存の computed で全走査 (18M voxel ≒ 15ms、
+  ブラシは stroke 終了時のみ bump するので許容)。
+- 検証: `check:voi-ui` の「MASK カード」4 項目 (存在 / 出自表示 / 目アイコンで消える・戻る)。
+  ダイアログの scrim がサイドバーへのクリックを遮るので、テストでは Escape で閉じてから操作する。
+
+**マスクも同じ d&d で読み込む (2026-08, ユーザ指定「画像もマスクも同じ方法で」)**
+
+読み込みの入口は **d&d (= Load files…) 1 つ**。doSort の NIfTI 処理を 2 パスにしてある:
+
+1. **パス 1**: `analyzeLabelMaskCandidate` (niftiReader.ts) がラベルマスクらしさを判定
+   (全 voxel が 0〜65535 の整数 / NaN 無し / 異なり値 ≤512)。候補でない NIfTI は即シリーズ化。
+2. **パス 2**: 候補について **dims が一致する既存 volume** を探し (petVolumeRef 優先 → PT → 先頭)、
+   見つかれば **確認ダイアログ** (`tryIngestNiiAsMask`)。OK なら SegmentationPanel の Load mask と
+   **同じ入口** (`loadMaskFromNifti`) へ流す。Cancel / 一致なし → 普通の volume としてシリーズ化。
+
+- 2 パスにするのは **同じ drop に画像 + マスクが混在**したとき、bag 内の順序に依らず
+  画像側が先に volume になっている必要があるため。
+- 同じ drop の **.json sidecar** (labels 配列を持つもの) を拾ってラベル名・色を復元する。
+  sidecar 無しなら実際の id から `Label N` + 黄金角色で生成する
+  (既定の Tumor/Non-tumor 表のままだと id と対応せず色も per-label 切替も嘘になる)。
+- **自動判定 + 手動確認**の組み合わせ。8-bit 解剖画像 (異なり値 ≤256) は判定を通り抜けるが、
+  確認ダイアログがあるので誤取り込みのコストは Cancel 1 クリック。
+- **`detectPetCtFromDicom` は生きている petVolumeRef を上書きしないこと (2026-08 修正)。**
+  doSort 末尾のこの関数が無条件に detect 結果を入れ直していて、PT の無いセッションでは
+  `setPetVolume(null)` → **直前に取り込んだマスクが破棄**された (実測で踏んだ)。
+  参照の voxel が seriesList に生存している間はスキップする。
+- **手動経路 (2026-08 追加)**: 自動判定に乗らなかった / Cancel した場合は、シリーズカードの
+  **「…」→ Use as mask** (`onUseSeriesAsMask`)。既に volume 化したシリーズをその場でマスクとして
+  取り込み直す (シリーズは残す)。明示操作なので確認ダイアログ無し、失敗理由は alert。
+  判定は緩める (異なり値上限 65535) が、**整数・非負・NaN 無しは譲らない**
+  (Uint16 に落とすと値が変質するため)。d&d 経路と共通の `findMaskTargetSeries` +
+  `ingestVoxelsAsMask` を通る。⚠ SeriesList に emit を足したら Sidebar の中継も足すこと (既知の罠)。
+- 検証: `npm run check:mask-dnd` (ダイアログ文言 / OK でシリーズ不増 + MASK カード + 着色画素 /
+  Cancel でシリーズ +1 → **Use as mask で救済** / sidecar 復元)。
+
+**テンプレートを読み込んだら、そのまま解析まで走らせること (2026-08)。**
+overlay は `labelOf` (割り当て結果) が無いと描けず、それを作るのは `runVoiAnalysis` だけ。
+以前は読み込みで止まっていたので、**「テンプレートが画像に合っているか」を目視で確かめられなかった**
+(Run を押すまで何も重ならない)。ユーザが読み込み直後に最も知りたいのは一致の可否なので、
+`loadVoiTemplateFiles` の末尾で自動実行する。対象は「選択中 box が映しているシリーズ」を優先し、
+候補外なら先頭の候補。ダイアログの選択欄は `store.analyzedSeriesIndex` を既定にして
+**表の数値と選択中シリーズが食い違わない**ようにしてある。
+`npm run check:voi-ui` に「Run を押していない時点で 136 行が出るか」の検査を入れてある。
+
+**`runVoiAnalysis` は最後に `boxStateVersion++` + `show()` を呼ぶこと。**
+ImageBox の描画は `show()` 起点で **voiStore を watch していない**ので、store に入れるだけでは
+overlay が出ない。実測で「Run 直後は出ず、別の操作で再描画されるまで気付けない」状態になった。
+`npm run check:voi-ui` は **canvas の画素を実際に読んで**着色率を測るのでこれを検出する
+(overlay ON 62.4% / OFF 0.0%)。
+
+**未実装 (意図的に後回し)**: 参照領域比 (SUVR) / 左右差 / Z スコア / バッチ処理。
+統計は純関数なのでいずれも上に足せる。
+
+---
+
+## modality 不明の volume の表示 window (2026-08)
+
+**固定 window を当てないこと。** 以前は CT/PT 以外を一律 `WC 0 / WW 1000` にしていたが、
+SPM で正規化した脳画像は値域が **0〜11 程度**しかなく、**ほぼ真っ黒**になっていた。
+
+- `volumeWindow.ts` の `autoWindowFromVolume(vol, pct)` に集約。分位点 (既定 1〜99%) から決める。
+- **NaN を必ず除くこと。** SPM の正規化出力は視野外を **NaN** で埋める
+  (実測 w00r.nii: 592,895 voxel 中 4,379 = **0.74%**)。NaN を含んだまま `sort` すると
+  比較が常に false になって並びが壊れ、分位点が出鱈目になる。
+- 使うのは 2 箇所: `promoteBoxToVolume` の初期 window と、Window preset の `MR-AUTO*`。
+- **Window preset menu は modality 不明を MR と同じ扱いにする** (`isUnknown`)。
+  以前は不明を CT 扱いにして HU プリセット (Lung/Med/Abd…) を出していたが、
+  絶対的な基準が無い volume には無意味。ボタン表示は `Auto`。
+- 実測 (w00r.nii): **WC 0 / WW 1000 → WC 3.026 / WW 6.053** (データ値域 -0.003〜9.18)。
+  `npm run check:voi-ui` が WC/WW の有限性・値域との整合を検査する。
+
+**VOI 統計も NaN 安全にしてある** (`computeVoiStats`)。1 つでも NaN が混じると sum が伝播して
+その領域が丸ごと NaN になるため、除外して数え、除外数を `nanVoxels` 列に出す
+(体積は領域の広がりなので **NaN 込みで数える**)。
+w00r ではラベル領域内に NaN は 0 個だったが、頭が視野端に寄った症例では入りうる。
+
+---
+
 ## 検証コマンド (2026-08 整理)
 
 散在していた検証スクリプトに npm の入口を付けた。**DICOM を要らないものだけ**を `npm run check`
@@ -1001,6 +1261,10 @@ npm run check:crop       # CT 体マスクの crop box (6 面) が bbox どお�
 npm run check:snapshot   # .mvs の保存 -> 復元が mask 差分 0 / 幾何まで戻るか
 npm run check:d2n        # DICOM -> NIfTI 変換の affine / voxel 可逆性 / .nii.gz
 npm run check:d2n-ui     # ★ 同上を **UI 操作から** (メニュー -> クリック -> zip の中身)
+npm run check:voi        # VOI 解析の中核 (独立実装との突合を含む)
+npm run check:voi-ui     # ★ 同上を **UI 操作から** (メニュー -> 読込 -> Run -> CSV)
+npm run check:orient     # ★ 表示の前後/左右が解剖学的に正しいか (アトラスで実測)
+npm run check:mask-dnd   # ★ d&d でマスク .nii を落としたときの自動判定 → 確認 → 取り込み
 ```
 
 計測用 (合否ではなく数値を見るもの):
@@ -1122,42 +1386,76 @@ console.error 監視では見逃す。このスクリプトは `console.warn` �
 
 ---
 
-## ペルソナと優先度 (2026-05-04 確認、ユーザ指示)
+## ペルソナと優先度 (2026-08-19 更新、ユーザ指示)
 
-**最重要 = ペルソナ 1 (PET/CT MTV 測定)**。Metavol はもともと MTV 測定ソフトとして始まった。
+**番号が優先順位**。1 が最重要。2026-08 に **ペルソナ 2 を「脳 PET の解剖学的標準化 + VOI」に
+差し替え**、従来の 2 (簡易 viewer) と 3 (PET/MR + radiomics) を 3 / 4 へ繰り下げた。
 
-### ペルソナ 1: PET/CT MTV 測定 ★最重要
-- **解決する問題**: PET volume から腫瘍体積 (MTV) と total lesion glycolysis (TLG) を測定する。臨床/研究用。
-- **現状の充足度** (commit b84d1cd 時点で高い):
-  - Sphere ROI / Polygon ROI / threshold スライダ (PERCIST liver / pct-of-max / fixed) / Apply
+> ⚠ **ソース中の `Persona N` コメントもこの番号に合わせてある** (2026-08 に一括更新済み)。
+> 番号を動かすときは `grep -rn "Persona [0-9]" src/ TODO.md` で全部直すこと。
+> 旧番号のまま残すと「Persona 2 = quick viewer」という**誤った手掛かり**が残る。
+
+### ペルソナ 1: 腫瘍 PET で MTV を測る ★最重要
+- **誰**: **忙しい医師**。1 症例あたりの時間が短い。
+- **解決する問題**: PET volume から腫瘍体積 (MTV) と total lesion glycolysis (TLG) を測る。
+- **最優先の設計制約**: **クリック数を最小に**。既定は一本道で、迷いどころを作らない。
+  右 Inspector を 4 ステップ (Segment → Refine → Statistics → Save) に絞り、
+  使用頻度の低いものを Advanced に畳んでいるのはこのため。
+  **新機能を主要フローに差す前に「クリックが増えないか」を必ず問う。**
+- **現状の充足度**: 高い。
+  - Sphere / Polygon / Brush ROI、threshold preset (PERCIST liver / pct-of-max / fixed) + Apply
   - Find islands (26-連結 CC) / Assign label / Save NIfTI mask
   - Lesion table、SUVpeak、TMTV cutoff (DLBCL CAR-T 48cc / NSCLC 80cc)、Deauville 5pt
-  - Snapshot (.mvs) で session 永続化
+  - Snapshot (.mvs) で session 永続化、IndexedDB 自動保存、undo/redo
 - **次の伸びしろ** (この優先順で):
-  1. Voxel-level brush edit (1 voxel ON/OFF。polygon より細かい修正用)
-  2. Undo を polygon 以外にも拡張 (apply / assign label / paint の取消)
-  3. Lesion table の inline rename / delete / merge / split
-  4. Multi-timepoint comparison (baseline vs follow-up、PERCIST 自動判定)
+  1. Lesion table の inline rename / delete / merge / split
+  2. Multi-timepoint comparison (baseline vs follow-up、PERCIST 自動判定)
+  3. **クリック削減そのもの** — 読み込み → 閾値 → 保存を既定で最短にする見直し
 
-### ペルソナ 2: 簡易 viewer (URL share)
+### ペルソナ 2: 脳 PET を解剖学的標準化して VOI テンプレートの値を取る (2026-08 新設)
+- **誰**: 脳 PET の研究者・読影者。**SPM を自分で回せる**人。
+- **解決する問題**: 脳 PET を標準脳へ正規化し、VOI テンプレート (AAL / Neuromorphometrics 等) を
+  当てはめて **領域ごとの数値** (mean / SD / volume など) を取り出す。
+- **役割分担**: **正規化 (MATLAB + SPM) は各自の PC**。ブラウザ内では正規化しない。
+  metavol-web が担うのは前後の 2 つだけ:
+  1. **DICOM → NIfTI 変換** (SPM に食わせる入力を作る)
+  2. **正規化済み NIfTI + VOI テンプレート → 領域値** (数値化・可視化・CSV)
+- **現状の充足度**: 一通り動く。詳細は「SPM 標準脳変換 + VOI テンプレート解析」節。
+  - DICOM→NIfTI (.nii.gz + sidecar を zip で、INT16/FLOAT32 自動、値は可逆)
+  - VOI テンプレート読込 (SPM の XML / CSV / LUT)、自己整合検査、出典・ライセンス表示
+  - world 経由の最近傍ラベル割り当て (**画像の値は補間しない**)、重なり診断と警告
+  - 領域統計 (voxel / volume / mean / SD / min / max、NaN 安全) + CSV 出力
+  - **既存のマスク overlay を流用**した領域の重ね描き
+  - 正規化画像は modality 不明でも**分位点から自動 window**
+- **次の伸びしろ**:
+  1. **参照領域比 (SUVR)** — 小脳・橋などを基準にした比。臨床でまず要る
+  2. 左右差 (L/R asymmetry index)
+  3. **複数症例のバッチ処理** — 現状 1 症例ずつ
+  4. Z スコア (正常データベースとの比較)
+  5. 統計は `voi/voiStats.ts` の**純関数**なので、上記はいずれもここに足せる
+
+### ペルソナ 3: 簡易 viewer (URL share)  ← 旧ペルソナ 2
 - **解決する問題**: 院内/カンファレンスで DICOM/NIfTI を「リンク 1 つ」で共有して見せる。
 - **現状の充足度** (中-高):
-  - Drag & drop DICOM/NIfTI、`?url=` で外部 URL 共有、append drag (commit b84d1cd)
+  - Drag & drop DICOM/NIfTI、`?url=` で外部 URL 共有、append drag
   - NIfTI raw byte view、NIfTI header viewer (volume card "..." menu)
   - nii.gz native streaming gunzip + 進捗 chip
 - **次の伸びしろ**: URL に view state (W/L、CLUT、layout) を載せる。OHIF 風 share。
 
-### ペルソナ 3: PET/MR + radiomics
+### ペルソナ 4: PET/MR + radiomics  ← 旧ペルソナ 3
 - **解決する問題**: MR と PET を整合させて anatomical context 付きで MTV を測る。Radiomics 抽出。
 - **現状の充足度** (中):
-  - MR registration (rigid 6-DOF, MI + Nelder-Mead, 3-level pyramid)
+  - MR registration (rigid 6-DOF, MI + Nelder-Mead, 多重解像度)。
+    **視野が大きく食い違うペアは自動を実行しない** (3.59)。手動 alignment が主。
   - Radiomics features (first-order / shape / GLCM / GLRLM)
 - **次の伸びしろ**:
-  1. WebGPU MI で registration 5-30s → 0.1-1s (TODO に詳細あり)
-  2. 手動 nudge UI (Fusion box で MR を Shift+drag で ±1mm 移動)
+  1. **解剖ランドマークベースの位置合わせ** (TotalSegmentator 等)。3.59 / 3.595 の結論
+  2. WebGPU MI で registration 高速化
   3. Radiomics 結果テーブルの UI 改善 (現状は console / snapshot 内)
 
 ### 開発判断のガイド
-- 機能追加で迷ったら **ペルソナ 1 の MTV 測定 UX を改善するか?** を最初に問う。Yes なら高優先。
-- 「P2/P3 専用機能」は P1 を妨げない範囲で追加 (画面の右下に隠す等)。
+- 機能追加で迷ったら **ペルソナ 1 のクリック数を増やさないか?** を最初に問う。
+- **ペルソナ 2 の機能はペルソナ 1 の動線に差さない。** VOI 解析を右 Inspector ではなく
+  独立ダイアログ (app-bar → VOI analysis…) にしたのはこの原則による。
+- 「P3/P4 専用機能」は P1/P2 を妨げない範囲で追加 (メニューの奥、Advanced 等)。
 - 「P1 が触らない領域」(MR registration、PNG/JPG planar 等) は別 commit で。

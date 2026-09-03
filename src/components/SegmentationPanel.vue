@@ -516,7 +516,7 @@ const onLoadMaskFiles = async (e: Event) => {
             if (!ok) return;
         }
 
-        const res = store.loadMaskFromNifti(parsed.mask, parsed.dims, sidecar);
+        const res = store.loadMaskFromNifti(parsed.mask, parsed.dims, { ...(sidecar ?? {}), name: niiFile.name });
         if (!res.ok) {
             alert(res.reason);
             return;

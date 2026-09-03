@@ -36,9 +36,10 @@ const wPresets = [
   { id: 'Fat',   label: 'Fat',   hint: 'Fat window — WC 10 / WW 275' },
 ];
 
-// MR は信号強度が任意単位なので固定 window を作れない。volume の分位点から算出する。
+// MR や **modality 不明**の volume は信号強度が任意単位で、固定 window を作れない。
+// volume の分位点から算出する (NaN は除く。SPM 正規化出力は視野外が NaN)。
 const wPresetsMr = [
-  { id: 'MR-AUTO',       label: 'Auto',  hint: 'Window from the 1–99 percentile of this MR volume' },
+  { id: 'MR-AUTO',       label: 'Auto',  hint: 'Window from the 1–99 percentile of this volume' },
   { id: 'MR-AUTO-TIGHT', label: 'Tight', hint: 'Window from the 5–95 percentile — higher contrast, clips more' },
   { id: 'MR-AUTO-WIDE',  label: 'Wide',  hint: 'Window from the 0.1–99.9 percentile — keeps extremes visible' },
 ];
@@ -58,11 +59,15 @@ const wPresetsPetOther = [
 
 const mod = computed(() => (prop.modality ?? '').toUpperCase());
 const isPt = computed(() => mod.value === 'PT' || mod.value === 'PET');
-const isMr = computed(() => mod.value === 'MR');
-// CT / 不明はどちらも CT プリセットを出す (DICOM の大半は CT なので既定として妥当)
+// **modality 不明は MR と同じ「分位点から自動」を出す。**
+// 以前は不明を CT 扱いにして HU プリセット (Lung/Med/Abd…) を出していたが、
+// SPM 正規化後の脳画像のように値域が 0〜11 しかない volume では**どれも役に立たない**。
+// 絶対的な基準が無いものには分位点しか手が無いので、そちらへ寄せる。
+const isUnknown = computed(() => mod.value === '' || mod.value === 'OTHER');
+const isMr = computed(() => mod.value === 'MR' || isUnknown.value);
 const isCt = computed(() => !isPt.value && !isMr.value);
 
-const groupLabel = computed(() => isPt.value ? 'PT' : isMr.value ? 'MR' : 'CT');
+const groupLabel = computed(() => isPt.value ? 'PT' : isUnknown.value ? 'Auto' : isMr.value ? 'MR' : 'CT');
 
 // ボタン表面: 現在のプリセット名。未選択なら modality だけ出す。
 const buttonLabel = computed(() => {
