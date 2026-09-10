@@ -260,6 +260,15 @@ MASK カード**が現れ、何のマスクか（VOI: Neuromorphometrics … / M
 
 ## 7. 保存形式
 
+### Voxel リスト（④ Save → Others → Voxel list (.txt)）
+- マスク内の全 voxel を 1 行ずつ `island_id label_id x y z value`（空白区切り）で書き出す
+- `island_id` は病変（26-連結成分）の番号。**Lesion table / Lesions CSV と同じ SUVmax 降順**
+  （1 = SUVmax 最大の病変）なので、表の病変 #N と `island_id==N` が厳密に対応する。
+  「腫瘍だけ取り出して各病変を別々に解析する」用途はこの列でフィルタする
+- `label_id` は数値ラベル id（id → 名前の対応はファイル先頭の `#` コメント行）
+- `x y z` は PET 格子の 0-based voxel index。voxel サイズ・格子寸法・単位・病変数も `#` 行に記載
+- Python なら `pandas.read_csv(f, comment='#', sep='\s+')` でそのまま読める
+
 ### NIfTI マスク
 - ファイル名: `{seriesUID}_{YYYYMMDDhhmmss}.nii`
 - データ: Uint16 多ラベル（0=背景、1..N=ラベルID）

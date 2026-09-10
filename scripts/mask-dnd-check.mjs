@@ -46,9 +46,15 @@ for (let b=252; b<348; b+=2) dv.setInt16(b, sdv.getInt16(b,true), true);
 hdr[344]=0x6e; hdr[345]=0x2b; hdr[346]=0x31; hdr[347]=0x00;   // "n+1"
 
 const vox = new Uint8Array(nx*ny*nz);
-// 3 ブロックに 1/2/3 を塗る (z 三等分、中央付近のみ)
+// 島 A: 3 ブロックに 1/2/3 を塗る (z 三等分、中央付近のみ)。z 方向に連続なので 1 つの島。
 for (let k=0;k<nz;k++) for (let j=30;j<60;j++) for (let i=25;i<55;i++)
   vox[k*nx*ny + j*nx + i] = k<nz/3 ? 1 : (k<2*nz/3 ? 2 : 3);
+// 島 B: A から x 方向に 5 voxel 以上離れた小さな立方体 (label 2)。
+// island_id の分離と SUVmax 順位付けの検証用。
+const B = { i0: 60, i1: 66, j0: 40, j1: 46, k0: 35, k1: 41 };
+for (let k=B.k0;k<B.k1;k++) for (let j=B.j0;j<B.j1;j++) for (let i=B.i0;i<B.i1;i++)
+  vox[k*nx*ny + j*nx + i] = 2;
+const N_A = 30*30*nz, N_B = 6*6*6, N_ALL = N_A + N_B;
 const maskNii = new Uint8Array(352 + vox.length);
 maskNii.set(hdr,0); maskNii.set(vox,352);
 
@@ -104,7 +110,7 @@ try {
     check(after === before, 'OK でシリーズは増えない', `${before} → ${after}`);
     const st = await segState(page);
     check(st.maskLabel === 'tumor_mask.nii', 'MASK カードの出自がファイル名', JSON.stringify(st.maskLabel));
-    check(st.nonZero > 0, 'マスクに voxel が入っている', `${st.nonZero}`);
+    check(st.nonZero === N_ALL, 'マスクに voxel が入っている', `${st.nonZero} vs ${N_ALL}`);
     check(st.labels.length === 3 && st.labels[0].name === 'Label 1',
           'sidecar 無しではラベル表を id から生成', JSON.stringify(st.labels));
     const card = page.locator('[data-testid="mask-card"]');
@@ -124,6 +130,72 @@ try {
       return n;
     });
     check(colored > 100, '画像に overlay が着色されている', `着色画素 ${colored}`);
+
+    // --- B2) Voxel list export (Persona 1 向け、様式 `island_id label_id x y z value`) ---
+    // 右 Inspector の ④ Save → Others → Voxel list を人と同じ操作で押し、
+    // 落ちてきた .txt を **Node 側で独立に読んだ wFDG の voxel 値**と突き合わせる。
+    await page.evaluate(() => {
+      const ss = document.querySelector('#app').__vue_app__._instance.setupState;
+      const d = (ss.dicomViewRef.value ?? ss.dicomViewRef).$.setupState;
+      d.inspector = true;
+    });
+    await page.waitForTimeout(1500);
+    await page.locator('.mv-save-others').click();
+    await page.waitForTimeout(400);
+    const dlPromise = page.waitForEvent('download', { timeout: 30000 });
+    await page.locator('.v-overlay .v-list-item', { hasText: 'Voxel list' }).first().click();
+    const dl = await dlPromise;
+    const txtPath = path.join(dir, 'voxels.txt');
+    await dl.saveAs(txtPath);
+    const txt = readFileSync(txtPath, 'utf-8');
+    const allLines = txt.split('\n');
+    const metaLines = allLines.filter(l => l.startsWith('#'));
+    const headerIdx = allLines.findIndex(l => l === 'island_id label_id x y z value');
+    check(headerIdx >= 0, 'ヘッダ行が `island_id label_id x y z value`');
+    check(metaLines.some(l => l.startsWith('# grid ')) && metaLines.some(l => l.startsWith('# voxel_mm ')),
+          'メタ行に grid / voxel_mm が入る');
+    check(metaLines.some(l => /^# islands 2 /.test(l)), 'メタ行に islands 2 (病変数)');
+    check(metaLines.filter(l => l.startsWith('# label ')).length === 3,
+          'メタ行に使用中ラベルの対応表 (3 行)');
+    const data = allLines.slice(headerIdx + 1).filter(l => l.length > 0);
+    check(data.length === N_ALL, `データ行数 = マスク voxel 数`, `${data.length} vs ${N_ALL}`);
+
+    // wFDG の voxel を Node で独立に読む (FLOAT32, vox_offset はヘッダから)
+    const voxOff = sdv.getFloat32(108, true) || 352;
+    const img = new Float32Array(src.buffer.slice(src.byteOffset + voxOff,
+                                                  src.byteOffset + voxOff + nx * ny * nz * 4));
+    const inB = (x, y, z) => x >= B.i0 && x < B.i1 && y >= B.j0 && y < B.j1 && z >= B.k0 && z < B.k1;
+    const inA = (x, y, z) => x >= 25 && x < 55 && y >= 30 && y < 60;
+    // 島ごとの SUVmax を独立に計算 (NaN は無視) — island_id の順位検証用
+    let maxA = -Infinity, maxB = -Infinity;
+    for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
+      const v = img[z * nx * ny + y * nx + x];
+      if (!Number.isFinite(v)) continue;
+      if (inB(x, y, z)) { if (v > maxB) maxB = v; }
+      else if (inA(x, y, z)) { if (v > maxA) maxA = v; }
+    }
+    const expIslandA = maxA >= maxB ? 1 : 2;
+    const expIslandB = 3 - expIslandA;
+    let bad = 0, firstBad = '';
+    for (const line of data) {
+      const t = line.split(' ');
+      if (t.length !== 6) { bad++; if (!firstBad) firstBad = `列数 ${t.length}: ${line}`; continue; }
+      const [isl, lab, x, y, z] = [Number(t[0]), Number(t[1]), Number(t[2]), Number(t[3]), Number(t[4])];
+      const idx = z * nx * ny + y * nx + x;
+      // 既知パターン: 島 B は label 2、島 A は k 三等分で 1/2/3
+      const expLab = inB(x, y, z) ? 2 : (inA(x, y, z) ? (z < nz / 3 ? 1 : (z < 2 * nz / 3 ? 2 : 3)) : 0);
+      const expIsl = inB(x, y, z) ? expIslandB : (inA(x, y, z) ? expIslandA : 0);
+      if (lab !== expLab) { bad++; if (!firstBad) firstBad = `label ${lab} != ${expLab} at ${x},${y},${z}`; continue; }
+      if (isl !== expIsl) { bad++; if (!firstBad) firstBad = `island ${isl} != ${expIsl} at ${x},${y},${z}`; continue; }
+      const expVal = img[idx];
+      if (t[5] === 'nan') {
+        if (Number.isFinite(expVal)) { bad++; if (!firstBad) firstBad = `nan だが実値 ${expVal}`; }
+      } else if (!(Math.abs(Number(t[5]) - expVal) <= 5.1e-7)) {
+        bad++; if (!firstBad) firstBad = `value ${t[5]} != ${expVal} at ${x},${y},${z}`;
+      }
+    }
+    check(bad === 0, '全行が独立読みの voxel 値・既知ラベル・既知 island と一致',
+          bad ? `不一致 ${bad} 行 (例: ${firstBad})` : `${data.length} 行検証 (SUVmax A=${maxA.toFixed(2)} B=${maxB.toFixed(2)} → 島番号 A=${expIslandA})`);
     await page.close();
   }
 
@@ -151,7 +223,7 @@ try {
     const st2 = await segState(page);
     check(st2.maskLabel === 'tumor_mask.nii', 'Use as mask でマスク化される (出自 = ファイル名)',
           JSON.stringify(st2.maskLabel));
-    check(st2.nonZero > 0, 'マスクに voxel が入っている', `${st2.nonZero}`);
+    check(st2.nonZero === N_ALL, 'マスクに voxel が入っている', `${st2.nonZero} vs ${N_ALL}`);
     check(await page.locator('[data-testid="mask-card"]').count() === 1, 'MASK カードが出る');
     await page.close();
   }

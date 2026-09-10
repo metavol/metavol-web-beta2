@@ -267,6 +267,27 @@ Volume 単独 / Fusion 両方をハンドル（`isVolumeImageBoxInfo` は `clut1
   - 同名 `.json` : ラベル一覧、SUV閾値、PET metadata、voxel size、dims
 - NIfTI ヘッダは自前実装（348B + 4B magic + raw voxel）。`niftiWriter.ts` を参照。
 
+### Voxel list (④ Save → Others → Voxel list (.txt), 2026-09 追加)
+
+マスク内の**全 voxel を 1 行ずつ** `island_id label_id x y z value` (空白区切り) で書き出す
+(ユーザ指定様式。island 列は「腫瘍だけ取り出して各病変を別々に解析する」ための追加指定)。
+実装は `segmentation/voxelListExport.ts` の**純関数** `maskVoxelListText`。
+
+- **island_id = 病変 (非ゼロ 26-連結成分) の番号。Lesion table / Lesions CSV と同じ
+  SUVmax 降順** (1 = 最大) に振る。componentMap の走査順 id は summarizeLesions の
+  componentId と同一 (両者とも connectedComponents26 を非ゼロ前景・同一走査順で回す) なので、
+  panel 側で summarizeLesions の順位表を componentMap に写すだけでよい。
+  **どちらかの island 定義や sort を変えるときはもう片方も揃えること** (番号がずれると
+  表とファイルの突き合わせが黙って壊れる)。
+- **label_id は数値 id**。ラベル名には空白が入るので列に入れると空白区切りが壊れる。
+  id → 名前の対応と grid / voxel_mm / unit / islands は先頭の `#` コメント行に載せる
+  (numpy.loadtxt / pandas の comment='#' でそのまま読める)。
+- **x y z は PET 格子の 0-based voxel index** (矩形 ROI の座標保存と同じ慣行)。
+- value は toFixed(6) 丸め (誤差 ≤5e-7)。NaN は `nan`。
+- 検証は `check:mask-dnd` 内: 合成マスクを **2 病変** (連続ブロック + 離れた立方体) にし、
+  UI クリックで落とした .txt の **71,316 行全部**を Node 側で独立に読んだ画像 voxel 値・
+  既知ラベル・既知 island (SUVmax を独立計算して順位まで) と突き合わせて一致。
+
 ### レポート出力 (④ Save → Others)
 
 - **PDF** (`pdfReport.ts`, jsPDF): 病変テーブル **全行** + 画像。詳細な記録用。

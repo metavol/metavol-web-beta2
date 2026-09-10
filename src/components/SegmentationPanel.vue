@@ -6,6 +6,7 @@ import { readNiftiMask } from './segmentation/niftiReader';
 import { summarizeLesions, collectComponentSuv, type LesionStat } from './segmentation/maskOps';
 import { worldToVoxel } from './Volume';
 import { triggerDownload } from './segmentation/niftiWriter';
+import { maskVoxelListText } from './segmentation/voxelListExport';
 import { getSuvSanityWarnings, getSuvMetadataSummary } from './suvSanity';
 // MR-PET registration の handler は App.vue (☰ Preprocessing) に移管済みのため import 不要
 
@@ -592,6 +593,42 @@ const onExportLesionCsv = () => {
         ? store.petVolumeRef.metadata.seriesUID.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 32)
         : 'lesions';
     triggerDownload(blob, `${sid}_lesions_${ts}.csv`);
+};
+
+// マスク内の全 voxel を `island_id label_id x y z value` で書き出す (Persona 1 向け、ユーザ指定様式)。
+// island_id は「腫瘍だけ取り出して各病変を別々に解析する」ためのもの。
+// **Lesion table / Lesions CSV と同じ番号** (SUVmax 降順、1 = 最大) を振る —
+// componentMap の走査順 id は summarizeLesions の componentId と同一
+// (どちらも connectedComponents26 を非ゼロ前景で同順に回す) なので、順位表で写すだけでよい。
+// 中身は voxelListExport.ts の純関数。ここは番号の振り直しとファイル名・保存だけ。
+const onExportVoxelList = () => {
+    const pet = store.petVolumeRef;
+    const mask = store.finalMask;
+    if (!pet || !mask) return;
+    const lesions = summarizeLesions(pet, mask, store.labels);   // SUVmax 降順
+    if (lesions.length === 0) {
+        alert('The mask is empty — nothing to export.');
+        return;
+    }
+    store.ensureComponentMap();
+    const cm = store.componentMap;
+    if (!cm) return;
+    const rank = new Uint16Array(store.componentCount + 1);
+    lesions.forEach((l, i) => { rank[l.componentId] = i + 1; });
+    const islandOf = new Uint16Array(mask.length);
+    for (let i = 0; i < islandOf.length; i++) islandOf[i] = cm[i] ? rank[cm[i]] : 0;
+    const text = maskVoxelListText(mask, pet, store.labels, islandOf, {
+        image: pet.metadata?.seriesDescription ?? pet.metadata?.sourceFilename ?? undefined,
+        unit: (pet.metadata?.modality === 'PT' || pet.metadata?.modality === 'PET') ? 'SUV'
+            : (pet.metadata?.modality === 'CT' ? 'HU' : 'raw'),
+        islandCount: lesions.length,
+    });
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
+    const sid = pet.metadata?.seriesUID
+        ? pet.metadata.seriesUID.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 32)
+        : 'mask';
+    triggerDownload(blob, `${sid}_voxels_${ts}.txt`);
 };
 
 // 全ラベルの SUV ヒストグラム + first-order 統計を 1 CSV に出力。
@@ -1663,6 +1700,11 @@ defineExpose({
                         <v-list-item :disabled="!lesionTotals" @click="onExportLesionCsv">
                             <template #prepend><v-icon icon="mdi-file-delimited-outline" size="small" /></template>
                             <v-list-item-title>Lesions CSV</v-list-item-title>
+                        </v-list-item>
+                        <v-list-item :disabled="!store.hasPet || !store.finalMask" @click="onExportVoxelList">
+                            <template #prepend><v-icon icon="mdi-grid" size="small" /></template>
+                            <v-list-item-title>Voxel list (.txt)</v-list-item-title>
+                            <v-list-item-subtitle>island_id label_id x y z value — one line per masked voxel</v-list-item-subtitle>
                         </v-list-item>
                         <v-list-item :disabled="!store.hasPet || pdfBusy" @click="onExportPdf">
                             <template #prepend><v-icon icon="mdi-file-pdf-box" size="small" /></template>
