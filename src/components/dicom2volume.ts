@@ -24,8 +24,45 @@ export interface SuvResult {
     decayCorrection?: string;
 }
 
+// SOP Class UID → modality の対応表。
+// **匿名化ソフトが (0008,0060) Modality を上書きする実例**への対策
+// (実測 sample-data/cart: 全シリーズ Modality=RG に書き換え。SOP Class と
+//  SUV 計算に要るタグ (BQML / ATTN / 投与量 / 半減期 / 体重) は無傷だった)。
+// SOP Class は「この IOD で保存された」という規格上の確定情報なので、
+// voxel 分布からの推定 (既知バグ 4 で禁止) とは違い、信頼して良い。
+const SOP_CLASS_MODALITY: Record<string, string> = {
+    '1.2.840.10008.5.1.4.1.1.128': 'PT',    // PET Image Storage
+    '1.2.840.10008.5.1.4.1.1.130': 'PT',    // Enhanced PET
+    '1.2.840.10008.5.1.4.1.1.128.1': 'PT',  // Legacy Converted Enhanced PET
+    '1.2.840.10008.5.1.4.1.1.2': 'CT',      // CT Image Storage
+    '1.2.840.10008.5.1.4.1.1.2.1': 'CT',    // Enhanced CT
+    '1.2.840.10008.5.1.4.1.1.4': 'MR',      // MR Image Storage
+    '1.2.840.10008.5.1.4.1.1.4.1': 'MR',    // Enhanced MR
+    '1.2.840.10008.5.1.4.1.1.20': 'NM',     // NM Image Storage
+};
+// アプリが挙動を変える modality。これ以外 (RG / OT / SC 等) が (0008,0060) に
+// 入っていたら SOP Class を見に行く。SOP Class でも決まらなければ raw のまま返す
+// (本物の RG (単純X線) は SOP Class が CR/DX なので対応表に無く、RG のまま残る = 正しい)。
+const ACTIONABLE_MODALITIES = new Set(['PT', 'PET', 'CT', 'MR', 'MRI', 'NM']);
+
+/**
+ * DICOM 1 枚から「実効 modality」を返す (常に大文字、無ければ '')。
+ * (0008,0060) が PT/CT/MR 等の既知値ならそれ。そうでなければ SOP Class UID から導出。
+ * **modality をタグから読む箇所は必ずこれを通すこと** — 生読みすると匿名化データで
+ * PT/CT が検出できず、Persona HUNTER のフロー全体 (MTV measurement) が始められない。
+ */
+export const dicomModalityOf = (
+    ds: { string: (tag: string, idx?: number) => string | undefined } | null | undefined,
+): string => {
+    if (!ds) return '';
+    const raw = (ds.string('x00080060') ?? '').toUpperCase().trim();
+    if (ACTIONABLE_MODALITIES.has(raw)) return raw;
+    const sop = (ds.string('x00080016') ?? '').trim();
+    return SOP_CLASS_MODALITY[sop] ?? raw;
+};
+
 const detectModality = (d: MyDataSet): Modality => {
-    const m = (d.string("x00080060") ?? "").toUpperCase();
+    const m = dicomModalityOf(d);
     if (m === "PT" || m === "PET") return "PT";
     if (m === "CT") return "CT";
     if (m === "MR") return "MR";

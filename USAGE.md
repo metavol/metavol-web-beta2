@@ -64,7 +64,9 @@
 1. PET/CT のフォルダを **drag & drop**（または `Test` ボタンでフォルダ選択）
 2. **PET Standard** を押す → 2x2（CT axial / PET axial / Fusion axial / PET MIP）が自動配置
 3. Inspector の **Threshold** で SUV 閾値（2.5/3.0/3.5/4.0/Manual）を選んで **Apply**
-4. PET / Fusion / MIP に赤マスクが乗る。同時に Find islands も自動実行
+4. PET / Fusion / MIP に赤マスクが乗る。同時に Find islands も自動実行され、
+   **Lesions の表が自動で開く**。各行の「…」から **Set label**（Tumor/Non-tumor 等へ付け替え）と
+   **Delete lesion**（マスクから除去、Ctrl+Z で復元可）ができ、生理的集積の選別が行単位で進む
 5. 必要なら **Polygon ROI (Erase)** で生理学的集積（脳、心臓、膀胱等）を消す
 6. **Labels** で病変ラベル（tumor1, tumor2…）を作成・選択
 7. **Assign Label** ツール → 病変アイランドをクリックで腫瘍ラベルを付与
@@ -76,7 +78,7 @@
 
 ---
 
-## 3.5 脳 PET の解剖学的標準化 + VOI 解析（ペルソナ 2）
+## 3.5 脳 PET の解剖学的標準化 + VOI 解析（ペルソナ ATLAS）
 
 標準脳への正規化そのものは **MATLAB + SPM12（各自の PC）** で行う。metavol-web が担うのは
 その **前（DICOM → NIfTI）** と **後（正規化済み NIfTI + VOI テンプレート → 領域値）**。
@@ -134,10 +136,14 @@ MASK カード**が現れ、何のマスクか（VOI: Neuromorphometrics … / M
 「…」→ Save mask / Clear mask ができる。さらに右サイドバー（Segmentation パネル）で
 - **Mask スライダ** … 透過度（ダイアログの Opacity と同じ値）
 - **目アイコン** … 領域ごとの表示/非表示（例: 白質だけ消す）
-- **色チップ** … 領域色の変更
+- **色チップ** … クリックで領域色を変更（カラーピッカーが開く）
 - **☰ → Save mask** … 領域マスクを NIfTI で保存
 がそのまま使える。⚠ マスク層は 1 枚なので、VOI 解析を実行すると実行中の MTV マスクは
 置き換わる（逆も同じ）。
+
+**SUVR（参照領域比）**: 結果の表の上にある **SUVR reference region** で参照領域
+（小脳・橋・Brain Stem など）を選ぶと、表と CSV に `suvr` 列（= 各領域の mean ÷ 参照領域の mean）が
+付く。選択は再解析・別症例でも保持されるので、同じ参照で症例を順に処理できる。
 
 **数値（Alignment check）**: 正常なら次のようになる。
 
@@ -253,10 +259,33 @@ MASK カード**が現れ、何のマスクか（VOI: Neuromorphometrics … / M
 - MPR / Axi / Cor / MIP / sMIP / Fusion
 
 ### Advanced（折りたたみ）
-- Demo phantoms: Earth / Humanoid / Voronoi
+- Demo phantoms: NEMA IEC / Whole-body FDG / Whole-body PET-CT
 - Show summary / Show tag
 
 ---
+
+## 6.4 匿名化データの注意
+
+匿名化ソフトによっては DICOM の Modality タグ (0008,0060) を全シリーズ一括で
+書き換えることがある（実例: 全部 "RG" になる）。metavol-web は **SOP Class UID から
+本来のモダリティ（PT/CT/MR）を復元する**ので、そのようなデータでもそのまま
+MTV 測定に進める。fusion のキャプチャ画像（Secondary Capture）は復元対象外で、
+書き換え後の表記のまま表示される。
+
+## 6.5 リンク共有 (ペルソナ COURIER)
+
+**データは URL パラメータ、見え方は .mvs** の分担で 1 リンク共有ができる。
+
+| パラメータ | 意味 |
+|---|---|
+| `?url=<https://…/scan.nii.gz>` | 外部 URL から DICOM/NIfTI を読む (複数可・カンマ区切り可。CORS 必須) |
+| `?mvs=<url>` | データ読み込み完了後に snapshot (.mvs) を取得して view を復元 |
+| `?demo=phantom` | ブラウザ内で全身 PET/CT ファントムを生成。**データ配布なしで動くデモリンク** |
+
+例: `https://…/metavol-web-beta2/?url=https://host/pet.nii.gz&mvs=https://host/view.mvs`
+
+.mvs はカメラアイコンで保存できる。**.mvs は d&d / Load files でも読める**
+(単独なら即適用、画像と同時に落とすと画像の後に適用される)。
 
 ## 7. 保存形式
 

@@ -113,18 +113,24 @@ export const computeVoiStats = (
 export const voiStatsToCsv = (
     stats: VoiStat[],
     meta: { image?: string; template?: string; atlas?: string; unit?: string },
+    /** SUVR 参照領域。指定すると suvr 列 (= mean / 参照 mean) を追加する */
+    suvrRef?: { id: number; name: string; mean: number } | null,
 ): string => {
     const esc = (s: string) => /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     const num = (v: number) => Number.isFinite(v) ? String(+v.toFixed(6)) : '';
+    const refOk = !!suvrRef && Number.isFinite(suvrRef.mean) && suvrRef.mean !== 0;
     const lines: string[] = [];
     if (meta.image) lines.push(`# image,${esc(meta.image)}`);
     if (meta.template) lines.push(`# template,${esc(meta.template)}`);
     if (meta.atlas) lines.push(`# atlas,${esc(meta.atlas)}`);
     if (meta.unit) lines.push(`# unit,${esc(meta.unit)}`);
-    lines.push('id,name,voxels,nan_voxels,volume_ml,mean,sd,min,max');
+    if (refOk) lines.push(`# suvr_reference,${suvrRef!.id},${esc(suvrRef!.name)},mean,${num(suvrRef!.mean)}`);
+    lines.push('id,name,voxels,nan_voxels,volume_ml,mean,sd,min,max' + (refOk ? ',suvr' : ''));
     for (const s of stats) {
-        lines.push([s.id, esc(s.name), s.voxels, s.nanVoxels, num(s.volumeMl),
-                    num(s.mean), num(s.sd), num(s.min), num(s.max)].join(','));
+        const row = [s.id, esc(s.name), s.voxels, s.nanVoxels, num(s.volumeMl),
+                     num(s.mean), num(s.sd), num(s.min), num(s.max)];
+        if (refOk) row.push(num(s.mean / suvrRef!.mean));
+        lines.push(row.join(','));
     }
     return lines.join('\n');
 };

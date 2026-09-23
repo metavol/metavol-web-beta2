@@ -1,4 +1,5 @@
 import { ref, type Ref } from 'vue';
+import { dicomModalityOf } from '../components/dicom2volume';
 import * as THREE from '@/lib/threeMath';
 import { readDicomPixels } from '../components/dicomPixels';
 import { useSegmentationStore } from '../stores/segmentation';
@@ -15,6 +16,8 @@ type Vec3Like = { x: number; y: number; z: number };
 export interface DebugInspectorCtx {
   /** App-bar から toggle される voxel inspector の ON/OFF (defineModel ref) */
   debugMode: Ref<boolean>;
+  /** Shift+Click の voxel 編集を許可するか (debug モードのみ true。hover 表示は debugMode 側で制御) */
+  editEnabled?: Ref<boolean>;
   imageBoxInfos: Ref<any[]>;
   imageBoxW: Ref<number | undefined>;
   imageBoxH: Ref<number | undefined>;
@@ -119,7 +122,7 @@ export function useDebugInspector(ctx: DebugInspectorCtx) {
       // DICOM 直読み行を出す。volume がある場合は volume 行が後段で出る。
       if (ds && !series.volume) {
         const px = readDicomSlicePixelAt(boxId, cx, cy);
-        const mod = (ds.string('x00080060') ?? '').toUpperCase();
+        const mod = dicomModalityOf(ds);
         const desc = ds.string('x0008103e') ?? `S${sIdx}`;
         rows.push({
           seriesIndex: sIdx,
@@ -203,7 +206,7 @@ export function useDebugInspector(ctx: DebugInspectorCtx) {
   };
 
   const handleDebugEditClick = (boxId: number, e: MouseEvent) => {
-    if (!ctx.debugMode.value) return false;
+    if (!(ctx.editEnabled ?? ctx.debugMode).value) return false;
     if (!e.shiftKey) return false;
     if (!ctx.isAnyVolumeBox(boxId) && !ctx.isDicomSliceImageBoxInfo(boxId)) return false;
     const [cx, cy] = ctx.getCanvasXY(e);

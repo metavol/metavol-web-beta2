@@ -257,6 +257,10 @@ const onApplyThreshold = () => {
     }
     store.applyThreshold(r.value);
     store.findIslands();
+    // Apply した人の次の関心は病変一覧なので、折りたたみを自動で開く (ペルソナ HUNTER)。
+    // 実測: 既定折りたたみのままだと表を見るのに毎回 +1 クリックで、
+    // 満足度計測でも「表が出ない」と誤検知するほど気付きにくかった。
+    showLesions.value = true;
     emit('redraw');
 };
 
@@ -339,6 +343,17 @@ const onRectDragEnd = () => {
 
 const onAlphaChange = (val: number) => {
     store.overlayAlpha = val;
+    emit('redraw');
+};
+
+// ラベル色の変更 (swatch クリック → v-color-picker)。
+// v-color-picker は mode='rgb' でも model は hex 文字列 (#RRGGBB / #RRGGBBAA)。
+const rgbToHex = (c: [number, number, number]) =>
+    '#' + c.map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('');
+const onPickLabelColor = (id: number, hex: string | null) => {
+    if (!hex || !/^#[0-9a-fA-F]{6}/.test(hex)) return;
+    const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+    store.setLabelColor(id, [r, g, b]);
     emit('redraw');
 };
 
@@ -528,6 +543,19 @@ const onLoadMaskFiles = async (e: Event) => {
     }
 };
 
+// Lesion 行の選別操作。store 側 (eraseComponent / assignComponentLabel) は
+// manualEdits 経由なので Ctrl+Z で戻せる。表示番号 (i+1) は SUVmax 降順の並び順で、
+// 操作後に振り直されることに注意 (identity は componentId)。
+const onReassignLesion = (l: LesionRow, labelId: number) => {
+    store.assignComponentLabel(l.componentId, labelId, `#${lesionRows.value.findIndex(r => r.componentId === l.componentId) + 1}`);
+    emit('redraw');
+};
+const onDeleteLesion = (l: LesionRow, idx: number) => {
+    store.eraseComponent(l.componentId, `#${idx + 1}`);
+    if (selectedLesion.value?.componentId === l.componentId) selectedLesion.value = null;
+    emit('redraw');
+};
+
 // ===== Lesion table =====
 // finalMask の 26-CC を 1 病変として SUVmax / SUVmean / MTV / TLG / centroid を集計。
 // maskVersion に依存して reactive 更新。3M voxel ≒ 30 ms 想定なので click→Apply 直後でも許容範囲。
@@ -595,7 +623,7 @@ const onExportLesionCsv = () => {
     triggerDownload(blob, `${sid}_lesions_${ts}.csv`);
 };
 
-// マスク内の全 voxel を `island_id label_id x y z value` で書き出す (Persona 1 向け、ユーザ指定様式)。
+// マスク内の全 voxel を `island_id label_id x y z value` で書き出す (Persona HUNTER 向け、ユーザ指定様式)。
 // island_id は「腫瘍だけ取り出して各病変を別々に解析する」ためのもの。
 // **Lesion table / Lesions CSV と同じ番号** (SUVmax 降順、1 = 最大) を振る —
 // componentMap の走査順 id は summarizeLesions の componentId と同一
@@ -909,7 +937,7 @@ defineExpose({
 <template>
     <div class="mv-seg-panel">
         <!-- Rectangle ROI: PET volume 非依存 (2D DICOM slice box でも使える)。
-             Persona 1 の初期表示では不要なので、ROI が 1 つ以上あるときだけ表示する。
+             Persona HUNTER の初期表示では不要なので、ROI が 1 つ以上あるときだけ表示する。
              新規作成はツールバーの Rectangle ROI ツールから行う。 -->
         <section v-if="store.rectRois.length" class="mv-section">
             <div class="mv-section-title">
@@ -1152,7 +1180,27 @@ defineExpose({
                         :title="isLabelVisible(l) ? 'Hide this label on the image' : 'Show this label on the image'"
                         @click="onToggleLabelVisible(l.id)"
                     />
-                    <span class="mv-color-swatch" :style="{ background: `rgb(${l.color[0]},${l.color[1]},${l.color[2]})` }" />
+                    <!-- swatch クリックで色変更 (ユーザ要望)。picker は swatches 主体にして
+                         1 クリックで選べるようにする (HUNTER のクリック数制約)。 -->
+                    <v-menu location="bottom start" :close-on-content-click="false">
+                        <template #activator="{ props: cp }">
+                            <button
+                                type="button"
+                                class="mv-color-swatch mv-color-swatch--btn"
+                                :style="{ background: `rgb(${l.color[0]},${l.color[1]},${l.color[2]})` }"
+                                :title="`Change color of ${l.name}`"
+                                v-bind="cp"
+                            />
+                        </template>
+                        <v-color-picker
+                            :model-value="rgbToHex(l.color)"
+                            :modes="['rgb']"
+                            show-swatches
+                            swatches-max-height="120"
+                            width="260"
+                            @update:model-value="(v: string) => onPickLabelColor(l.id, v)"
+                        />
+                    </v-menu>
                     <button
                         type="button"
                         class="mv-label-row-name"
@@ -1540,6 +1588,7 @@ defineExpose({
                                     <th class="num">SUVmean</th>
                                     <th class="num">MTV<br><span class="mv-th-unit">ml</span></th>
                                     <th class="num">TLG</th>
+                                    <th class="mv-lesion-act-th"></th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -1560,16 +1609,48 @@ defineExpose({
                                     <td class="num mv-mono">{{ l.suvMean.toFixed(3) }}</td>
                                     <td class="num mv-mono">{{ fmtMtv(l.mtvCc) }}</td>
                                     <td class="num mv-mono">{{ fmtTlg(l.tlg) }}</td>
+                                    <!-- 選別操作 (146 病変問題)。行クリックの jump と混線しないよう @click.stop -->
+                                    <td class="mv-lesion-act" @click.stop>
+                                        <v-menu location="bottom end">
+                                            <template #activator="{ props: lp }">
+                                                <button type="button" class="mv-lesion-act-btn" v-bind="lp"
+                                                        title="Reassign or delete this lesion">
+                                                    <v-icon icon="mdi-dots-horizontal" size="x-small" />
+                                                </button>
+                                            </template>
+                                            <v-list density="compact">
+                                                <v-list-item
+                                                    v-for="lab in store.labels"
+                                                    :key="lab.id"
+                                                    :disabled="lab.id === l.labelId"
+                                                    @click="onReassignLesion(l, lab.id)"
+                                                >
+                                                    <template #prepend>
+                                                        <span class="mv-color-swatch"
+                                                              :style="{ background: `rgb(${lab.color[0]},${lab.color[1]},${lab.color[2]})` }" />
+                                                    </template>
+                                                    <v-list-item-title>Set label: {{ lab.name }}</v-list-item-title>
+                                                </v-list-item>
+                                                <v-divider />
+                                                <v-list-item @click="onDeleteLesion(l, i)">
+                                                    <template #prepend><v-icon icon="mdi-delete-outline" size="small" /></template>
+                                                    <v-list-item-title>Delete lesion (Ctrl+Z to undo)</v-list-item-title>
+                                                </v-list-item>
+                                            </v-list>
+                                        </v-menu>
+                                    </td>
                                 </tr>
                             </tbody>
                             <tfoot>
                                 <tr>
                                     <td colspan="2" class="mv-tfoot-label">Total</td>
+                                    <!-- アクション列ぶんの空セルは tfoot 末尾に足す -->
                                     <td class="num mv-mono mv-accent">{{ lesionTotals.maxSuv.toFixed(3) }}</td>
                                     <td class="num mv-mono">—</td>
                                     <td class="num mv-mono">—</td>
                                     <td class="num mv-mono">{{ fmtMtv(lesionTotals.totalMtv) }}</td>
                                     <td class="num mv-mono">{{ fmtTlg(lesionTotals.totalTlg) }}</td>
+                                    <td></td>
                                 </tr>
                             </tfoot>
                         </table>
@@ -2301,6 +2382,15 @@ defineExpose({
     border-radius: 2px;
     flex-shrink: 0;
 }
+/* クリック可能な swatch (ラベル色変更)。button のデフォルト装飾を消し、hover で枠を出す */
+.mv-color-swatch--btn {
+    border: 1px solid transparent;
+    padding: 0;
+    cursor: pointer;
+}
+.mv-color-swatch--btn:hover {
+    border-color: var(--mv-accent);
+}
 /* ④ Save 行: NIfTI mask (主) + Others メニュー (従) */
 .mv-save-row {
     display: flex;
@@ -2588,6 +2678,17 @@ defineExpose({
     font-size: 10px;
     font-family: 'JetBrains Mono', 'Consolas', monospace;
 }
+.mv-lesion-act { width: 26px; text-align: center; }
+.mv-lesion-act-btn {
+    border: none;
+    background: transparent;
+    color: var(--mv-text-muted);
+    border-radius: 3px;
+    cursor: pointer;
+    padding: 0 2px;
+}
+.mv-lesion-act-btn:hover { color: var(--mv-accent); background: rgba(0, 212, 170, 0.15); }
+
 table.mv-lesion-table {
     border-collapse: collapse;
     font-size: 11px;

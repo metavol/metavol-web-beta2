@@ -4,10 +4,10 @@ import { useVoiStore } from '../stores/voi';
 import { useSegmentationStore } from '../stores/segmentation';
 
 // SPM で標準脳へ正規化した画像に VOI テンプレートを重ねて領域統計を出すダイアログ。
-// **Persona 2 (脳 PET の解剖学的標準化 + VOI) の中心機能。**
+// **Persona ATLAS (脳 PET の解剖学的標準化 + VOI) の中心機能。**
 //
-// **右 Inspector には入れない。** あそこは Persona 1 (忙しい医師の MTV 測定) の 4 ステップ動線で、
-// 136 行の表を差し込むと主要フローが埋まり、**クリック数最小という P1 の最優先制約**を壊す。
+// **右 Inspector には入れない。** あそこは Persona HUNTER (忙しい医師の MTV 測定) の 4 ステップ動線で、
+// 136 行の表を差し込むと主要フローが埋まり、**クリック数最小という HUNTER の最優先制約**を壊す。
 // 独立したダイアログにして完全に分離する。
 
 const props = defineProps<{
@@ -27,7 +27,7 @@ const store = useVoiStore();
 const seg = useSegmentationStore();
 
 const selected = ref<number | null>(null);
-const sortKey = ref<'name' | 'volumeMl' | 'mean' | 'sd' | 'max' | 'voxels'>('name');
+const sortKey = ref<'name' | 'volumeMl' | 'mean' | 'sd' | 'max' | 'voxels' | 'suvr'>('name');
 const sortDesc = ref(false);
 const filter = ref('');
 const hideEmpty = ref(false);
@@ -39,6 +39,16 @@ const effectiveIndex = computed(() =>
   ?? (store.analyzedSeriesIndex >= 0 ? store.analyzedSeriesIndex : undefined)
   ?? props.candidates[0]?.index ?? -1);
 
+// SUVR 参照領域。voxel を持つ領域だけ候補に出す (空領域を分母にはできない)。
+const suvrCandidates = computed(() =>
+  store.stats.filter(s => s.voxels > 0 && Number.isFinite(s.mean))
+    .map(s => ({ title: `${s.name} (mean ${s.mean.toFixed(3)})`, value: s.id })));
+const suvrRefMean = computed<number | null>(() => {
+  if (store.suvrRefId == null) return null;
+  const r = store.stats.find(s => s.id === store.suvrRefId);
+  return r && Number.isFinite(r.mean) && r.mean !== 0 ? r.mean : null;
+});
+
 const rows = computed(() => {
   let r = store.stats;
   if (hideEmpty.value) r = r.filter(s => s.voxels > 0);
@@ -46,7 +56,9 @@ const rows = computed(() => {
   if (q) r = r.filter(s => s.name.toLowerCase().includes(q) || String(s.id) === q);
   const k = sortKey.value;
   const dir = sortDesc.value ? -1 : 1;
-  return [...r].sort((a, b) => {
+  const ref = suvrRefMean.value;
+  const withSuvr = r.map(s => ({ ...s, suvr: ref != null ? s.mean / ref : NaN }));
+  return withSuvr.sort((a, b) => {
     if (k === 'name') return dir * a.name.localeCompare(b.name);
     const av = (a as any)[k] as number, bv = (b as any)[k] as number;
     if (!Number.isFinite(av) && !Number.isFinite(bv)) return 0;
@@ -178,6 +190,17 @@ const box = (b: [number, number][] | undefined) =>
           <div class="mv-voi-tools">
             <v-text-field v-model="filter" density="compact" variant="outlined" hide-details
                           placeholder="Filter by region name or id" prepend-inner-icon="mdi-magnify" />
+            <!-- SUVR: 参照領域を選ぶと SUVR 列 (= mean / 参照 mean) が表と CSV に付く。
+                 小脳・橋などを想定。選択は再解析後・別症例でも保持される。 -->
+            <v-autocomplete
+              class="mv-voi-suvr"
+              :model-value="store.suvrRefId"
+              :items="suvrCandidates"
+              density="compact" variant="outlined" hide-details clearable
+              placeholder="SUVR reference region (optional)"
+              prepend-inner-icon="mdi-division"
+              @update:model-value="(v: number | null) => { store.suvrRefId = v; }"
+            />
             <v-checkbox v-model="hideEmpty" density="compact" hide-details label="Hide empty regions" />
             <v-spacer />
             <v-btn size="small" variant="tonal" prepend-icon="mdi-download" @click="emit('exportCsv')">Export CSV</v-btn>
@@ -193,6 +216,7 @@ const box = (b: [number, number][] | undefined) =>
                   <th class="num" @click="setSort('sd')">SD</th>
                   <th class="num">Min</th>
                   <th class="num" @click="setSort('max')">Max</th>
+                  <th v-if="suvrRefMean != null" class="num" @click="setSort('suvr')">SUVR</th>
                 </tr>
               </thead>
               <tbody>
@@ -204,6 +228,7 @@ const box = (b: [number, number][] | undefined) =>
                   <td class="num">{{ num(s.sd) }}</td>
                   <td class="num">{{ num(s.min) }}</td>
                   <td class="num">{{ num(s.max) }}</td>
+                  <td v-if="suvrRefMean != null" class="num">{{ num((s as any).suvr) }}</td>
                 </tr>
               </tbody>
             </table>

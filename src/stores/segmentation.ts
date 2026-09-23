@@ -98,7 +98,7 @@ const DEFAULT_LABEL_PALETTE: Array<[number, number, number]> = [
 
 // 既定ラベルセット (id は 1 から連番)。
 // CLAUDE.md の UI ポリシーに従い英語表記。順序は臨床的によく使う優先度。
-// Persona 1 の運用上 Tumor の次に Physiological (生理的集積の除外) を置く。
+// Persona HUNTER の運用上 Tumor の次に Physiological (生理的集積の除外) を置く。
 // color はラベルごとに明示指定 (palette index には依存しない)。Physiological は水色。
 // 既定は 3 つだけに絞る (多すぎると選択のコストが上がるため)。
 // 部位別 (Lymph / Bone / Lung / Liver …) が要るケースはラベルリスト下端の
@@ -507,6 +507,42 @@ export const useSegmentationStore = defineStore('segmentation', {
             this.commitMaskEdit('Clear threshold');
         },
 
+        // ===== Lesion 単位の選別操作 (ペルソナ HUNTER の 146 病変問題) =====
+        // 病変 = 非ゼロ 26-連結成分 (summarizeLesions の componentId = componentMap の id)。
+        // どちらも manualEdits 経由で書くので通常のマスク編集と同じく undo/redo に載る。
+
+        /** 病変 1 つをマスクから除去する (行の Delete)。 */
+        eraseComponent(componentId: number, displayName?: string): boolean {
+            this.ensureComponentMap();
+            const cm = this.componentMap;
+            const me = this.manualEdits;
+            if (!cm || !me || componentId <= 0) return false;
+            this.beginMaskEdit();
+            for (let i = 0; i < cm.length; i++) {
+                if (cm[i] === componentId) me[i] = ERASE_SENTINEL;
+            }
+            this.recomputeFinalMask();
+            this.invalidateComponentMap();
+            return this.commitMaskEdit(`Delete lesion ${displayName ?? '#' + componentId}`);
+        },
+
+        /** 病変 1 つを別ラベルへ付け替える (行のラベルメニュー)。Tumor → Non-tumor の選別用。 */
+        assignComponentLabel(componentId: number, labelId: number, displayName?: string): boolean {
+            this.ensureComponentMap();
+            const cm = this.componentMap;
+            const me = this.manualEdits;
+            if (!cm || !me || componentId <= 0) return false;
+            if (!this.labels.some(l => l.id === labelId)) return false;
+            this.beginMaskEdit();
+            for (let i = 0; i < cm.length; i++) {
+                if (cm[i] === componentId) me[i] = labelId;
+            }
+            this.recomputeFinalMask();
+            // ラベルが変わるだけで島の形は不変なので componentMap は有効なまま
+            const lname = this.labelById(labelId)?.name ?? `#${labelId}`;
+            return this.commitMaskEdit(`Lesion ${displayName ?? '#' + componentId} → ${lname}`);
+        },
+
         // マスク層を丸ごと空にする (threshold + manual の両方)。MASK カードの Clear 用。
         // 破壊的なので履歴も捨てる (undo で戻す対象が無くなるため)。
         clearMask() {
@@ -722,6 +758,15 @@ export const useSegmentationStore = defineStore('segmentation', {
         renameLabel(id: number, name: string) {
             const l = this.labels.find(x => x.id === id);
             if (l) l.name = name;
+        },
+
+        // ラベル色の手動変更 (ユーザ要望)。maskVersion を bump するのは
+        // (a) overlay の再描画キャッシュを無効化する、(b) 自動保存に色変更を載せる、の 2 つのため。
+        setLabelColor(id: number, color: [number, number, number]) {
+            const l = this.labels.find(x => x.id === id);
+            if (!l) return;
+            l.color = [color[0], color[1], color[2]];
+            this.maskVersion++;
         },
 
         setSphere(centerWorld: THREE.Vector3, radiusMm: number) {

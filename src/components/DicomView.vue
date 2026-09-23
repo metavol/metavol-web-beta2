@@ -33,7 +33,7 @@ import sidebar from "./Sidebar.vue";
 import imagebox from "./ImageBox.vue";
 import { ImageBoxInfoBase, DicomSliceImageBoxInfo, VolumeImageBoxInfo, defaultInfo, pushVolume, FusedVolumeImageBoxInfo, makeMipState } from "./DicomImageBoxInfo";
 import { getAllFilesRecursive } from "./DragAndDropUtil";
-import { generateVolumeFromDicom } from './dicom2volume.ts';
+import { generateVolumeFromDicom, dicomModalityOf } from './dicom2volume.ts';
 import { readDicomPixels, readDicomPixelsAsInt16, autoWindowFromPixels } from './dicomPixels.ts';
 import * as DecompressJpegLossless from "./decompressJpegLossless";
 import { getSeriesTransferSyntaxInfo } from "./transferSyntax";
@@ -246,6 +246,8 @@ interface Nii {
 type OtherFile = Uint8Array;
 
 let bagOfFiles: (MyDicom | Nii | OtherFile)[];
+// 画像と同じ drop に入っていた .mvs (snapshot)。画像の読み込み完了後に適用する。
+const pendingSnapshotFiles: File[] = [];
 
 const selectedImageBoxId = ref(0);
 const isLoading = ref(false);
@@ -287,9 +289,15 @@ export interface SeriesSummary {
 }
 const seriesSummaries = ref<SeriesSummary[]>([]);
 
-// ===== デバッグ機能 =====
-// Voxel inspector (旧 debugMode) — App-bar からも toggle 可能なよう defineModel で公開
+// ===== Voxel probe / デバッグ機能 =====
+// **probe と debug を分離してある (2026-09, ユーザ要望「inspector は普通の機能」)。**
+//   probeMode : hover で voxel 値を読むだけの通常機能。App-bar のメニューから toggle。
+//   debugMode : 開発者向け (Ctrl+Shift+D / ?debug=1)。probe に加えて Shift+Click の
+//               voxel 編集と赤い DEBUG バッジが付く。
+const probeMode = defineModel<boolean>('probeMode', { default: false });
 const debugMode = defineModel<boolean>('debugMode', { default: false });
+// hover 表示はどちらでも有効。編集は debugMode のみ。
+const inspectorHoverOn = computed(() => probeMode.value || debugMode.value);
 // Voxel inspector 本体 (hover 情報収集 / マスク層読み取り / shift+click 編集) は
 // useDebugInspector composable に分離。ref 群と関数はこの下の方 (deps 定義後) で
 // 生成し、debugShow など再エクスポートする。
@@ -317,6 +325,20 @@ const applyAutoFit = () => {
 //                     複数指定: ?url=u1&url=u2 もしくは ?url=u1,u2 (カンマ区切り)
 //                     CORS 必須: ホスト側で Access-Control-Allow-Origin を返すこと
 // Ctrl+Shift+D で voxel inspector を toggle
+// 不用意なタブ閉じ / リロードでの作業消失ガード (ユーザ要望)。
+// series を 1 つでも読み込んでいたら確認ダイアログを出す。mask の有無まで見ないのは、
+// 大きな症例では読み込み自体に数分掛かっており「開き直し」も損失だから。
+// 自動保存 (IndexedDB) はあるが、view 状態や undo 履歴までは戻らない。
+// なお beforeunload のダイアログはブラウザ仕様で「ユーザ操作があったタブ」でしか出ない。
+const onBeforeUnloadGuard = (e: BeforeUnloadEvent) => {
+  if (seriesList.length === 0) return;
+  e.preventDefault();
+  // Chrome は preventDefault だけで出るが、旧仕様のブラウザは returnValue が必要
+  e.returnValue = '';
+};
+window.addEventListener('beforeunload', onBeforeUnloadGuard);
+onUnmounted(() => window.removeEventListener('beforeunload', onBeforeUnloadGuard));
+
 onMounted(() => {
   // Parity test 用 window globals: Playwright や DevTools console から叩ける。
   // - isReady(): 全ボックスが描画準備完了か
@@ -444,9 +466,22 @@ onMounted(() => {
     if (p.get('debug') === '1') debugMode.value = true;
     const devCase = p.get('dev');
     if (devCase) loadDevCase(devCase);
-    // ?demo=<id>: production-build にも入る公開デモデータ (public/demo/<id>/manifest.json)
+    // ?demo=<id>: production-build にも入る公開デモデータ (public/demo/<id>/manifest.json)。
+    // **予約 id 'phantom' / 'phantom-petct' はブラウザ内でファントムを生成する** —
+    // 実データを配布せずに「リンク 1 つで動くデモ」を成立させるため (Persona COURIER)。
     const demoCase = p.get('demo');
-    if (demoCase) loadDemoCase(demoCase);
+    if (demoCase === 'phantom' || demoCase === 'phantom-petct') {
+      void phantomWholeBodyPetCt();
+    } else if (demoCase === 'phantom-nema') {
+      phantomNema();
+    } else if (demoCase) {
+      loadDemoCase(demoCase);
+    }
+    // ?mvs=<url>: 共有された snapshot (.mvs) を **データ読み込み完了後に**適用する。
+    // view 状態を URL 自体へ埋め込む方式は撤去済み (壊れやすく、ユーザ指定で snapshot 方式へ移行)。
+    // 「データは ?url=/?demo=/?dev=、見え方は ?mvs=」の分担で 1 リンク共有が完成する。
+    const mvsUrl = p.get('mvs');
+    if (mvsUrl) applySnapshotFromUrlWhenLoaded(mvsUrl);
     // ?test=parity: multiplebonemets を auto load + PET Standard layout を組む
     if (p.get('test') === 'parity') {
       // ロード→自動レイアウトが終わってから PET Standard を強制起動。
@@ -572,6 +607,31 @@ const loadDevCase = async (caseId: string) => {
 //   public/demo/<id>/manifest.json   → { "files": ["ct.nii.gz", "pet.nii.gz"], "description": "..." }
 //   public/demo/<id>/<file>          → 実体
 // dev-case と違い vite middleware を通さず static 配信なので GitHub Pages でも動く。
+// ?mvs=<url>: 最初のデータ読み込みが終わってから snapshot を取りに行って適用する。
+// 即時に適用しないのは、snapshot の view/mask が「シリーズが載っている」前提だから
+// (mask 復元は seriesUID 照合、box は series index 参照)。
+const applySnapshotFromUrlWhenLoaded = (u: string) => {
+  const stop = watch(isLoading, (v) => {
+    if (v !== false) return;
+    stop();
+    // autoLayout / 初回描画が落ち着いてから適用する (適用直後に layout が上書きしないように)
+    setTimeout(async () => {
+      try {
+        const r = await fetch(u);
+        if (!r.ok) {
+          console.warn(`[mvs] fetch failed (HTTP ${r.status}): ${u}`);
+          return;
+        }
+        const res = applySnapshotJson(await r.text());
+        if (res.ok) console.log(`[mvs] applied: ${res.info}`);
+        else console.warn(`[mvs] apply failed: ${res.reason}`);
+      } catch (err) {
+        console.warn('[mvs] failed', err);
+      }
+    }, 800);
+  });
+};
+
 // base path は import.meta.env.BASE_URL を使う (vite.config.mts の base= '/metavol-web-beta2/')。
 const loadDemoCase = async (caseId: string) => {
   try {
@@ -612,7 +672,7 @@ const loadDemoCase = async (caseId: string) => {
   }
 };
 
-// 外部 URL (?url=https://...) から fetch + loadFiles。Persona 3 (quick viewer) 用 shareable link。
+// 外部 URL (?url=https://...) から fetch + loadFiles。Persona COURIER (quick viewer) 用 shareable link。
 // CORS 必須。ホストが Access-Control-Allow-Origin を返さないと fetch 失敗する。
 // 複数 URL を並列 fetch (concurrency=4)、すべて File 化してから一括 loadFiles。
 const loadFromExternalUrls = async (urls: string[]) => {
@@ -863,7 +923,7 @@ const getBoxModalityLabel = (i: number): string => {
     const info = infoAny as DicomSliceImageBoxInfo;
     const s = seriesList[info.currentSeriesNumber];
     if (s && s.myDicom && s.myDicom.length > 0) {
-      const m = (s.myDicom[0].string('x00080060') ?? '').toUpperCase();
+      const m = dicomModalityOf(s.myDicom[0]);
       if (m === 'PT' || m === 'PET') return 'PT';
       if (m === 'CT' || m === 'MR') return m;
     }
@@ -936,7 +996,7 @@ const getBoxPetDisplayMul = (id: number): number => {
   if (sIdx == null || sIdx < 0 || sIdx >= seriesList.length) return 1;
   const series = seriesList[sIdx];
   const mod = series?.volume?.metadata?.modality
-    ?? (series?.myDicom?.[0]?.string('x00080060') ?? '');
+    ?? dicomModalityOf(series?.myDicom?.[0]);
   return petDisplayMul(mod, series?.volume?.metadata?.suvFactor, series?.volume?.metadata?.suvOk);
 };
 
@@ -952,7 +1012,7 @@ const getBoxLegend = (i: number): ClutLegend | undefined => {
     const wc = info.myWC ?? Number(ds.string('x00281050', 0) ?? '0');
     const ww = info.myWW ?? Number(ds.string('x00281051', 0) ?? '1');
     if (!isFinite(wc) || !isFinite(ww) || ww <= 0) return undefined;
-    const mod = (ds.string('x00080060') ?? '').toUpperCase();
+    const mod = dicomModalityOf(ds);
     // DICOM 2D box: volume 未生成段階では DICOM タグ (0028,0051) Corrected Image から
     // 直接 NAC 判定 (PT で ATTN を含まない → suvOk=false)
     let suvOk = series?.volume?.metadata?.suvOk;
@@ -971,7 +1031,7 @@ const getBoxLegend = (i: number): ClutLegend | undefined => {
     const f = info as FusedVolumeImageBoxInfo;
     const baseSeries = seriesList[f.currentSeriesNumber];
     const baseMod = baseSeries?.volume?.metadata?.modality
-      ?? (baseSeries?.myDicom?.[0]?.string('x00080060') ?? '').toUpperCase();
+      ?? dicomModalityOf(baseSeries?.myDicom?.[0]);
     const baseSuvOk = baseSeries?.volume?.metadata?.suvOk;
     const baseMul = petDisplayMul(baseMod, baseSeries?.volume?.metadata?.suvFactor, baseSuvOk);
     return buildClutLegend(f.clut, f.myWC! * baseMul, f.myWW! * baseMul, suffixForModality(baseMod, baseSuvOk));
@@ -979,7 +1039,7 @@ const getBoxLegend = (i: number): ClutLegend | undefined => {
   // Volume / MIP box
   const series = seriesList[info.currentSeriesNumber];
   const mod = series?.volume?.metadata?.modality
-    ?? (series?.myDicom?.[0]?.string('x00080060') ?? '').toUpperCase();
+    ?? dicomModalityOf(series?.myDicom?.[0]);
   const suvOk = series?.volume?.metadata?.suvOk;
   const mul = petDisplayMul(mod, series?.volume?.metadata?.suvFactor, suvOk);
   return buildClutLegend(info.clut, info.myWC! * mul, info.myWW! * mul, suffixForModality(mod, suvOk));
@@ -1037,7 +1097,7 @@ const cornerInfoFor = (i: number): CornerInfo | undefined => {
   const patientName = (firstDs.string('x00100010') ?? '').replace(/\^/g, ' ').trim();
   const patientId   = firstDs.string('x00100020') ?? '';
   const studyDate   = formatDicomDate(firstDs.string('x00080020'));
-  const modality    = (firstDs.string('x00080060') ?? '').toUpperCase();
+  const modality    = dicomModalityOf(firstDs);
   const seriesDesc  = firstDs.string('x0008103e') ?? '';
 
   const tl: string[] = [];
@@ -1077,7 +1137,7 @@ const getBoxLegend2 = (i: number): ClutLegend | undefined => {
   if (f.myWC1 == null || f.myWW1 == null) return undefined;
   const petSeries = seriesList[f.currentSeriesNumber1];
   const petMod = petSeries?.volume?.metadata?.modality
-    ?? (petSeries?.myDicom?.[0]?.string('x00080060') ?? '').toUpperCase();
+    ?? dicomModalityOf(petSeries?.myDicom?.[0]);
   const petSuvOk = petSeries?.volume?.metadata?.suvOk;
   const mul = petDisplayMul(petMod, petSeries?.volume?.metadata?.suvFactor, petSuvOk);
   return buildClutLegend(f.clut1, f.myWC1! * mul, f.myWW1! * mul, suffixForModality(petMod, petSuvOk));
@@ -1409,14 +1469,14 @@ const getBoxBaseModality = (i: number): string => {
   const f = imageBoxInfos.value[i] as FusedVolumeImageBoxInfo;
   const s = seriesList[f.currentSeriesNumber];
   return (s?.volume?.metadata?.modality
-    ?? (s?.myDicom?.[0]?.string('x00080060') ?? '')).toUpperCase();
+    ?? dicomModalityOf(s?.myDicom?.[0])).toUpperCase();
 };
 const getBoxOverlayModality = (i: number): string => {
   if (!isFusedImageBoxInfo(i)) return '';
   const f = imageBoxInfos.value[i] as FusedVolumeImageBoxInfo;
   const s = seriesList[f.currentSeriesNumber1];
   return (s?.volume?.metadata?.modality
-    ?? (s?.myDicom?.[0]?.string('x00080060') ?? '')).toUpperCase();
+    ?? dicomModalityOf(s?.myDicom?.[0])).toUpperCase();
 };
 const getBoxOverlayClut = (i: number): number | undefined => {
   if (!isFusedImageBoxInfo(i)) return undefined;
@@ -1786,7 +1846,7 @@ const loadVoiTemplateFiles = async (files: File[]): Promise<{ ok: boolean; messa
     // overlay は `labelOf` (割り当て結果) が無いと描けず、それを作るのは runVoiAnalysis だけ。
     // 以前はここで止まっていたので、**テンプレートが画像に合っているかを目視で確かめられなかった**
     // (Run を押すまで何も重ならない)。ユーザが最初に知りたいのは「合っているか」なので、
-    // 読み込み = 確認、にする。ついでに Persona 1 と同じくクリックも 1 つ減る。
+    // 読み込み = 確認、にする。ついでに Persona HUNTER と同じくクリックも 1 つ減る。
     // 対象は「選択中 box が映しているシリーズ」を優先し、候補外なら先頭の候補。
     const cands = voiCandidateSeries();
     if (cands.length > 0) {
@@ -1869,12 +1929,15 @@ const runVoiAnalysis = (seriesIndex: number): { ok: boolean; message: string } =
 
 const downloadVoiCsv = () => {
   if (!voiStore.stats.length) return;
+  // SUVR 参照 (選択されていれば suvr 列が付く)。参照 mean は表と同じ stats から引く。
+  const refStat = voiStore.suvrRefId != null
+    ? voiStore.stats.find(r => r.id === voiStore.suvrRefId) : undefined;
   const csv = '﻿' + voiStatsToCsv(voiStore.stats, {
     image: voiStore.analyzedLabel,
     template: voiStore.template?.sourceName,
     atlas: voiStore.template?.header?.name,
     unit: voiStore.analyzedUnit,
-  });
+  }, refStat ? { id: refStat.id, name: refStat.name, mean: refStat.mean } : null);
   const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 15);
   triggerDownload(new Blob([csv], { type: 'text/csv;charset=utf-8' }), `voi_${ts}.csv`);
 };
@@ -2221,7 +2284,7 @@ const modalityOfSeries = (idx: number): string => {
   const s = seriesList[idx];
   if (!s) return '';
   const dl = s.myDicom;
-  if (dl && dl.length > 0) return (dl[0].string('x00080060') ?? '').toUpperCase();
+  if (dl && dl.length > 0) return dicomModalityOf(dl[0]);
   return (s.volume?.metadata?.modality ?? '').toUpperCase();
 };
 
@@ -2261,7 +2324,7 @@ const selectedBoxModality = computed<string>(() => {
   const s = seriesList[sIdx];
   if (!s) return '';
   const dl = s.myDicom;
-  if (dl && dl.length > 0) return (dl[0].string('x00080060') ?? '').toUpperCase();
+  if (dl && dl.length > 0) return dicomModalityOf(dl[0]);
   return (s.volume?.metadata?.modality ?? '').toUpperCase();
 });
 
@@ -2310,7 +2373,7 @@ const applyTracerPreset = (preset: TracerPreset) => {
     if (v?.metadata?.modality === 'PT') return true;
     // volume 未生成でも DICOM タグだけは確認できる
     const dlist = seriesList[idx].myDicom;
-    const m = dlist?.[0]?.string("x00080060")?.toUpperCase();
+    const m = dicomModalityOf(dlist?.[0]);
     return m === 'PT' || m === 'PET';
   };
 
@@ -2963,7 +3026,7 @@ const seriesModality = (idx: number): string => {
   const s = seriesList[idx];
   if (!s) return '';
   const dl = s.myDicom;
-  if (dl && dl.length > 0) return (dl[0].string('x00080060') ?? '').toUpperCase();
+  if (dl && dl.length > 0) return dicomModalityOf(dl[0]);
   return (s.volume?.metadata?.modality ?? '').toUpperCase();
 };
 const isPtModality = (m: string) => m === 'PT' || m === 'PET';
@@ -3262,8 +3325,8 @@ const mouseMove = (e: MouseEvent) => {
   const id = getIdOfEventOccured(e);
   const infoV = getVolumeImageBoxInfo;
 
-  // デバッグ: マウス位置の voxel 値を更新
-  if (debugMode.value && e.buttons === 0){
+  // Voxel probe: マウス位置の voxel 値を更新 (probe / debug のどちらかが ON のとき)
+  if (inspectorHoverOn.value && e.buttons === 0){
     updateDebugHover(id, e);
   }
 
@@ -4351,7 +4414,7 @@ const loadFile = async (file: File) => {
 // innermost dim → screen X (左→右)、middle → screen Y (上→下)、outermost → paging。
 // modality / SUV factor も無視 (raw counts そのまま)。
 // WC/WW は voxel min/max を簡易サンプリング (10000 step) で推定。
-// Persona 3 (NIfTI orientation 検証) 用。
+// Persona COURIER (NIfTI orientation 検証) 用。
 // NIfTI header dialog 用 reactive state (volume card の "..." メニュー → "View NIfTI header")
 const niftiHeaderDialog = ref<{
   open: boolean;
@@ -4586,7 +4649,23 @@ const onHiddenLoadInputChange = (e: Event) => {
 };
 
 const loadFiles = (files: FileList | File[]) => {
-  const localFileList = Array.from(files);
+  let localFileList = Array.from(files);
+  if (localFileList.length === 0) return;
+
+  // **.mvs (snapshot) も同じ入口で受ける** (画像・マスクと同じ「読み込みの入口は 1 つ」原則)。
+  // 画像と一緒に落とされたら、画像の読み込み完了後に適用する (view/mask はシリーズ前提)。
+  // .mvs 単独ならその場で適用する。
+  const snapshotFiles = localFileList.filter(f => /\.mvs$/i.test(f.name));
+  localFileList = localFileList.filter(f => !/\.mvs$/i.test(f.name));
+  if (snapshotFiles.length > 0 && localFileList.length === 0) {
+    for (const f of snapshotFiles) {
+      void loadSnapshotFile(f).then(res => {
+        if (!res.ok) alert(`Snapshot "${f.name}": ${res.reason}`);
+      });
+    }
+    return;
+  }
+  if (snapshotFiles.length > 0) pendingSnapshotFiles.push(...snapshotFiles);
   if (localFileList.length === 0) return;
 
   // 既に series が存在する場合は append モード: 既存 box / sync 状態を保持し、
@@ -4631,6 +4710,19 @@ const loadFiles = (files: FileList | File[]) => {
       if (seriesList.length > 0) drawer.value = true;
       show();
       isLoading.value = false;
+      // 同じ drop に入っていた .mvs (snapshot) を、画像が載った後に適用する。
+      // 少し待つのは autoLayout / 初回描画の後に view を上書きさせるため (?mvs= と同じ理由)。
+      if (pendingSnapshotFiles.length > 0) {
+        const toApply = pendingSnapshotFiles.splice(0, pendingSnapshotFiles.length);
+        setTimeout(() => {
+          for (const f of toApply) {
+            void loadSnapshotFile(f).then(res => {
+              if (!res.ok) alert(`Snapshot "${f.name}": ${res.reason}`);
+              else console.log(`[snapshot d&d] applied: ${res.info}`);
+            });
+          }
+        }, 800);
+      }
       // 背景で全 JPEG Lossless frame を decompress。完了後にサムネ再生成 + 再描画。
       decompressAllJpegLossless().then(() => {
         rebuildSeriesSummaries();
@@ -5580,7 +5672,8 @@ const {
   updateDebugHover,
   handleDebugEditClick,
 } = useDebugInspector({
-  debugMode,
+  debugMode: inspectorHoverOn,   // hover 表示のゲート (probe または debug)
+  editEnabled: debugMode,        // Shift+Click 編集は debug のみ
   imageBoxInfos,
   imageBoxW,
   imageBoxH,
@@ -5601,6 +5694,7 @@ const {
 const {
   downloadSnapshotFile,
   loadSnapshotFile,
+  applySnapshotJson,
 } = useSnapshotIo({
   tileN,
   imageBoxInfos,
@@ -5845,7 +5939,7 @@ const rebuildSeriesSummaries = () => {
     if (s.myDicom && s.myDicom.length > 0){
       const ds = s.myDicom[0];
       description = ds.string("x0008103e") ?? '';
-      modality = (ds.string("x00080060") ?? '').toUpperCase();
+      modality = dicomModalityOf(ds);
       const rows = ds.int16("x00280010") ?? 0;
       const cols = ds.int16("x00280011") ?? 0;
       matrixSize = `${rows}×${cols}×${s.myDicom.length}`;
@@ -5962,7 +6056,7 @@ const detectPetCtFromDicom = () => {
     let m = '';
     const dlist = seriesList[i].myDicom;
     if (dlist && dlist.length > 0) {
-      m = (dlist[0].string("x00080060") ?? "").toUpperCase();
+      m = dicomModalityOf(dlist[0]);
     } else {
       m = (seriesList[i].volume?.metadata?.modality ?? '').toUpperCase();
     }
@@ -6518,7 +6612,7 @@ const getPetCtSeriesCandidates = (): { pt: SeriesCand[]; ct: SeriesCand[] } => {
     let m = '';
     const dlist = seriesList[i].myDicom;
     if (dlist && dlist.length > 0) {
-      m = (dlist[0].string("x00080060") ?? '').toUpperCase();
+      m = dicomModalityOf(dlist[0]);
     } else {
       m = (seriesList[i].volume?.metadata?.modality ?? '').toUpperCase();
     }
@@ -6773,7 +6867,7 @@ const findBaseSeriesIndexForFusion = (): { idx: number; modality: 'CT' | 'MR' } 
   let ctIdx = -1, mrIdx = -1;
   for (let i = 0; i < seriesList.length; i++) {
     const v = seriesList[i].volume;
-    const tag = (seriesList[i].myDicom?.[0]?.string('x00080060') ?? '').toUpperCase();
+    const tag = dicomModalityOf(seriesList[i].myDicom?.[0]);
     const m = v?.metadata?.modality ?? tag;
     if (m === 'CT' && ctIdx < 0) ctIdx = i;
     if (m === 'MR' && mrIdx < 0) mrIdx = i;
@@ -6865,7 +6959,7 @@ const setupCompare2up = async () => {
   for (let i = 0; i < seriesList.length; i++) {
     const v = seriesList[i].volume;
     const m = (v?.metadata?.modality)
-      ?? ((seriesList[i].myDicom?.[0]?.string('x00080060') ?? '').toUpperCase() === 'PT' ? 'PT' : '');
+      ?? (dicomModalityOf(seriesList[i].myDicom?.[0]) === 'PT' ? 'PT' : '');
     if (m === 'PT' || m === 'PET') ptIdxs.push(i);
   }
   let leftIdx: number, rightIdx: number, leftDesc: string, rightDesc: string;
@@ -6880,7 +6974,7 @@ const setupCompare2up = async () => {
     let ctIdx = -1, petIdx = -1;
     for (let i = 0; i < seriesList.length; i++) {
       const dl = seriesList[i].myDicom;
-      const m = (dl?.[0]?.string('x00080060') ?? '').toUpperCase();
+      const m = dicomModalityOf(dl?.[0]);
       if (m === 'CT' && ctIdx < 0) ctIdx = i;
       if ((m === 'PT' || m === 'PET') && petIdx < 0) petIdx = i;
     }
@@ -7087,7 +7181,7 @@ defineExpose({
   // App-bar ハンバーガー用: Segmentation panel の save/load パススルー
   segLoadMask: () => segPanelRef.value?.loadMask?.(),
   segExportPdf: () => segPanelRef.value?.exportPdf?.(),
-  // NIfTI raw byte view (Persona 3 デバッグ用)
+  // NIfTI raw byte view (Persona COURIER デバッグ用)
   inspectNiftiRaw,
   getNiftiSeriesList,
   // PET Standard ピッカー UI 用 (App.vue):
@@ -7238,7 +7332,7 @@ defineExpose({
           ref="hiddenLoadInput"
           type="file"
           multiple
-          accept=".dcm,.nii,.nii.gz,.gz,application/dicom,application/octet-stream"
+          accept=".dcm,.nii,.nii.gz,.gz,.mvs,application/dicom,application/octet-stream"
           style="display: none"
           @change="onHiddenLoadInputChange"
         />
@@ -7252,7 +7346,8 @@ defineExpose({
       </span>
       <span class="mv-imagearea-empty-hint mv-empty-link-hint">
         Remote: pass DICOM/NIfTI as <code>?url=https://your-host/scan.nii.gz</code>
-        (multiple <code>?url=</code> params allowed; CORS-permitted hosts only)
+        (multiple <code>?url=</code> params allowed; CORS-permitted hosts only).
+        Add <code>&amp;mvs=…</code> to restore a saved view (.mvs), or try <code>?demo=phantom</code>
       </span>
     </div>
     <div class="mv-tile-grid" :class="{ 'is-no-gap': noGapMode }" :style="gridStyle">
@@ -7356,7 +7451,8 @@ defineExpose({
 
     <!-- Debug: voxel hover inspector -->
     <DebugInspector
-      :enabled="debugMode"
+      :enabled="inspectorHoverOn"
+      :can-edit="debugMode"
       :rows="debugHoverRows"
       :mask="debugMaskInfo"
       :world="debugWorld"

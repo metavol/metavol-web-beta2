@@ -1,5 +1,5 @@
 // View state を URL query (?state=...) に encode/decode するユーティリティ。
-// 用途: Persona 3 (link share) と Persona 1 (PR 発表時のスクリーン再現) 両方。
+// 用途: Persona COURIER (link share) と Persona HUNTER (PR 発表時のスクリーン再現) 両方。
 //
 // 制約:
 //   - file ロードは別経路 (?url=... or ?dev=... or ?demo=...)。state は layout のみ。

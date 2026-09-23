@@ -30,6 +30,19 @@ npm run dev
 - `npm run build` — 型チェック + 本番ビルド
 - `npm run preview` — `dist/` のプレビュー
 
+## 対応ブラウザ
+
+| ブラウザ | 表示 | 備考 |
+|---|---|---|
+| **Chrome / Edge (最新)** | ◎ 推奨 | WebGPU 描画。全機能が使える |
+| Firefox (最新) | ○ | WebGPU が無効な環境では CPU 描画に自動フォールバック (大きな volume では遅い)。**Test ボタン (フォルダ選択) は使えない** (File System Access API 非対応) — drag & drop / Load files… は使える |
+| Safari (最新) | ○ | 同上 |
+
+実装依存の内訳:
+- **WebGPU** — slice/MIP/VR 描画の高速化。無ければ CPU 描画に自動フォールバック (機能は同じ)
+- **File System Access API** — app-bar の Test ボタン (フォルダ選択) のみ。Chrome/Edge 限定
+- **DecompressionStream / CompressionStream** — .nii.gz の読み書き。非対応環境は fflate に自動フォールバック
+
 ## 使い方の詳細
 
 [USAGE.md](./USAGE.md) を参照。

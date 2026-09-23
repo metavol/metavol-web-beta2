@@ -30,7 +30,7 @@
               ref="appBarLoadInput"
               type="file"
               multiple
-              accept=".dcm,.nii,.nii.gz,.gz,application/dicom,application/octet-stream"
+              accept=".dcm,.nii,.nii.gz,.gz,.mvs,application/dicom,application/octet-stream"
               style="display: none"
               @change="onAppBarLoadInputChange"
             />
@@ -211,7 +211,7 @@
 
             <v-divider />
 
-            <!-- Inspect NIfTI raw bytes (Persona 3 デバッグ用): NIfTI series が 1 つ以上あるときだけ表示 -->
+            <!-- Inspect NIfTI raw bytes (Persona COURIER デバッグ用): NIfTI series が 1 つ以上あるときだけ表示 -->
             <v-menu v-if="niftiSeriesList.length > 0" location="end">
               <template v-slot:activator="{ props: act }">
                 <v-list-item v-bind="act">
@@ -568,7 +568,7 @@
               <v-icon icon="mdi-eyedropper" size="small" :color="voxelInspector ? 'primary' : undefined" />
             </template>
             <v-list-item-title>{{ voxelInspector ? 'Voxel inspector ON' : 'Voxel inspector OFF' }}</v-list-item-title>
-            <v-list-item-subtitle>Hover to read voxel values (Ctrl+Shift+D)</v-list-item-subtitle>
+            <v-list-item-subtitle>Hover to read voxel values in every series</v-list-item-subtitle>
           </v-list-item>
           <v-list-item @click="showOverlayInfo = !showOverlayInfo">
             <template v-slot:prepend>
@@ -755,7 +755,7 @@
         v-model:tileN="tileN"
         v-model:syncImageBox="syncImageBox"
         v-model:closingImages="closingImages"
-        v-model:debugMode="voxelInspector"
+        v-model:probeMode="voxelInspector"
         v-model:showOverlayInfo="showOverlayInfo"
         v-model:noGapMode="noGapMode"
       />
@@ -814,7 +814,7 @@
       @recoverSlices="dicomViewRef?.recoverSlices?.()"
     />
 
-    <!-- SPM 標準脳変換 + VOI テンプレート解析。Persona 1 の動線を汚さないよう独立ダイアログ。 -->
+    <!-- SPM 標準脳変換 + VOI テンプレート解析。Persona HUNTER の動線を汚さないよう独立ダイアログ。 -->
     <VoiAnalysisDialog
       v-model:open="voiOpen"
       :candidates="voiCandidates"
@@ -1352,7 +1352,7 @@ const mrRegPercent = computed(() => {
   return Math.min(100, (p.level / p.nLevels) * 100);
 });
 
-// NIfTI raw byte view (Persona 3 / orientation 検証用)
+// NIfTI raw byte view (Persona COURIER / orientation 検証用)
 const niftiSeriesList = computed<Array<{ idx: number; description: string }>>(() => {
   const r = dicomViewRef.value;
   if (!r?.getNiftiSeriesList) return [];

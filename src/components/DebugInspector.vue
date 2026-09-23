@@ -1,6 +1,8 @@
 <script setup lang="ts">
 defineProps<{
     enabled: boolean;
+    /** Shift+Click 編集が使える状態か (debug モード)。false なら編集ヒントを出さない */
+    canEdit?: boolean;
     rows: Array<{
         seriesIndex: number;
         modality: string;
@@ -34,9 +36,9 @@ defineProps<{
         :style="{ left: (screenX + 16) + 'px', top: (screenY + 16) + 'px' }"
     >
         <div class="hdr">
-            <v-icon icon="mdi-bug-outline" size="x-small" />
+            <v-icon :icon="canEdit ? 'mdi-bug-outline' : 'mdi-eyedropper'" size="x-small" />
             <span class="ml-1">voxel inspector</span>
-            <span class="hdr-hint ml-2">Shift+Click to edit</span>
+            <span v-if="canEdit" class="hdr-hint ml-2">Shift+Click to edit</span>
         </div>
         <div v-if="world" class="world-row mono">
             <span class="world-label">world (mm)</span>

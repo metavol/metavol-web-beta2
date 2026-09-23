@@ -304,6 +304,45 @@ try {
     }
   }
 
+  // --- ⑥ SUVR (参照領域比) ---
+  // 参照に Brain Stem (id 35) を UI の autocomplete で選び、表に SUVR 列が出ること、
+  // CSV の suvr 列 = mean / 参照 mean になっていること (id 44 で検算) を見る。
+  {
+    const ac = dlg.locator('.mv-voi-suvr input').first();
+    await ac.click();
+    await ac.fill('Brain Stem');
+    await page.waitForTimeout(800);
+    await page.locator('.v-overlay .v-list-item', { hasText: 'Brain Stem' }).first().click();
+    await page.waitForTimeout(800);
+    check(await dlg.locator('.mv-voi-table thead th', { hasText: 'SUVR' }).count() === 1,
+          'SUVR 参照を選ぶと表に SUVR 列が出る');
+
+    const dlS = page.waitForEvent('download', { timeout: 60000 }).catch(() => null);
+    await dlg.locator('button', { hasText: 'Export CSV' }).first().click();
+    const downloadS = await dlS;
+    check(!!downloadS, 'SUVR 選択後の Export CSV でダウンロードが起きる');
+    if (downloadS) {
+      const text = readFileSync(await downloadS.path(), 'utf-8').replace(/^\ufeff/, '');
+      const lines = text.split('\n');
+      const header = lines.find(l => l.startsWith('id,'));
+      check(header === 'id,name,voxels,nan_voxels,volume_ml,mean,sd,min,max,suvr',
+            'CSV に suvr 列が付く', header ?? '(なし)');
+      check(lines.some(l => l.startsWith('# suvr_reference,35,')),
+            'メタ行に参照領域 (id 35) が記録される');
+      const pick = (idWant) => {
+        const l = lines.find(x => x.startsWith(idWant + ','));
+        if (!l) return null;
+        const f = l.split(',');
+        return { mean: Number(f[5]), suvr: Number(f[9]) };
+      };
+      const refRow = pick(35), row44 = pick(44);
+      const expected = refRow && row44 ? row44.mean / refRow.mean : NaN;
+      check(!!row44 && Math.abs(row44.suvr - expected) < 1e-5,
+            'suvr = mean / 参照 mean (id 44 で検算)', `${row44?.suvr} vs ${expected.toFixed(6)}`);
+      check(!!refRow && Math.abs(refRow.suvr - 1) < 1e-6, '参照領域自身の suvr = 1');
+    }
+  }
+
   console.log(`\n  ダイアログ: ${dialogs.length ? JSON.stringify(dialogs) : 'なし'}`);
   console.log(`  console error: ${errors.length ? errors.length + ' 件' : 'なし'}`);
   if (errors.length) failed = true;

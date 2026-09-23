@@ -41,23 +41,23 @@
 
 ## 戦略: 4 ペルソナのエンドツーエンド完成
 
-### Persona 1: PET/CT segmentation (オーソドックスユーザ)
+### Persona HUNTER: PET/CT segmentation (オーソドックスユーザ)
 DICOM ロード → PET Standard → SUV threshold → manual ROI 編集 → MTV/TLG 測定 → NIfTI 保存
 - 現状 90% 完成。Inspector の polygon ROI / Sphere ROI / Labels / Histogram / Save 動線あり
 - 残: lesion 一覧の export 改善、レポート出力 (Phase 2)
 
-### Persona 2: 脳 PET の解剖学的標準化 + VOI テンプレート (2026-08 新設)
+### Persona ATLAS: 脳 PET の解剖学的標準化 + VOI テンプレート (2026-08 新設)
 
 正規化 (MATLAB/SPM) は各自の PC。metavol-web は **DICOM→NIfTI** と
 **正規化済み NIfTI + VOI テンプレート → 領域値** を担う。実装済み (CLAUDE.md 参照)。
 
-### Persona 3: Quick viewer (DICOM/NIfTI さっと見たい)
+### Persona COURIER: Quick viewer (DICOM/NIfTI さっと見たい)
 URL クリック → ロード → 見て閉じる
 - 現状 70% 完成。ファイル D&D / NIfTI auto-detect 動作
 - 残: URL に file リンクを埋めて即ロードする shareable link、アップロード UI 簡素化、ロゴ/シェア boilerplate 削減
 - 「3 秒以内に画像が出る」UX が目標
 
-### Persona 4: PET/MR + radiomics (ヘビーユーザ)
+### Persona MINER: PET/MR + radiomics (ヘビーユーザ)
 別撮影 PT/MR ロード → MR-PET register → MR ベースで ROI → ROI 内 PET radiomics 抽出
 - 現状 40% 完成。Auto-register MR↔PET (☰ Preprocessing) 動作、blend slider あり
 - 残: ROI を MRI で描画 → そのまま PET 値抽出する明示的 workflow、radiomics features の export
@@ -107,7 +107,7 @@ CLAUDE.md「SPM 標準脳変換 + VOI テンプレート解析」に詳細。
       発火しない**が、他の SPM 出力 (int16 書き出し等) では値が定数倍ずれる。VOI 専用の
       loader (`parseNiftiLabelVolume`) では既に適用済み。既存の読み込み経路は未修正。
 
-## Persona 2 (脳 PET + VOI) の満足度向上 (2026-08-19 着手)
+## Persona ATLAS (脳 PET + VOI) の満足度向上 (2026-08-19 着手)
 
 **全体フロー**: ① 病院から DICOM → ② metavol-web で .nii 保存 → ③ SPM12 で normalize (`w*.nii`)
 → ④ metavol-web で開く → ⑤ テンプレート読込 → ⑥ 領域値 → ⑦ CSV
@@ -115,13 +115,13 @@ CLAUDE.md「SPM 標準脳変換 + VOI テンプレート解析」に詳細。
 - [x] **⑤ でテンプレートの一致を目視できるようにした** (2026-08-19)。読み込み時に自動解析まで走らせ、
       overlay・診断・表が即出る。Run を押す手間も 1 つ減った。`npm run check:voi-ui` で検査。
 - [ ] **② の摩擦**: SPM12 は `.nii.gz` を直接読めないのに、メニューは `.nii.gz` を
-      「recommended」と表示している。**Persona 2 の用途では逆**。さらに両方 zip 包装なので
+      「recommended」と表示している。**Persona ATLAS の用途では逆**。さらに両方 zip 包装なので
       「展開 → (gz なら) gunzip → SPM」の手数がかかる。SPM 向けの導線を用意する。
 - [ ] **テンプレートを憶える** (localStorage / IndexedDB)。現状リロードで消え、症例ごとに
       2 ファイル選択し直し。**繰り返し作業で最も効く。**
 - [ ] **参照領域比 (SUVR)** — 小脳・橋などを基準にした比。臨床でまず要る。
 - [ ] **複数症例のバッチ処理** — 現状 1 症例ずつ。1 枚の CSV (症例 × 領域) に。
-- [ ] 表の行クリックでその領域へジャンプ (Persona 1 の lesion table にはある)。
+- [ ] 表の行クリックでその領域へジャンプ (Persona HUNTER の lesion table にはある)。
 - [ ] VOI 結果・テンプレートが **snapshot (.mvs) にも自動保存にも入っていない**。
 - [ ] VOI 領域値が **PDF / PPTX レポートに入らない** (現状 MTV 用のみ)。
 
@@ -226,7 +226,7 @@ PET=全身 1148mm) では MI / NMI / 体内限定 / 形状の **5 指標すべ�
 - **composable 切り出し**: `DicomView.vue` (~1900行) を `useSphereROI` / `usePolygonROI` / `useDebug` 等に分解
 - **バンドル 500KB 超**: `vite build` 時 warning。manual chunk 分割（vendor / nifti / dcmjs-codecs を分離）
 
-### NIfTI 「raw byte array」表示モード (将来実装、Persona 3 向け)
+### NIfTI 「raw byte array」表示モード (将来実装、Persona COURIER 向け)
 
 NIfTI ヘッダの affine / orientation を **無視**して、ファイル内 byte 配列の物理ストレージ順をそのまま画面に再現するモード。
 - innermost dim (= fastest-varying = pixel データの先頭から連続する軸) を **screen X (左→右)**
@@ -279,9 +279,26 @@ UI 案: NIfTI series card のメニュー or ☰ から "Inspect NIfTI bytes" �
 
 ---
 
-## ペルソナ別の現状サマリ (2026-05-03 commit e649358 時点)
+## ペルソナ別の満足度スコア (2026-09-22 実測、2026-09-23 の改善後に再計測)
 
-### Persona 1 (PET/CT segmentation, MTV/TLG 測定) — **完成度 95%**
+中核ジャーニーを UI 操作で実測 (`node scripts/persona-satisfaction.mjs`、要 dev サーバ)。
+スコア = ジャーニー到達度 + 摩擦 (クリック/時間) + 既知ギャップの主観評点。
+
+| ペルソナ | スコア | 実測 (読み込み操作を除く) | 最大の不満点 |
+|---|---|---|---|
+| HUNTER | **93** | **6 クリック** / 作業 ~11s で Lesions CSV (146 病変)。表は Apply で自動展開、行の「…」で付け替え/削除 (Ctrl+Z 可) | rename/merge/split (病変の永続 identity が必要)。multi-timepoint |
+| ATLAS | **85** | 4 クリック / 1.4s で 136 領域 CSV + **SUVR 列** (参照は症例間で保持) | バッチ・テンプレート記憶・左右差/Z スコア。SPM 往復は各自 MATLAB |
+| COURIER | **85** | 表示まで nii 1.3s / DICOM 4.2s。**?url=&mvs= の 1 リンクで view ごと共有**、?demo=phantom、.mvs d&d | 公開デモの実データ未配置。断面切替のワンアクション化 |
+| MINER | **65** | Radiomics CSV 2.1s (HUNTER のマスクから) | 視野非対称の registration は手動が主 (仕様)。radiomics 結果の UI が素朴 |
+| PILOT | **35** | (静的評価) 論文パイプライン 8 段中 ~3.5 段が自動 | モデル自動セグメンテーション・所見文ドラフト・write 側 LLM tool が未実装 |
+
+PILOT の段階内訳 (Choi JNM 2026 のパイプライン対応): シリーズ選択=半自動 (曖昧時のみピッカー) /
+SUV 変換=自動 / 同一 FoR 整合=自動 / MIP=レイアウトで自動 / モデルセグメンテーション=✗ (閾値のみ) /
+vision 読影=✗ / 所見文ドラフト=✗ (PDF/PPT は数値表のみ) / agent tool=読み取り専用のみ。
+
+## ペルソナ別の現状サマリ (2026-05-03 commit e649358 時点、機能一覧として保持)
+
+### Persona HUNTER (PET/CT segmentation, MTV/TLG 測定) — **完成度 95%**
 - ✅ DICOM ロード (PET+CT) → autoLayout で multi-tile DicomSlice
 - ✅ PET Standard ボタン → 2x2 (CT axial / PET axial / Fusion axial / PET MIP)
 - ✅ Threshold (SUV preset 0-3 / 0-6 / 0-10 / 0-15 / Other 0-100/1000/10000)
@@ -293,7 +310,7 @@ UI 案: NIfTI series card のメニュー or ☰ から "Inspect NIfTI bytes" �
 - ✅ NIfTI mask **load (round-trip)** with seriesUID validation
 - 残: lesion 別 SUV histogram、SUVpeak (1cc sphere centered at SUVmax)、PDF レポート出力
 
-### Persona 3 (Quick viewer) — **完成度 85%**
+### Persona COURIER (Quick viewer) — **完成度 85%**
 - ✅ DICOM/NIfTI ファイル D&D
 - ✅ 自動 modality 推定 (NIfTI filename heuristics)
 - ✅ Series card に description / DCM/NII chip / matrix size
@@ -304,7 +321,7 @@ UI 案: NIfTI series card のメニュー or ☰ から "Inspect NIfTI bytes" �
 - 残: NIfTI raw byte view (TODO に詳細)、デモデータの公開リンク
 - 残: MIP / cor / sag への切替がもっとワンアクションで (現在は plane menu)
 
-### Persona 4 (PET/MR + radiomics) — **完成度 70%**
+### Persona MINER (PET/MR + radiomics) — **完成度 70%**
 - ✅ MR-PET registration (☰ Preprocessing → Auto-register、進捗 chip 付き)
 - ✅ Fusion D&D (modality chip drag → 任意 box)
 - ✅ Fusion box の base/overlay 別 CLUT + W/L active layer toggle
@@ -450,7 +467,7 @@ own threshold) → 各骨を独立に剛体移動 → 2D 投影で骨シンチ�
 
 1. **DataBox abstraction Phase 1** (P1-A): `BoxTitlebar.vue` 抽出。機能変化なし refactor
 2. **NOTICES / THIRD_PARTY_LICENSES** (P2-A): `license-checker` で生成、配布物に同梱
-3. **MR ROI UX cue** (Persona 4 仕上げ): 描画開始時に「This ROI will be stored on PET grid」インラインヒント
-4. **公開デモデータ** (Persona 3 仕上げ): `public/demo/*.nii.gz` + `?demo=lung01` mapping
+3. **MR ROI UX cue** (Persona MINER 仕上げ): 描画開始時に「This ROI will be stored on PET grid」インラインヒント
+4. **公開デモデータ** (Persona COURIER 仕上げ): `public/demo/*.nii.gz` + `?demo=lung01` mapping
 5. **バンドル分割** (P2-C): manual chunk
 6. **DicomView.vue composable 化** (P1-B): `useSphereROI` / `usePolygonROI` 等

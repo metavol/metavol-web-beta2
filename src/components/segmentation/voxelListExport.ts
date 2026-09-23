@@ -1,7 +1,7 @@
 import type { Volume } from '../Volume';
 import type { LabelEntry } from '../../stores/segmentation';
 
-// マスク内の全 voxel を 1 行ずつ書き出す (Persona 1 向け)。
+// マスク内の全 voxel を 1 行ずつ書き出す (Persona HUNTER 向け)。
 //
 // 様式 (ユーザ指定): `island_id label_id x y z value` の空白区切り。
 // - **island_id = 病変 (非ゼロ 26-連結成分) の番号。** 「腫瘍だけ取り出して各病変を

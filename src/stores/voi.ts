@@ -30,6 +30,9 @@ interface VoiState {
     labelOf: Uint16Array | null;
     /** labelOf が乗っている series の index (再解析やジャンプ機能の起点) */
     analyzedSeriesIndex: number;
+    /** SUVR の参照領域 id (null = SUVR 列を出さない)。小脳・橋などを想定。
+        再解析やテンプレート差し替えでも保持する (複数症例で同じ参照を使い回すため)。 */
+    suvrRefId: number | null;
 }
 
 export const useVoiStore = defineStore('voi', {
@@ -45,6 +48,7 @@ export const useVoiStore = defineStore('voi', {
         lastRunMs: 0,
         labelOf: null,
         analyzedSeriesIndex: -1,
+        suvrRefId: null,
     }),
     getters: {
         hasTemplate: (s) => !!s.template,

@@ -161,7 +161,16 @@ coronal/sagittal 撮像では解剖学的に正しくない (断面ベクトル�
   - `finalMask`     : `recomputeFinalMask()` で `manualEdits` 優先で合成。
 
 ### PET/CT 自動検出
-- DICOM タグ `(0008,0060) Modality` を見て `PT`/`PET` → PET、`CT` → CT。
+- **modality はタグの生読み禁止。必ず `dicomModalityOf(ds)` (dicom2volume.ts) を通すこと** (2026-09)。
+  `(0008,0060)` がアプリの扱う既知値 (PT/PET/CT/MR/NM) ならそれ、そうでなければ
+  **SOP Class UID (0008,0016)** から導出する (PET Image Storage → PT 等)。
+- 理由: **匿名化ソフトが Modality を一括で書き換える実例**がある
+  (実測 sample-data/cart: 全 13 シリーズ Modality=RG。SOP Class と SUV 用タグは無傷)。
+  生読みだと PT/CT を検出できず、Persona HUNTER の MTV measurement 自体が始められない。
+- SOP Class は規格上の確定情報なので、**voxel 分布からの推定 (既知バグ 4 で禁止) とは別物**。
+  Secondary Capture (fusion キャプチャや Patient Protocol) は対応表に無いので RG のまま残る = 正しい。
+- 検証: `npm run check:cart` (PT×4/CT×4 復元、SC は RG のまま、SUV 化成立、
+  MTV measurement → Apply → Lesion table 257 行まで通し)。
 - DicomView の `doSort()` 末尾で `detectPetCtFromDicom()` 実行。MPR 後は `refreshSegStoreVolumeRefs()` で volume 参照を最新化。
 
 ### Pinia Proxy トラップに注意（既知の落とし穴）
@@ -301,9 +310,9 @@ Volume 単独 / Fusion 両方をハンドル（`isVolumeImageBoxInfo` は `clut1
 
 ---
 
-## 右 Inspector (SegmentationPanel) レイアウト — Persona 1 ワークフロー順 (2026-07)
+## 右 Inspector (SegmentationPanel) レイアウト — Persona HUNTER ワークフロー順 (2026-07)
 
-Persona 1 (MTV 測定) の動線に沿って、既定は 4 ステップの一本道に簡略化してある:
+Persona HUNTER (MTV 測定) の動線に沿って、既定は 4 ステップの一本道に簡略化してある:
 - **最上部 Overlay バー**: mask 表示切替 + 不透明度を **1 行** で (step ①〜④ 共通のため最上段固定)。
 - **① Segment**: SUV threshold preset + **Apply split-button**。メインは現在ラベルで適用、caret メニューで
   Tumor/Physiological を選んで即適用 (`onApplyAs`)。+ Clear
@@ -335,18 +344,45 @@ sticky レイアウト。よく使う保存と mask opacity は常に見える�
   SUVmax を大きく、SUVmean/radius/voxels + Clear を表示。サイドバーの Sphere ROI(Advanced) は説明のみ。
 - Refine の編集ツール hint は常時表示せず **hover の v-tooltip** (`.mv-tool-toggle-wrap` + activator="parent")。
 - **単位は ml** (旧 cc)。lesion table MTV/ml・SUVpeak 1ml、Labels 体積 ml、CSV/PDF ヘッダも ml。
+- **ラベル色は swatch クリックで変更できる (2026-09)**。Labels 一覧の swatch が button
+  (`.mv-color-swatch--btn`) で、v-menu + v-color-picker (rgb + swatches) を開く。
+  store は `setLabelColor(id, [r,g,b])` — maskVersion を bump して再描画キャッシュ無効化 +
+  自動保存に載せる。GPU 側は `labelClutDynamic` (computed) が新しい配列参照になるので
+  `getClutBuffer` の参照キャッシュが自然に外れる。検証は `check:ui-misc`
+  (**voxel を持つラベル** = currentLabelId の色を変えて canvas のチャンネル順位まで見る。
+  最初 voxel の無い Tumor を変えて「再描画されない」と誤判定した — テストを書くときは注意)。
 - `jumpToWorld` は未初期化 box (centerInWorld なし) を skip する防御を追加 (lesion 行クリック時の crash 防止)。
+- **Apply で Lesions 表を自動展開する (2026-09)**。`showLesions` は既定 false (省スペース) だが、
+  Apply した人の次の関心は病変一覧なので `onApplyThreshold` が true にする。
+  満足度計測で「表を見るのに毎回 +1 クリック」「テストが表の出現待ちでタイムアウト」を踏んだ教訓。
+- **Lesion 行の選別操作 (2026-09)**: 各行の「…」→ Set label / Delete lesion。
+  store の `assignComponentLabel` / `eraseComponent` (componentMap ベース、manualEdits 経由なので
+  **Ctrl+Z で戻る**)。SUV≥3 で 146 島のような「生理的集積だらけの表」を行単位で選別するための機能。
+  ⚠ 行の表示番号 (#N) は SUVmax 降順の**並び位置**で、識別子は componentId。削除・付け替え後に
+  maskVersion が変わると番号は振り直される。
+  検証: `check:ui-misc` (自動展開 / 付け替え / 削除 voxel 195723→729 / Ctrl+Z 復元)。
 
 ---
 
-## デバッグ機能（一般ユーザ非露出）
+## Voxel probe / デバッグ機能 (2026-09 に分離)
 
-- **有効化**: URL `?debug=1` で起動時 ON、または **Ctrl+Shift+D** トグル
-- ON 時は画面右下に赤い `DEBUG` バッジ
-- **voxel inspector** (`DebugInspector.vue`): マウスホバーで全シリーズの voxel 値テーブルを表示。ドラッグ中は抑止
-- **voxel 編集**: Shift+左クリックで `prompt()` ダイアログ。`Volume.voxel[idx]` を直接書換 →
+**probe (通常機能) と debug (開発者向け) の 2 段構え** (ユーザ要望「inspector は普通の機能」):
+
+| | probeMode | debugMode |
+|---|---|---|
+| 入口 | app-bar **View options → Voxel inspector** | URL `?debug=1` / **Ctrl+Shift+D** |
+| hover の値表示 (全シリーズ + world mm + mask 層) | ○ | ○ |
+| Shift+Click の voxel 編集 | × | ○ |
+| 赤い DEBUG バッジ / 編集ヒント | × | ○ |
+
+- DicomView に `probeMode` (defineModel) を追加し、hover ゲートは `inspectorHoverOn =
+  probeMode || debugMode`。編集ゲートは `editEnabled` (= debugMode) を composable に別渡し。
+  **App.vue の「Voxel inspector」メニューは probeMode に bind** してある (以前は debugMode
+  ごと ON になり、一般ユーザに編集モードが開いていた)。
+- **voxel 編集** (debug のみ): Shift+左クリックで `prompt()`。`Volume.voxel[idx]` を直接書換 →
   `evictVolumeTexture(voxel)` (GPU cache 破棄。無いと画像が変わらない。既知バグ 5 参照) → `show()`
 - 実装は `composables/useDebugInspector.ts`（`updateDebugHover` / `handleDebugEditClick` / debug ref 群）。`debugMode` は defineModel なので DicomView 側に残り、composable に渡す。`seriesList` は reassign される let なので getter (`getSeriesList`) 経由で渡す
+- 検証: `npm run check:ui-misc` (probe ON で hover 表示 / バッジ・編集ヒント・prompt が出ない)
 
 ## DicomView.vue の composable 分割（肥大化対策・進行中）
 
@@ -356,6 +392,17 @@ DicomView.vue は god component（6,000 行超）。**挙動を変えずに**行
 - **reassign される `let`（`seriesList` 等）は必ず getter (`() => seriesList`) で渡す**（値を capture するとstale化）
 - composable 呼び出しは依存（`screenToWorldAny` / `show` 等）が全て定義済みの位置（`findPetSeriesIndex` の直後）に置く。返す ref/関数は同名で分割代入し、template・イベントハンドラは runtime で参照するので TDZ 問題は起きない
 - 切り出し済み: `useDebugInspector.ts`（voxel inspector）、`useSnapshotIo.ts`（View state URL / Snapshot file の save/load。`RectRoiJson` 型はここに定義し DicomView へ import で戻す。`rectRoiToJson`/`importRectRoisFromJson` は rect ROI export と共有のため DicomView に残し ctx で渡す）
+
+## beforeunload ガード (2026-09)
+
+series を 1 つでも読み込んでいたら、タブを閉じる / リロードで確認ダイアログを出す
+(`onBeforeUnloadGuard`, DicomView)。mask の有無まで見ないのは、大きな症例では読み込み自体に
+数分掛かっており「開き直し」も損失だから。
+
+- ブラウザ仕様: ダイアログは**ユーザ操作があったタブ**でしか出ない (sticky activation)。
+- Playwright は `page.goto` / `page.close()` (既定) では beforeunload を無視するので
+  既存の check スクリプトは影響を受けない。出したいときだけ `page.close({ runBeforeUnload: true })`。
+- 検証: `check:ui-misc` (データありで dialog type='beforeunload' が出る / 無しで出ない)。
 
 ## テスト DICOM ロード（File System Access API）
 
@@ -1076,7 +1123,7 @@ dims / pixdim / sform_code / **srow から復元した affine が元の imagePos
 ブラウザ内で正規化はしない。
 
 **入口**: app-bar のハンバーガー → **VOI analysis…**。右 Inspector には入れない
-(あそこは Persona 1 の 4 ステップ動線。136 行の表を差すと主要フローが埋まる)。
+(あそこは Persona HUNTER の 4 ステップ動線。136 行の表を差すと主要フローが埋まる)。
 
 **モジュール**
 
@@ -1237,8 +1284,14 @@ overlay が出ない。実測で「Run 直後は出ず、別の操作で再描�
 `npm run check:voi-ui` は **canvas の画素を実際に読んで**着色率を測るのでこれを検出する
 (overlay ON 62.4% / OFF 0.0%)。
 
-**未実装 (意図的に後回し)**: 参照領域比 (SUVR) / 左右差 / Z スコア / バッチ処理。
-統計は純関数なのでいずれも上に足せる。
+**SUVR (参照領域比、2026-09 実装)**: 結果ツール行の autocomplete で参照領域を選ぶと、
+表と CSV に `suvr` 列 (= mean / 参照 mean) が付く。参照は `voiStore.suvrRefId` に保持し、
+**再解析・別症例でも選択を保つ** (同じ参照で症例を回す運用のため)。CSV にはメタ行
+`# suvr_reference,<id>,<name>,mean,<val>` が入る。実装は `voiStatsToCsv` の省略可能引数
+(純関数のまま)。検証: `check:voi-ui` の ⑥ (列の出現 / suvr=mean÷参照mean を id 44 で検算 /
+参照自身の suvr=1 / メタ行)。
+
+**未実装 (意図的に後回し)**: 左右差 / Z スコア / バッチ処理。統計は純関数なのでいずれも上に足せる。
 
 ---
 
@@ -1286,12 +1339,16 @@ npm run check:voi        # VOI 解析の中核 (独立実装との突合を含�
 npm run check:voi-ui     # ★ 同上を **UI 操作から** (メニュー -> 読込 -> Run -> CSV)
 npm run check:orient     # ★ 表示の前後/左右が解剖学的に正しいか (アトラスで実測)
 npm run check:mask-dnd   # ★ d&d でマスク .nii を落としたときの自動判定 → 確認 → 取り込み
+npm run check:ui-misc    # ★ voxel probe / ラベル色変更 / beforeunload / native legend の UI 検査
+npm run check:courier    # ★ ?demo=phantom / ?mvs= / .mvs d&d (リンク共有まわり)
+npm run check:cart       # ★ 匿名化で Modality=RG に書き換えられた DICOM の SOP Class 復元
 ```
 
 計測用 (合否ではなく数値を見るもの):
 ```bash
 node scripts/autosave-cost.mjs      # 自動保存 1 回のコスト (コピー + IndexedDB 書き込み)
 node scripts/axis-orientation.mjs   # 各シリーズの index 軸が world のどこを向いているか
+node scripts/persona-satisfaction.mjs  # ペルソナ別ジャーニーのクリック数・所要時間 (TODO.md にスコア表)
 ```
 
 **`check:render` は「2.8 の再発」専用**。template から呼ばれる判定関数が throw すると
@@ -1407,16 +1464,26 @@ console.error 監視では見逃す。このスクリプトは `console.warn` �
 
 ---
 
-## ペルソナと優先度 (2026-08-19 更新、ユーザ指示)
+## ペルソナと優先度 (2026-09 コードネーム制に移行、ユーザ指示)
 
-**番号が優先順位**。1 が最重要。2026-08 に **ペルソナ 2 を「脳 PET の解剖学的標準化 + VOI」に
-差し替え**、従来の 2 (簡易 viewer) と 3 (PET/MR + radiomics) を 3 / 4 へ繰り下げた。
+**ペルソナは番号でなくコードネームで呼ぶ** (番号だと追加・削除のたびに振り直しが要るため)。
+優先順位は下の表で別管理する。ソース中のコメントも `Persona HUNTER` の形で書く
+(検索は `grep -rn "Persona [A-Z]" src/ TODO.md`)。
 
-> ⚠ **ソース中の `Persona N` コメントもこの番号に合わせてある** (2026-08 に一括更新済み)。
-> 番号を動かすときは `grep -rn "Persona [0-9]" src/ TODO.md` で全部直すこと。
-> 旧番号のまま残すと「Persona 2 = quick viewer」という**誤った手掛かり**が残る。
+| コードネーム | 一言 | 優先度 | 旧番号 |
+|---|---|---|---|
+| **HUNTER** | 腫瘍 PET で MTV を測る忙しい医師 (クリック最小) | ★ 1 位 | 1 |
+| **ATLAS** | 脳 PET を SPM 標準化して VOI テンプレートで測る研究者 | 2 位 | 2 |
+| **COURIER** | リンク 1 つで画像を共有したい簡易 viewer 利用者 | 3 位 | 3 |
+| **MINER** | PET/MR 整合 + radiomics のヘビーユーザ | 4 位 | 4 |
+| **PILOT** | 日常診療ワークフローを自動化したい読影医 (LLM agent) | 暫定末尾 | 5 |
 
-### ペルソナ 1: 腫瘍 PET で MTV を測る ★最重要
+- 名前の由来: HUNTER=腫瘍を狩る / ATLAS=脳アトラス / COURIER=届ける /
+  MINER=特徴量採掘 / PILOT=自動操縦 + 出典が pilot study。
+- 旧番号は 2026-09 以前のコミットメッセージ・メモとの照合用。新規記述では使わない。
+- ⚠ TODO.md の `P1-A` 等はタスク優先度タグであってペルソナではない (置換時に巻き込まないこと)。
+
+### ペルソナ HUNTER — 腫瘍 PET で MTV を測る ★最重要
 - **誰**: **忙しい医師**。1 症例あたりの時間が短い。
 - **解決する問題**: PET volume から腫瘍体積 (MTV) と total lesion glycolysis (TLG) を測る。
 - **最優先の設計制約**: **クリック数を最小に**。既定は一本道で、迷いどころを作らない。
@@ -1429,11 +1496,14 @@ console.error 監視では見逃す。このスクリプトは `console.warn` �
   - Lesion table、SUVpeak、TMTV cutoff (DLBCL CAR-T 48cc / NSCLC 80cc)、Deauville 5pt
   - Snapshot (.mvs) で session 永続化、IndexedDB 自動保存、undo/redo
 - **次の伸びしろ** (この優先順で):
-  1. Lesion table の inline rename / delete / merge / split
+  1. ~~Lesion table の delete / ラベル付け替え~~ → 2026-09 実装 (行の「…」メニュー)。
+     rename / merge / split は病変の**永続 identity** が要るため未着手 (componentId は
+     mask 編集で振り直される)
   2. Multi-timepoint comparison (baseline vs follow-up、PERCIST 自動判定)
   3. **クリック削減そのもの** — 読み込み → 閾値 → 保存を既定で最短にする見直し
+     (2026-09: Apply で Lesions 表自動展開により 7→6 クリック)
 
-### ペルソナ 2: 脳 PET を解剖学的標準化して VOI テンプレートの値を取る (2026-08 新設)
+### ペルソナ ATLAS — 脳 PET を解剖学的標準化して VOI テンプレートの値を取る (2026-08 新設)
 - **誰**: 脳 PET の研究者・読影者。**SPM を自分で回せる**人。
 - **解決する問題**: 脳 PET を標準脳へ正規化し、VOI テンプレート (AAL / Neuromorphometrics 等) を
   当てはめて **領域ごとの数値** (mean / SD / volume など) を取り出す。
@@ -1449,21 +1519,30 @@ console.error 監視では見逃す。このスクリプトは `console.warn` �
   - **既存のマスク overlay を流用**した領域の重ね描き
   - 正規化画像は modality 不明でも**分位点から自動 window**
 - **次の伸びしろ**:
-  1. **参照領域比 (SUVR)** — 小脳・橋などを基準にした比。臨床でまず要る
+  1. ~~参照領域比 (SUVR)~~ → 2026-09 実装 (ダイアログの参照セレクタ + suvr 列)
   2. 左右差 (L/R asymmetry index)
   3. **複数症例のバッチ処理** — 現状 1 症例ずつ
   4. Z スコア (正常データベースとの比較)
   5. 統計は `voi/voiStats.ts` の**純関数**なので、上記はいずれもここに足せる
 
-### ペルソナ 3: 簡易 viewer (URL share)  ← 旧ペルソナ 2
+### ペルソナ COURIER — 簡易 viewer (URL share)
 - **解決する問題**: 院内/カンファレンスで DICOM/NIfTI を「リンク 1 つ」で共有して見せる。
-- **現状の充足度** (中-高):
-  - Drag & drop DICOM/NIfTI、`?url=` で外部 URL 共有、append drag
+- **リンク共有の分担 (2026-09 完成)**: **データは `?url=` / `?demo=` / `?dev=`、見え方は `?mvs=<url>`**。
+  view state を URL 自体へ埋め込む方式は撤去済み (壊れやすく、ユーザ指定で snapshot 方式へ移行)。
+  `?url=data.nii.gz&mvs=view.mvs` の 1 リンクで「同じデータを同じ見え方で」開ける。
+- **現状の充足度** (高):
+  - Drag & drop DICOM/NIfTI/.mvs、`?url=` で外部 URL 共有、append drag
+  - **`?mvs=<url>`** — データ読み込み完了後に snapshot を fetch して適用 (2026-09)
+  - **`?demo=phantom`** — ブラウザ内でファントム生成。**データ配布なしで動くデモリンク** (2026-09)。
+    `phantom-nema` も予約 id。実データ入りの公開デモは public/demo/<id>/manifest.json 方式 (中身は未配置)
+  - **.mvs も d&d / Load files で受ける** (2026-09、「読み込みの入口は 1 つ」原則)。
+    単独なら即適用、画像と同時なら画像の読み込み完了 + 800ms 後に適用
   - NIfTI raw byte view、NIfTI header viewer (volume card "..." menu)
   - nii.gz native streaming gunzip + 進捗 chip
-- **次の伸びしろ**: URL に view state (W/L、CLUT、layout) を載せる。OHIF 風 share。
+- **検証**: `npm run check:courier` (phantom リンク / ?mvs= 復元 / .mvs 単独 d&d / 画像+.mvs 同時 drop)
+- **次の伸びしろ**: 公開デモの実データ配置 (合成 nii を public/demo へ)、断面切替のワンアクション化。
 
-### ペルソナ 4: PET/MR + radiomics  ← 旧ペルソナ 3
+### ペルソナ MINER — PET/MR + radiomics
 - **解決する問題**: MR と PET を整合させて anatomical context 付きで MTV を測る。Radiomics 抽出。
 - **現状の充足度** (中):
   - MR registration (rigid 6-DOF, MI + Nelder-Mead, 多重解像度)。
@@ -1474,9 +1553,40 @@ console.error 監視では見逃す。このスクリプトは `console.warn` �
   2. WebGPU MI で registration 高速化
   3. Radiomics 結果テーブルの UI 改善 (現状は console / snapshot 内)
 
+### ペルソナ PILOT — 日常診療ワークフローを自動化したい読影医 (2026-09 新設)
+- **出典**: Choi H, et al. "End-to-End PET/CT Interpretation and Quantification with an
+  LLM-Orchestrated AI Agent: A Real-World Pilot Study." J Nucl Med 2026
+  (doi:10.2967/jnumed.126.272362)。LLM が raw DICOM → シリーズ選択 → 位置合わせ/SUV 変換 →
+  セグメンテーション/検出 → MIP → vision-LLM 読影 → **構造化ドラフトレポート**までを
+  人手なしで完走 (170 例、原発巣感度 100%、N: 感度 84.8%/特異度 39.4%、
+  M: 感度 70.2%/特異度 65.0% → **専門医の監督つき協調が前提**)。
+- **誰**: 日常診療の読影医・核医学科。**1 例ずつ丁寧に測る時間はなく、
+  「機械に一次処理と下書きをやらせて、自分は検証と修正に回りたい」**人。
+- **HUNTER との違い**: HUNTER は「自分の手で最少クリックで測る」。PILOT は「開いた時点で
+  もう測られていて、下書きまである」。HUNTER の道具 (threshold / lesion table / レポート) は
+  PILOT の**部品**になる — 自動化の結果は必ず HUNTER の編集可能な形 (mask / lesion table) に
+  落とすこと。ブラックボックスの数値だけ返す設計にしない (検証・修正が仕事の中心のため)。
+- **既にある部品** (この論文のパイプラインとの対応):
+  - SUV 変換 (Vox-BASE 12 桁一致) / registration / MIP / 閾値セグメンテーション
+  - Lesion table (MTV/TLG/SUVpeak/Deauville) / PDF・PPTX レポート / voxel list
+  - LLM チャットパネル (Ollama、**読み取り専用 2 tool のみ**) / mask・snapshot の永続化
+- **欠けている部品** (実装順の候補):
+  1. **自動シリーズ選択** — 読み込んだ study から AC PT + 診断 CT を自動で選んで
+     PET Standard を組む (detectPetCtFromDicom の拡張。LLM 不要のルールでもかなり届く)
+  2. **モデルベース自動セグメンテーション** — TotalSegmentator 等 (TODO 済み項目と直結。
+     registration 3.59 の解剖ランドマークとも共用できる)
+  3. **LLM の write 側 tool** — 「threshold 2.5 を適用して」「肝臓の集積を Physiological に」
+     等を tool calling で実行 (ユーザ pending の「LLM write-side tools」がこれ)
+  4. **構造化ドラフトレポート生成** — lesion table + 画像を LLM に渡して所見文を下書き
+     (buildReportInput が既に唯一の組み立て箇所なので、そこに載せる)
+- **安全設計** (論文の結論から): 自動結果は**常に draft** として提示し、確定操作
+  (レポート出力・保存) は人が行う。N/M 判定のような系統的弱点があることを UI で隠さない。
+
 ### 開発判断のガイド
-- 機能追加で迷ったら **ペルソナ 1 のクリック数を増やさないか?** を最初に問う。
-- **ペルソナ 2 の機能はペルソナ 1 の動線に差さない。** VOI 解析を右 Inspector ではなく
+- 機能追加で迷ったら **ペルソナ HUNTER のクリック数を増やさないか?** を最初に問う。
+- **ペルソナ ATLAS の機能はペルソナ HUNTER の動線に差さない。** VOI 解析を右 Inspector ではなく
   独立ダイアログ (app-bar → VOI analysis…) にしたのはこの原則による。
-- 「P3/P4 専用機能」は P1/P2 を妨げない範囲で追加 (メニューの奥、Advanced 等)。
-- 「P1 が触らない領域」(MR registration、PNG/JPG planar 等) は別 commit で。
+- 「COURIER/MINER 専用機能」は HUNTER/ATLAS を妨げない範囲で追加 (メニューの奥、Advanced 等)。
+- 「HUNTER が触らない領域」(MR registration、PNG/JPG planar 等) は別 commit で。
+- **PILOT (自動化) は HUNTER の部品を再利用し、結果を HUNTER の編集可能な形に落とす。**
+  自動化のために HUNTER の手動動線を壊さない (自動が外れたとき手で直せることが PILOT の前提)。

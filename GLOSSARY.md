@@ -259,3 +259,16 @@ type Volume = {
 | **seriesSummaries** | seriesList を rebuild して UI 用に整形した reactive 配列 |
 | **imb** | 各 tile の ImageBox component ref 配列 (`imb.value[i].drawNiftiSlice(...)` で描画) |
 | **imageBoxInfos** | 各 tile の info object (`DicomSliceImageBoxInfo` / `VolumeImageBoxInfo` / `FusedVolumeImageBoxInfo`) |
+---
+
+## ペルソナ (コードネーム)
+
+開発判断の基準となる想定ユーザ。**番号でなくコードネームで呼ぶ** (詳細は CLAUDE.md「ペルソナと優先度」)。
+
+| コードネーム | 誰 | 旧番号 |
+|---|---|---|
+| **HUNTER** | 腫瘍 PET で MTV/TLG を測る忙しい医師。クリック数最小が最優先 | 1 |
+| **ATLAS** | 脳 PET を SPM で標準化し VOI テンプレートで領域値を取る研究者 | 2 |
+| **COURIER** | DICOM/NIfTI をリンク 1 つで共有したい簡易 viewer 利用者 | 3 |
+| **MINER** | PET/MR 整合 + radiomics のヘビーユーザ | 4 |
+| **PILOT** | 日常診療ワークフローを自動化したい読影医 (LLM agent、Choi JNM 2026 由来) | 5 |

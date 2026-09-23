@@ -2266,7 +2266,8 @@ defineExpose({init, show, show2, showRgb, showDirect,
                 <div class="mv-align-hint">Arrow keys move · Shift + drag · Ctrl+Z undo</div>
             </div>
 
-            <!-- Color scale legend (Volume / Fusion / MIP のみ) -->
+            <!-- Color scale legend。legend prop があれば全種の box で出す
+                 (native の DICOM slice box も getBoxLegend が W/L から作る。2026-09 確認) -->
             <div v-if="prop.legend" class="mv-clut-legend">
                 <span class="mv-clut-min">{{ prop.legend.minLabel }}</span>
                 <div class="mv-clut-bar" :style="{ background: prop.legend.gradient }"></div>
