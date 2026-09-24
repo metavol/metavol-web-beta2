@@ -821,6 +821,7 @@
       @loadTemplate="onLoadVoiTemplate"
       @run="onRunVoi"
       @exportCsv="dicomViewRef?.downloadVoiCsv?.()"
+      @jumpRegion="(id: number) => dicomViewRef?.jumpToVoiRegion?.(id)"
       @overlayChanged="dicomViewRef?.refreshVoiOverlay?.()"
     />
 
@@ -832,7 +833,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue';
 import DicomView from "./components/DicomView.vue";
 import { getWH, getTileN } from "./components/UrlParser.ts";
 import { useSegmentationStore } from "./stores/segmentation";
@@ -1020,6 +1021,13 @@ const petPickerOpen = ref(false);
 const petPickerCandidates = ref<{ pt: SeriesCandidate[]; ct: SeriesCandidate[] } | null>(null);
 const petPickerSelectedPt = ref<number | null>(null);
 const petPickerSelectedCt = ref<number | null>(null);
+// ピッカーで PT を選び直したら、CT もその PT と同じ撮影 (FoR/study) の CT に追従させる。
+// 手で CT を選び直すのは自由 (追従は PT 変更時だけ)。
+watch(petPickerSelectedPt, (pt) => {
+  if (pt == null || !petPickerOpen.value) return;
+  const ct = dicomViewRef.value?.bestCtIndexForPet?.(pt);
+  if (ct != null && ct >= 0) petPickerSelectedCt.value = ct;
+});
 
 // PET Standard ボタン: 候補の数で挙動を分岐
 //   - 1 PT × 1 CT → 即実行 (現状通り)
@@ -1036,9 +1044,10 @@ const onClickPetStandard = () => {
     return;
   }
 
-  // 既定選択 (resolvePetCtIndices と同じ優先順位: active → first)
+  // 既定選択 (resolvePetCtIndices と同じ優先順位)。CT は**選ばれた PT と同じ撮影**から
+  // (FoR → study)。複数 study を読み込んだとき別 study の CT と組まれないように。
   const defaultPt = cands.pt.find(c => c.isActive)?.idx ?? cands.pt[0].idx;
-  const defaultCt = cands.ct.find(c => c.isActive)?.idx ?? cands.ct[0].idx;
+  const defaultCt = r.bestCtIndexForPet?.(defaultPt) ?? (cands.ct.find(c => c.isActive)?.idx ?? cands.ct[0].idx);
   petPickerCandidates.value = cands;
   petPickerSelectedPt.value = defaultPt;
   petPickerSelectedCt.value = defaultCt;

@@ -23,7 +23,8 @@
     "check:mask-dnd": "node scripts/mask-dnd-check.mjs",
     "check:ui-misc": "node scripts/ui-misc-check.mjs",
     "check:courier": "node scripts/courier-check.mjs",
-    "check:cart": "node scripts/cart-modality-check.mjs"
+    "check:cart": "node scripts/cart-modality-check.mjs --case all",
+    "check:modality-override": "node scripts/modality-override-check.mjs"
   },
   "dependencies": {
     "@mdi/font": "6.2.95",

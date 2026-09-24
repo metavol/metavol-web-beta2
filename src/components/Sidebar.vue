@@ -31,6 +31,7 @@ defineProps<{
     isPrimary: boolean;
     isRgb: boolean;
     sourceType: 'DICOM' | 'NIFTI';
+    modalityOverridden?: boolean;
   }>;
 }>();
 
@@ -62,7 +63,7 @@ const emit = defineEmits([
       <MaskCard @redraw="emit('redraw')" />
       <SeriesList
         :series="seriesSummaries ?? []"
-        @setModality="(p: { index: number; modality: 'PT' | 'CT' | 'MR' }) => emit('setModality', p)"
+        @setModality="(p: { index: number; modality: 'PT' | 'CT' | 'MR' | 'AUTO' }) => emit('setModality', p)"
         @setActiveForSeg="(p: { index: number; modality: 'PT' | 'CT' }) => emit('setActiveForSeg', p)"
         @inspectRaw="(p: { index: number }) => emit('inspectRaw', p)"
         @viewHeader="(p: { index: number }) => emit('viewHeader', p)"

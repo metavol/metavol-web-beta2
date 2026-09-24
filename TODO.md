@@ -1,5 +1,23 @@
 # TODO
 
+## 要対応: 型チェックが空振りしている (2026-09-25 判明)
+
+- [ ] `tsconfig.json` の `include` が `./src/typed-router.d.ts` だけで、vue-tsc がアプリを検査していない。
+      本来範囲で回すと 56 件の構文エラー (テンプレート内ハンドラの TS 型注釈、DicomView/Sidebar)。
+      構文エラーの先の意味エラーは未計測。手順: ① テンプレート内型注釈の扱いを決める
+      (vueCompilerOptions の確認 or 注釈を script 側の関数へ移す) → ② include を src 全体へ →
+      ③ 意味エラーの棚卸しと修正 → ④ `npm run check` に組み込む。詳細は CLAUDE.md の同名節。
+
+## ユーザ決定事項 (2026-09-23)
+
+- **LLM write 側 tool は解禁** — 「threshold 2.5 を適用」等の操作系 tool calling を実装してよい
+  (それまで read-only 2 tool に制限していた保留を解除)。実装は Persona PILOT の 3 番目の部品。
+- **TotalSegmentator はローカルサーバ方式で行く** (ブラウザ内 wasm 推論は採らない)。
+  各自の PC で Python サーバ (TotalSegmentator CLI/API) を立て、metavol-web が
+  localhost へ投げる構成。MINER の解剖ランドマーク registration と PILOT の
+  自動セグメンテーションの両方がこれに乗る。
+- プラン A (テンプレート永続化 / SPM 表記 / VOI 行ジャンプ / 小 matrix 初期ズーム) 承認 → 実装済み。
+
 `metavol-web` の作業 backlog。CLAUDE.md はリポジトリ規約・アーキテクチャの恒久的なリファレンス、こちらは変動の激しいタスク管理を担当する。
 
 ---
@@ -101,7 +119,7 @@ CLAUDE.md「SPM 標準脳変換 + VOI テンプレート解析」に詳細。
       `npm run check:voi-ui` が canvas の画素を読んで着色率を検査 (ON 62.4% / OFF 0.0%)。
       - [ ] 手動検証: 45% 既定だと脳全体が覆われて下の解剖が見づらい。実用上ちょうどよいか、
             **輪郭表示 (境界だけ描く) モードが要るか**は使ってみての判断待ち。
-- [ ] 参照領域比 (SUVR) — 今回スコープ外。統計は純関数なので上に足せる。
+- [x] 参照領域比 (SUVR) — 2026-09-23 実装 (ダイアログの参照セレクタ + suvr 列、check:voi-ui ⑥)。
 - [ ] 左右差 / Z スコア / **複数症例のバッチ処理** — 同上。
 - [ ] `scl_slope`/`scl_inter` の適用 (`loadNii`) — **今回のファイルは両方 slope=1 なので
       発火しない**が、他の SPM 出力 (int16 書き出し等) では値が定数倍ずれる。VOI 専用の
@@ -114,14 +132,14 @@ CLAUDE.md「SPM 標準脳変換 + VOI テンプレート解析」に詳細。
 
 - [x] **⑤ でテンプレートの一致を目視できるようにした** (2026-08-19)。読み込み時に自動解析まで走らせ、
       overlay・診断・表が即出る。Run を押す手間も 1 つ減った。`npm run check:voi-ui` で検査。
-- [ ] **② の摩擦**: SPM12 は `.nii.gz` を直接読めないのに、メニューは `.nii.gz` を
+- [x] **② の摩擦** (2026-09-24: Export メニューを .nii (for SPM) 先頭に入れ替え): SPM12 は `.nii.gz` を直接読めないのに、メニューは `.nii.gz` を
       「recommended」と表示している。**Persona ATLAS の用途では逆**。さらに両方 zip 包装なので
       「展開 → (gz なら) gunzip → SPM」の手数がかかる。SPM 向けの導線を用意する。
-- [ ] **テンプレートを憶える** (localStorage / IndexedDB)。現状リロードで消え、症例ごとに
+- [x] **テンプレートを憶える** (2026-09-24 実装: IndexedDB、check:voi-ui ⑧) (localStorage / IndexedDB)。現状リロードで消え、症例ごとに
       2 ファイル選択し直し。**繰り返し作業で最も効く。**
-- [ ] **参照領域比 (SUVR)** — 小脳・橋などを基準にした比。臨床でまず要る。
+- [x] **参照領域比 (SUVR)** — 2026-09-23 実装。
 - [ ] **複数症例のバッチ処理** — 現状 1 症例ずつ。1 枚の CSV (症例 × 領域) に。
-- [ ] 表の行クリックでその領域へジャンプ (Persona HUNTER の lesion table にはある)。
+- [x] 表の行クリックでその領域へジャンプ (2026-09-24 実装、check:voi-ui ⑦) (Persona HUNTER の lesion table にはある)。
 - [ ] VOI 結果・テンプレートが **snapshot (.mvs) にも自動保存にも入っていない**。
 - [ ] VOI 領域値が **PDF / PPTX レポートに入らない** (現状 MTV 用のみ)。
 
@@ -137,7 +155,7 @@ CLAUDE.md「SPM 標準脳変換 + VOI テンプレート解析」に詳細。
       - metavol-web の書き出し側で NIfTI の `descrip` や `intent_name` に modality を埋め、
         SPM が上書きしないフィールドを探す (SPM は descrip を "Warped" で潰す)
       - sidecar JSON を SPM 後も手で持ち回る運用にする
-- [ ] **小さい matrix の volume が 1 voxel = 1 画素で開く** (実測: 79x95 の脳が
+- [x] **小さい matrix の volume が 1 voxel = 1 画素で開く** (2026-09-24: 初期フィットズーム、check:ui-misc A0) (実測: 79x95 の脳が
       1203x875 の box に 4374 画素ぶんしか占めない)。**「Fit to window」を押しても変わらない**
       (あれは box の寸法を合わせるもので、画像の拡大率は変えない。実測 4374 → 4374)。
       現状の拡大手段は **Ctrl+ホイール** (実測 6 回で 4374 → 13636 画素)。
@@ -287,7 +305,7 @@ UI 案: NIfTI series card のメニュー or ☰ から "Inspect NIfTI bytes" �
 | ペルソナ | スコア | 実測 (読み込み操作を除く) | 最大の不満点 |
 |---|---|---|---|
 | HUNTER | **93** | **6 クリック** / 作業 ~11s で Lesions CSV (146 病変)。表は Apply で自動展開、行の「…」で付け替え/削除 (Ctrl+Z 可) | rename/merge/split (病変の永続 identity が必要)。multi-timepoint |
-| ATLAS | **85** | 4 クリック / 1.4s で 136 領域 CSV + **SUVR 列** (参照は症例間で保持) | バッチ・テンプレート記憶・左右差/Z スコア。SPM 往復は各自 MATLAB |
+| ATLAS | **88** | 4 クリック / 1.4s で 136 領域 CSV + **SUVR 列** (参照は症例間で保持) | バッチ処理・VOI 結果の .mvs/レポート収録・左右差/Z スコア。(テンプレート記憶・行ジャンプは 2026-09-24 済) |
 | COURIER | **85** | 表示まで nii 1.3s / DICOM 4.2s。**?url=&mvs= の 1 リンクで view ごと共有**、?demo=phantom、.mvs d&d | 公開デモの実データ未配置。断面切替のワンアクション化 |
 | MINER | **65** | Radiomics CSV 2.1s (HUNTER のマスクから) | 視野非対称の registration は手動が主 (仕様)。radiomics 結果の UI が素朴 |
 | PILOT | **35** | (静的評価) 論文パイプライン 8 段中 ~3.5 段が自動 | モデル自動セグメンテーション・所見文ドラフト・write 側 LLM tool が未実装 |

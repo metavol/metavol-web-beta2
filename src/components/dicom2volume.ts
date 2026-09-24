@@ -40,25 +40,68 @@ const SOP_CLASS_MODALITY: Record<string, string> = {
     '1.2.840.10008.5.1.4.1.1.4.1': 'MR',    // Enhanced MR
     '1.2.840.10008.5.1.4.1.1.20': 'NM',     // NM Image Storage
 };
-// アプリが挙動を変える modality。これ以外 (RG / OT / SC 等) が (0008,0060) に
-// 入っていたら SOP Class を見に行く。SOP Class でも決まらなければ raw のまま返す
-// (本物の RG (単純X線) は SOP Class が CR/DX なので対応表に無く、RG のまま残る = 正しい)。
+// Secondary Capture 系 (fusion の画面キャプチャ、Patient Protocol、読影結果の貼り付け等)。
+// 画素は表示用の 8bit / RGB で**定量値を持たない**。Modality が PT を名乗っていても
+// PET として扱ってはいけない (MTV の候補や SUV 計算に紛れ込む)。
+const SECONDARY_CAPTURE_SOP = new Set([
+    '1.2.840.10008.5.1.4.1.1.7',     // Secondary Capture Image Storage
+    '1.2.840.10008.5.1.4.1.1.7.1',   // Multi-frame Single Bit SC
+    '1.2.840.10008.5.1.4.1.1.7.2',   // Multi-frame Grayscale Byte SC
+    '1.2.840.10008.5.1.4.1.1.7.3',   // Multi-frame Grayscale Word SC
+    '1.2.840.10008.5.1.4.1.1.7.4',   // Multi-frame True Color SC
+]);
+// アプリが挙動を変える modality。
 const ACTIONABLE_MODALITIES = new Set(['PT', 'PET', 'CT', 'MR', 'MRI', 'NM']);
 
 /**
  * DICOM 1 枚から「実効 modality」を返す (常に大文字、無ければ '')。
- * (0008,0060) が PT/CT/MR 等の既知値ならそれ。そうでなければ SOP Class UID から導出。
  * **modality をタグから読む箇所は必ずこれを通すこと** — 生読みすると匿名化データで
- * PT/CT が検出できず、Persona HUNTER のフロー全体 (MTV measurement) が始められない。
+ * PT/CT を取り違え、Persona HUNTER のフロー全体 (MTV measurement) が破綻する。
+ *
+ * 優先順位 (2026-09 改訂):
+ *   1. **SOP Class UID (0008,0016) が画像種別を示すなら、それを常に優先する。**
+ *      (0008,0060) と食い違っても SOP Class が正しい。SOP Class は「この IOD で保存された」
+ *      という構造上の宣言で、書き換えるとファイルが規格違反になるため匿名化ソフトは触らない。
+ *   2. Secondary Capture なのに PT/CT/MR を名乗る → 'OT' (定量画像ではない)。
+ *      PT 等を名乗っていなければ raw のまま (RG などの表示はそのまま残す)。
+ *   3. それ以外 → raw。
+ *
+ * 実例 (どちらも匿名化ソフトの仕様で Modality を一括上書き。SOP Class は無傷):
+ *   - sample-data/cart: 全シリーズ Modality=RG → 旧規則 (raw が既知値でなければ SOP) で救えた
+ *   - sample-data/ac76: **全シリーズ Modality=PT** (CT も fusion SC も)。旧規則は
+ *     「raw が既知値ならそれを信用」だったので CT が PT と判定され、MTV 測定が組めなかった。
+ *     → 「既知の値で嘘をつかれる」ケースがあるので、raw を SOP より優先してはいけない。
  */
+// ユーザが「…」→ Change modality で指定した値 (最終手段)。データセットに直接印を付ける
+// ので、dicomModalityOf を通る全箇所 (検出・一覧・SUV 化・凡例…) が自動的に従う。
+// ファイルは書き換えない (メモリ上のみ。リロードで消える)。
+const MODALITY_OVERRIDE_KEY = '__mvModalityOverride';
+
+/** シリーズ内の全データセットにユーザ指定 modality を付ける。null で解除 (自動判定に戻す)。 */
+export const setDicomModalityOverride = (dsList: object[] | null | undefined, modality: string | null) => {
+    if (!dsList) return;
+    for (const ds of dsList) {
+        if (modality) (ds as any)[MODALITY_OVERRIDE_KEY] = modality;
+        else delete (ds as any)[MODALITY_OVERRIDE_KEY];
+    }
+};
+/** このデータセットの modality がユーザ指定か (カードに印を出すため)。 */
+export const isDicomModalityOverridden = (ds: object | null | undefined): boolean =>
+    !!ds && typeof (ds as any)[MODALITY_OVERRIDE_KEY] === 'string';
+
 export const dicomModalityOf = (
     ds: { string: (tag: string, idx?: number) => string | undefined } | null | undefined,
 ): string => {
     if (!ds) return '';
+    // 0. ユーザ指定 (最終手段) が最優先。自動判定 (下の 1〜3) が外れたときの逃げ道。
+    const manual = (ds as any)[MODALITY_OVERRIDE_KEY];
+    if (typeof manual === 'string' && manual) return manual;
     const raw = (ds.string('x00080060') ?? '').toUpperCase().trim();
-    if (ACTIONABLE_MODALITIES.has(raw)) return raw;
     const sop = (ds.string('x00080016') ?? '').trim();
-    return SOP_CLASS_MODALITY[sop] ?? raw;
+    const fromSop = SOP_CLASS_MODALITY[sop];
+    if (fromSop) return fromSop;
+    if (SECONDARY_CAPTURE_SOP.has(sop) && ACTIONABLE_MODALITIES.has(raw)) return 'OT';
+    return raw;
 };
 
 const detectModality = (d: MyDataSet): Modality => {

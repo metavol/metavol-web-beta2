@@ -343,6 +343,53 @@ try {
     }
   }
 
+  // --- ⑦ 行クリックで領域へジャンプ (HUNTER の lesion table と同じ体験) ---
+  {
+    const before = await page.evaluate(() => {
+      const ss = document.querySelector('#app').__vue_app__._instance.setupState;
+      const d = (ss.dicomViewRef.value ?? ss.dicomViewRef).$.setupState;
+      const c = d.imageBoxInfos[0]?.centerInWorld;
+      return c ? [c.x, c.y, c.z] : null;
+    });
+    await dlg.locator('input[placeholder*="Filter"]').fill('Right Hippocampus');
+    await page.waitForTimeout(400);
+    await dlg.locator('.mv-voi-table tbody tr.jumpable').first().click();
+    await page.waitForTimeout(1200);
+    const after = await page.evaluate(() => {
+      const ss = document.querySelector('#app').__vue_app__._instance.setupState;
+      const d = (ss.dicomViewRef.value ?? ss.dicomViewRef).$.setupState;
+      const seg = document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s.get('segmentation');
+      const c = d.imageBoxInfos[0]?.centerInWorld;
+      return { center: c ? [c.x, c.y, c.z] : null, crosshair: !!seg.crosshairWorld };
+    });
+    const moved = before && after.center &&
+      (Math.abs(before[0] - after.center[0]) + Math.abs(before[1] - after.center[1]) + Math.abs(before[2] - after.center[2])) > 1;
+    check(!!moved && after.crosshair, '行クリックで box 中心 + crosshair が領域へ動く',
+          `${JSON.stringify(before?.map(v => +v.toFixed(1)))} → ${JSON.stringify(after.center?.map(v => +v.toFixed(1)))}`);
+    await dlg.locator('input[placeholder*="Filter"]').fill('');
+  }
+
+  // --- ⑧ テンプレートの永続化 (IndexedDB): reload しても残り、ダイアログを開くと自動解析 ---
+  {
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => !!document.querySelector('#app')?.__vue_app__, null, { timeout: 60000 });
+    await page.waitForFunction(
+      () => ((document.querySelector('#app')?.__vue_app__?._instance?.setupState?.seriesSummariesView?.length ?? 0) >= 1),
+      null, { timeout: 300000 });
+    await page.waitForTimeout(5000);
+    await page.locator('.v-app-bar button').first().click();
+    await page.waitForTimeout(500);
+    await page.locator('.v-overlay .v-list-item', { hasText: 'VOI analysis' }).first().click();
+    await page.waitForTimeout(1000);
+    const dlg2 = page.locator('.mv-voi-card');
+    const info2 = await dlg2.locator('.mv-voi-info').innerText().catch(() => '');
+    check(/Neuromorphometrics/.test(info2), 'reload 後もテンプレートが復元されている (IndexedDB)');
+    await page.waitForFunction(() => document.querySelectorAll('.mv-voi-table tbody tr').length >= 100,
+      null, { timeout: 60000 }).catch(() => {});
+    const rows2 = await dlg2.locator('.mv-voi-table tbody tr').count();
+    check(rows2 === 136, 'ダイアログを開くだけで自動解析が走る (復元テンプレート + 画像)', `${rows2} 行`);
+  }
+
   console.log(`\n  ダイアログ: ${dialogs.length ? JSON.stringify(dialogs) : 'なし'}`);
   console.log(`  console error: ${errors.length ? errors.length + ' 件' : 'なし'}`);
   if (errors.length) failed = true;

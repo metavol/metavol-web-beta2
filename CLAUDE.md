@@ -162,15 +162,41 @@ coronal/sagittal 撮像では解剖学的に正しくない (断面ベクトル�
 
 ### PET/CT 自動検出
 - **modality はタグの生読み禁止。必ず `dicomModalityOf(ds)` (dicom2volume.ts) を通すこと** (2026-09)。
-  `(0008,0060)` がアプリの扱う既知値 (PT/PET/CT/MR/NM) ならそれ、そうでなければ
-  **SOP Class UID (0008,0016)** から導出する (PET Image Storage → PT 等)。
-- 理由: **匿名化ソフトが Modality を一括で書き換える実例**がある
-  (実測 sample-data/cart: 全 13 シリーズ Modality=RG。SOP Class と SUV 用タグは無傷)。
-  生読みだと PT/CT を検出できず、Persona HUNTER の MTV measurement 自体が始められない。
-- SOP Class は規格上の確定情報なので、**voxel 分布からの推定 (既知バグ 4 で禁止) とは別物**。
-  Secondary Capture (fusion キャプチャや Patient Protocol) は対応表に無いので RG のまま残る = 正しい。
-- 検証: `npm run check:cart` (PT×4/CT×4 復元、SC は RG のまま、SUV 化成立、
-  MTV measurement → Apply → Lesion table 257 行まで通し)。
+- **判定規則 (2026-09-25 改訂 v2)**:
+  0. **ユーザの手動指定 (最終手段) が最優先** — シリーズカードの「…」→ **Change modality** →
+     Set as PT / CT / MR / **Auto (from file)** (= 手動指定の解除)。`setDicomModalityOverride` が
+     データセットに印 (`__mvModalityOverride`) を付けるので、dicomModalityOf を通る全箇所が従う。
+     **DICOM は volume を作り直す** (PT の voxel は SUV 倍、CT は HU のままなので、ラベルだけ
+     差し替えると値の単位が壊れる)。作り直しの前に旧 volume への store 参照を外し、
+     旧 GPU texture を evict し、そのシリーズを映す box の W/L を既定窓に戻す。
+     マスクが載っていれば確認ダイアログ (作り直しで消えるため)。カードのチップは `PT*` +
+     点線枠で「手動」と分かる。**メモリ上のみ** (ファイルは書き換えない。リロードで消える)。
+     NIfTI は従来の「Set as」と同じ関数 (`onSetSeriesModality`) に来て、metadata を書き換える
+     (初回に自動判定結果を `autoModality` に憶え、Auto で戻せる)。
+     検証: `npm run check:modality-override` (cart の CT を PT にして戻す往復。
+     手動の印 / 作り直し / petVolumeRef 付け替え / Auto で CT に戻る / **HU 値が往復で不変**)。
+     ⚠ サブメニューは `open-on-hover open-on-click` + activator に `@click.stop`。無いと
+     クリックで親メニューごと閉じてタッチ操作では開けない (実測で踏んだ)。
+  1. **SOP Class UID (0008,0016) が画像種別 (PET/CT/MR/NM Image Storage 等) を示すなら常にそれ**。
+     (0008,0060) と食い違っても SOP Class が正しい
+  2. **Secondary Capture なのに PT/CT/MR を名乗る → 'OT'** (画面キャプチャで定量値を持たない)
+  3. それ以外 → (0008,0060) の生の値
+- 理由: **匿名化ソフトが Modality を一括で書き換える実例が 2 種類ある** (どちらも SOP Class は無傷):
+  - sample-data/cart: 全シリーズ **RG** に上書き
+  - sample-data/ac76: 全シリーズ **PT** に上書き (CT も fusion の SC も)。v1 の規則
+    「(0008,0060) が既知値ならそれを信用、既知値でなければ SOP」は cart は救えたが、
+    ac76 では **既知の値で嘘をつかれ** CT が PT 判定され MTV が組めなかった。
+    → **(0008,0060) を SOP Class より優先してはいけない。**
+- SOP Class は規格上の確定情報 (書き換えるとファイルが規格違反になるので匿名化ソフトは触らない)。
+  **voxel 分布からの推定 (既知バグ 4 で禁止) とは別物**。
+- **CT は「実際に使う PET」に合わせて選ぶ** (`bestCtIndexForPet`, 2026-09-25):
+  同じ FrameOfReference → 同じ study → active → 最上位。以前は PT と CT を独立に
+  「active → 最上位」で選んでいたため、複数 study (経時比較で同一患者の複数回撮影) を一緒に
+  読むと別 study の CT と組まれうる。ac76 (4 study) では先頭 study が両方の最上位で**偶然**
+  成立していただけ。ピッカーでも PT を選び直すと CT の既定が追従する (App.vue の watch)。
+- 検証: `npm run check:cart` (cart と ac76 の両方): SOP Class と一覧の modality を突き合わせ /
+  SC が PT/CT を名乗らない / **全 PET について選ばれる CT が同じ study** / ピッカー追従 /
+  SUV 化 / MTV measurement → Apply → Lesion table まで通し。
 - DicomView の `doSort()` 末尾で `detectPetCtFromDicom()` 実行。MPR 後は `refreshSegStoreVolumeRefs()` で volume 参照を最新化。
 
 ### Pinia Proxy トラップに注意（既知の落とし穴）
@@ -1269,6 +1295,18 @@ per-label 非表示 (着色画素 2817→2212→2817) まで画素で検査す�
 - 検証: `npm run check:mask-dnd` (ダイアログ文言 / OK でシリーズ不増 + MASK カード + 着色画素 /
   Cancel でシリーズ +1 → **Use as mask で救済** / sidecar 復元)。
 
+**テンプレートは IndexedDB に憶える (2026-09, `voi/templatePersistence.ts`)。**
+読み込み成功時に丸ごと保存 (ラベル volume 8.5MB 込み)、起動時 (onMounted) に復元する。
+保存先はユーザ自身のブラウザなので CC BY-NC (同梱配布の禁止) に抵触しない。
+結果 (labelOf/stats) は復元しない — 画像が違うかもしれないので、**ダイアログを開いたときに
+候補があれば自動で解析し直す** (VoiAnalysisDialog の watch(open))。
+THREE.Vector3 は structured clone で prototype が落ちるため、数値配列に分解して保存し
+復元時に組み直す。検証: `check:voi-ui` ⑧ (reload → 復元 → ダイアログを開くだけで 136 行)。
+
+**VOI 表の行クリックで領域へジャンプ (2026-09)。** `jumpToVoiRegion(labelId)` が labelOf の
+重心を world へ変換して `jumpToWorld` (HUNTER の lesion jump と同じ)。voxel 0 の領域は不可。
+検証: `check:voi-ui` ⑦。
+
 **テンプレートを読み込んだら、そのまま解析まで走らせること (2026-08)。**
 overlay は `labelOf` (割り当て結果) が無いと描けず、それを作るのは `runVoiAnalysis` だけ。
 以前は読み込みで止まっていたので、**「テンプレートが画像に合っているか」を目視で確かめられなかった**
@@ -1341,7 +1379,8 @@ npm run check:orient     # ★ 表示の前後/左右が解剖学的に正しい
 npm run check:mask-dnd   # ★ d&d でマスク .nii を落としたときの自動判定 → 確認 → 取り込み
 npm run check:ui-misc    # ★ voxel probe / ラベル色変更 / beforeunload / native legend の UI 検査
 npm run check:courier    # ★ ?demo=phantom / ?mvs= / .mvs d&d (リンク共有まわり)
-npm run check:cart       # ★ 匿名化で Modality=RG に書き換えられた DICOM の SOP Class 復元
+npm run check:cart       # ★ 匿名化で Modality を書き換えられた DICOM (cart=RG / ac76=PT) の SOP Class 復元 + PT/CT ペアリング
+npm run check:modality-override  # ★ シリーズの「…」→ Change modality (手動指定の最終手段) の往復
 ```
 
 計測用 (合否ではなく数値を見るもの):
@@ -1360,6 +1399,36 @@ console.error 監視では見逃す。このスクリプトは `console.warn` �
 実データが要るスクリプトは先に `npm run dev` を起動しておく (既定 3000 番)。
 
 ---
+
+## ⚠ vue-tsc は実質アプリを検査していない (2026-09-25 判明)
+
+**`tsconfig.json` の `include` が `./src/typed-router.d.ts` の 1 ファイルだけ**なので、
+`npx vue-tsc --noEmit -p tsconfig.json` の exit=0 は**空振り**。これまでの「型チェック PASS」は
+アプリのコードについて何も保証していない。実際に素通りしたもの:
+未 import の `watch` (App.vue、実行時 ReferenceError になるところだった) / 型 import への値アクセス (下記)。
+
+- 本来の範囲 (`src/**/*.ts`, `src/**/*.vue`) を含めて回すと **56 件の構文エラー**が出る
+  (DicomView.vue 30 / Sidebar.vue 26)。すべて**テンプレートのインラインハンドラに書いた
+  TS 型注釈** (`@x="(p: { index: number }) => ..."`) が JS として解釈されているもの。
+  構文エラーがあると TS は意味検査 (未定義名など) を**そもそも走らせない**ので、その先に
+  何件の本物のエラーがあるかは未計測。
+- **直すまでの運用**: 型チェックを安全網と見なさない。**編集後は必ず UI check を 1 本以上回す**
+  (アプリが mount しない種類の事故はそれで即わかる)。
+- TODO に「型チェック範囲の是正」として積んである (テンプレート内の型注釈の扱い →
+  include 拡張 → 意味エラーの棚卸し の順)。
+
+## vue-tsc が見逃す実行時クラッシュ: 型 import への値アクセス (2026-09 実測)
+
+`import { Volume, voxelToWorld } from "./Volume.ts"` (Volume は `export type`) の環境で
+**`Volume.voxelToWorld(...)` と書くとアプリが起動時に丸ごと落ちる**
+("does not provide an export named 'Volume'")。値として使われた瞬間に esbuild が
+import を残し、実行時に存在しない named export を要求するため。
+**vue-tsc は通る** (実測 exit=0) ので型チェックでは捕まらない。
+
+- 対策: Volume.ts の関数は **直接 import した名前** (`voxelToWorld` 等) で呼ぶ。
+  `Volume.` 前置は型注釈 (`v: Volume.Volume` 等、erasure される位置) 以外で使わない。
+- 検出: `npm run check` 系はどれでも「アプリが mount しない」ので即死でわかるが、
+  **編集後に 1 本も UI check を回さないと気付けない**。大きな編集の後は最低 1 本回すこと。
 
 ## 開発時の小ワザ
 
@@ -1574,9 +1643,11 @@ console.error 監視では見逃す。このスクリプトは `console.warn` �
   1. **自動シリーズ選択** — 読み込んだ study から AC PT + 診断 CT を自動で選んで
      PET Standard を組む (detectPetCtFromDicom の拡張。LLM 不要のルールでもかなり届く)
   2. **モデルベース自動セグメンテーション** — TotalSegmentator 等 (TODO 済み項目と直結。
-     registration 3.59 の解剖ランドマークとも共用できる)
+     registration 3.59 の解剖ランドマークとも共用できる)。
+     **実行方式はローカルサーバ一択 (2026-09-23 ユーザ決定)**: 各自の PC で Python サーバを
+     立て、metavol-web は localhost の API へ投げる。ブラウザ内 wasm 推論は採らない
   3. **LLM の write 側 tool** — 「threshold 2.5 を適用して」「肝臓の集積を Physiological に」
-     等を tool calling で実行 (ユーザ pending の「LLM write-side tools」がこれ)
+     等を tool calling で実行 (**2026-09-23 ユーザが解禁**。未実装)
   4. **構造化ドラフトレポート生成** — lesion table + 画像を LLM に渡して所見文を下書き
      (buildReportInput が既に唯一の組み立て箇所なので、そこに載せる)
 - **安全設計** (論文の結論から): 自動結果は**常に draft** として提示し、確定操作

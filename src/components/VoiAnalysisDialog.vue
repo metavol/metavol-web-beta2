@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, watch } from 'vue';
 import { useVoiStore } from '../stores/voi';
 import { useSegmentationStore } from '../stores/segmentation';
 
@@ -17,10 +17,21 @@ const emit = defineEmits<{
   (e: 'loadTemplate'): void;
   (e: 'run', index: number): void;
   (e: 'exportCsv'): void;
+  (e: 'jumpRegion', labelId: number): void;
   (e: 'overlayChanged'): void;
 }>();
 
 const open = defineModel<boolean>('open', { default: false });
+
+// ダイアログを開いたとき、復元済みテンプレート + 解析対象があるのに結果が無ければ
+// 自動で解析する (IndexedDB 復元後の初回。読み込み時の自動解析と同じ「開く = 確認」の思想)。
+watch(open, (v) => {
+  if (!v) return;
+  if (store.hasTemplate && !store.hasResults) {
+    const idx = effectiveIndex.value;
+    if (idx >= 0) emit('run', idx);
+  }
+});
 const store = useVoiStore();
 // overlay の表示/透過度は **MTV マスクと同じ state** (segmentation store)。
 // ここに独自の透過度を持つと「マスクパネルのスライダと別物」になり操作が二重化する。
@@ -220,7 +231,12 @@ const box = (b: [number, number][] | undefined) =>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="s in rows" :key="s.id" :class="{ empty: s.voxels === 0 }">
+                <!-- 行クリックで領域へジャンプ (voxel が無い領域は飛べない)。
+                     ダイアログの後ろの box が動くので、脇に寄せて使う想定。 -->
+                <tr v-for="s in rows" :key="s.id"
+                    :class="{ empty: s.voxels === 0, jumpable: s.voxels > 0 }"
+                    :title="s.voxels > 0 ? 'Click: jump to this region' : ''"
+                    @click="s.voxels > 0 && emit('jumpRegion', s.id)">
                   <td>{{ s.name }}</td>
                   <td class="num">{{ s.voxels }}</td>
                   <td class="num">{{ num(s.volumeMl, 2) }}</td>
@@ -279,4 +295,6 @@ const box = (b: [number, number][] | undefined) =>
 .mv-voi-table td { padding: 3px 8px; border-top: 1px solid var(--mv-border, #2a3441); }
 .mv-voi-table td.num, .mv-voi-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .mv-voi-table tr.empty { opacity: .45; }
+.mv-voi-table tr.jumpable { cursor: pointer; }
+.mv-voi-table tr.jumpable:hover td { background: rgba(0, 212, 170, 0.08); }
 </style>

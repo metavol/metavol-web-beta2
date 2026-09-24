@@ -35,11 +35,12 @@ const props = defineProps<{
         isRgb: boolean;
         sourceType: 'DICOM' | 'NIFTI';
         datatypeName?: string;
+        modalityOverridden?: boolean;
     }>;
 }>();
 
 const emit = defineEmits<{
-    (e: 'setModality', payload: { index: number; modality: 'PT' | 'CT' | 'MR' }): void;
+    (e: 'setModality', payload: { index: number; modality: 'PT' | 'CT' | 'MR' | 'AUTO' }): void;
     (e: 'setActiveForSeg', payload: { index: number; modality: 'PT' | 'CT' }): void;
     (e: 'inspectRaw', payload: { index: number }): void;
     (e: 'viewHeader', payload: { index: number }): void;
@@ -202,6 +203,39 @@ const sliceLabelFor = (s: { index: number }): string | null => {
                     <!-- DICOM -> NIfTI 変換。**box に出していないシリーズでも変換できる**ことが肝。
                          以前はここが "No actions for DICOM" で、変換は box のタイトルバー経由しか
                          なかった。既定は .nii.gz (Float32 なので CT は素だと数百 MB になる)。 -->
+                    <!-- モダリティの手動指定 (最終手段, 2026-09)。自動判定 (SOP Class → Modality タグ) が
+                         外れたとき用。匿名化ソフトが Modality を書き換えた実例 (cart=RG / ac76=PT) を受けて追加。
+                         普段の動線には出さず「…」の奥に置く (HUNTER のクリック数を増やさない)。 -->
+                    <!-- open-on-hover + open-on-click: マウスはホバー、タッチ/クリック派はクリックで開く。
+                         activator のクリックが親メニュー (close-on-content-click) まで伝わると
+                         親ごと閉じてサブメニューが開けない (実測) ので @click.stop で止める。 -->
+                    <v-menu location="end" open-on-hover open-on-click :close-on-content-click="true">
+                        <template v-slot:activator="{ props: mp }">
+                            <v-list-item v-bind="mp" class="mv-change-modality" @click.stop>
+                                <template v-slot:prepend>
+                                    <v-icon icon="mdi-swap-horizontal" size="small" />
+                                </template>
+                                <v-list-item-title>Change modality</v-list-item-title>
+                                <v-list-item-subtitle>If this series was detected as the wrong type</v-list-item-subtitle>
+                                <template v-slot:append>
+                                    <v-icon icon="mdi-menu-right" size="small" />
+                                </template>
+                            </v-list-item>
+                        </template>
+                        <v-list density="compact">
+                            <v-list-item v-for="m in (['PT', 'CT', 'MR'] as const)" :key="m"
+                                         :disabled="s.modality === m && !!s.modalityOverridden"
+                                         @click="emit('setModality', { index: s.index, modality: m })">
+                                <v-list-item-title>Set as {{ m }}</v-list-item-title>
+                            </v-list-item>
+                            <v-divider />
+                            <v-list-item :disabled="!s.modalityOverridden"
+                                         @click="emit('setModality', { index: s.index, modality: 'AUTO' })">
+                                <v-list-item-title>Auto (from file)</v-list-item-title>
+                                <v-list-item-subtitle>Undo the manual setting</v-list-item-subtitle>
+                            </v-list-item>
+                        </v-list>
+                    </v-menu>
                     <!-- d&d の自動判定に乗らなかった / Cancel してしまったマスクを手動で取り込み直す。
                          判定と取り込みは DicomView.onUseSeriesAsMask (失敗理由は alert で出る)。 -->
                     <v-list-item
@@ -214,19 +248,21 @@ const sliceLabelFor = (s: { index: number }): string | null => {
                         <v-list-item-title>Use as mask</v-list-item-title>
                         <v-list-item-subtitle>Treat this volume as a label mask on the matching image</v-list-item-subtitle>
                     </v-list-item>
+                    <!-- SPM12 は .nii.gz を直接読めないため、SPM 用途の .nii を先頭に置く
+                         (以前は .nii.gz が先で、ATLAS のユーザが毎回展開の一手間を踏んでいた)。 -->
+                    <v-list-item @click="emit('exportNifti', { index: s.index, gzip: false })">
+                        <template v-slot:prepend>
+                            <v-icon icon="mdi-download" size="small" />
+                        </template>
+                        <v-list-item-title>Export as NIfTI (.nii) — for SPM</v-list-item-title>
+                        <v-list-item-subtitle>Uncompressed; SPM12 cannot read .nii.gz</v-list-item-subtitle>
+                    </v-list-item>
                     <v-list-item @click="emit('exportNifti', { index: s.index, gzip: true })">
                         <template v-slot:prepend>
                             <v-icon icon="mdi-download-outline" size="small" />
                         </template>
                         <v-list-item-title>Export as NIfTI (.nii.gz)</v-list-item-title>
-                        <v-list-item-subtitle>Downloads a .zip with the image + sidecar</v-list-item-subtitle>
-                    </v-list-item>
-                    <v-list-item @click="emit('exportNifti', { index: s.index, gzip: false })">
-                        <template v-slot:prepend>
-                            <v-icon icon="mdi-download" size="small" />
-                        </template>
-                        <v-list-item-title>Export as NIfTI (.nii)</v-list-item-title>
-                        <v-list-item-subtitle>Uncompressed image inside the .zip</v-list-item-subtitle>
+                        <v-list-item-subtitle>Smaller download (.zip with image + sidecar)</v-list-item-subtitle>
                     </v-list-item>
                 </v-list>
             </v-menu>
@@ -258,8 +294,10 @@ const sliceLabelFor = (s: { index: number }): string | null => {
             </div>
             <div class="meta">
                 <div class="row1">
-                    <span class="modality" :style="{ background: modalityChip(s.modality).color }">
-                        {{ modalityChip(s.modality).text }}
+                    <span class="modality" :class="{ 'is-manual': s.modalityOverridden }"
+                          :style="{ background: modalityChip(s.modality).color }"
+                          :title="s.modalityOverridden ? 'Modality set manually (… → Change modality → Auto to undo)' : undefined">
+                        {{ modalityChip(s.modality).text }}<span v-if="s.modalityOverridden" class="manual-mark">*</span>
                     </span>
                     <span
                         class="source-chip"
@@ -307,6 +345,15 @@ const sliceLabelFor = (s: { index: number }): string | null => {
 </template>
 
 <style scoped>
+/* 手動指定された modality の印 (点線の枠 + *)。自動判定と見分けられるように */
+.modality.is-manual {
+    outline: 1px dashed rgba(255, 255, 255, 0.85);
+    outline-offset: 1px;
+}
+.manual-mark {
+    margin-left: 1px;
+    font-weight: 700;
+}
 .series-card {
     display: flex;
     gap: 8px;

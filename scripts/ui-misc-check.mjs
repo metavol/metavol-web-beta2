@@ -55,6 +55,25 @@ try {
     const page = await openApp('?dev=spm-normalized');
     await page.waitForTimeout(6000);
 
+    // --- A0) 小 matrix volume の初期フィットズーム (79x95 の脳が切手サイズで開かない) ---
+    {
+      const frac = await page.evaluate(() => {
+        const cv = [...document.querySelectorAll('canvas')].filter(c => c.width > 64)[0];
+        if (!cv) return 0;
+        const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+        let minX = cv.width, maxX = 0;
+        for (let y = 0; y < cv.height; y += 2) {
+          for (let x = 0; x < cv.width; x += 2) {
+            const i = (y * cv.width + x) * 4;
+            if (d[i] + d[i + 1] + d[i + 2] > 30) { if (x < minX) minX = x; if (x > maxX) maxX = x; }
+          }
+        }
+        return maxX > minX ? (maxX - minX) / cv.width : 0;
+      });
+      check(frac > 0.4, '小 matrix の脳が box を占める大きさで開く (初期フィットズーム)',
+            `内容幅 ${(frac * 100).toFixed(0)}% of box`);
+    }
+
     // --- A) Voxel probe (通常機能) ---
     // View options メニュー (mdi-tune-variant) → "Voxel inspector OFF" をクリックして ON にする
     await page.locator('.v-app-bar .mdi-tune-variant').first().click();
@@ -230,6 +249,18 @@ try {
     check(legends >= state.natives, 'native box にカラースケール legend が出る', `legend ${legends}`);
     const legendText = await page.locator('.mv-clut-legend').first().innerText().catch(() => '');
     check(legendText.trim().length > 0, 'legend に min/max ラベルが入っている', JSON.stringify(legendText.replace(/\s+/g, ' ')));
+
+    // --- D2) Export メニューは SPM 用の .nii が先頭 (SPM12 は .nii.gz を読めない) ---
+    const card0 = page.locator('.series-card').first();
+    await card0.hover();
+    await card0.locator('.card-menu-btn').click();
+    await page.waitForTimeout(400);
+    const items = await page.locator('.v-overlay .v-list-item-title').allTextContents();
+    const niiIdx = items.findIndex(t => t.includes('(.nii) — for SPM'));
+    const gzIdx = items.findIndex(t => t.includes('(.nii.gz)'));
+    check(niiIdx >= 0 && gzIdx >= 0 && niiIdx < gzIdx,
+          'Export メニューは .nii (for SPM) が .nii.gz より先', JSON.stringify(items.filter(t => t.includes('NIfTI'))));
+    await page.keyboard.press('Escape');
     await page.close();
   }
 

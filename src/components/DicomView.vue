@@ -33,7 +33,7 @@ import sidebar from "./Sidebar.vue";
 import imagebox from "./ImageBox.vue";
 import { ImageBoxInfoBase, DicomSliceImageBoxInfo, VolumeImageBoxInfo, defaultInfo, pushVolume, FusedVolumeImageBoxInfo, makeMipState } from "./DicomImageBoxInfo";
 import { getAllFilesRecursive } from "./DragAndDropUtil";
-import { generateVolumeFromDicom, dicomModalityOf } from './dicom2volume.ts';
+import { generateVolumeFromDicom, dicomModalityOf, setDicomModalityOverride, isDicomModalityOverridden } from './dicom2volume.ts';
 import { readDicomPixels, readDicomPixelsAsInt16, autoWindowFromPixels } from './dicomPixels.ts';
 import * as DecompressJpegLossless from "./decompressJpegLossless";
 import { getSeriesTransferSyntaxInfo } from "./transferSyntax";
@@ -49,6 +49,7 @@ import { useVoiStore } from "../stores/voi";
 import { parseLabelFile, parseNiftiLabelVolume, checkVoiTemplate } from "./voi/voiTemplate";
 import { assignVoiLabels, diagnoseOverlap, overlapWarnings } from "./voi/voiResample";
 import { computeVoiStats, voiStatsToCsv } from "./voi/voiStats";
+import { saveVoiTemplate, loadVoiTemplate } from './voi/templatePersistence';
 import { buildCategoricalClut } from "./Clut";
 import { analyzeLabelMaskCandidate } from './segmentation/niftiReader';
 import { autoWindowFromVolume } from "./volumeWindow";
@@ -285,6 +286,7 @@ export interface SeriesSummary {
   isPrimary: boolean;
   isRgb: boolean;     // RGB / カラー画像 (thumbnail 生成・表示の警告用)
   sourceType: 'DICOM' | 'NIFTI';  // 読み込み元ファイル種別 (Sidebar カードに表示)
+  modalityOverridden?: boolean;   // ユーザが Change modality で手動指定したか (カードに印)
   datatypeName?: string;          // 元データの voxel datatype label (例 'Int16', 'Uint16', 'Float32')
 }
 const seriesSummaries = ref<SeriesSummary[]>([]);
@@ -340,6 +342,15 @@ window.addEventListener('beforeunload', onBeforeUnloadGuard);
 onUnmounted(() => window.removeEventListener('beforeunload', onBeforeUnloadGuard));
 
 onMounted(() => {
+  // 前回のセッションで読み込んだ VOI テンプレートを復元する (ATLAS)。
+  // 結果 (labelOf/stats) は復元しない — 画像が違うかもしれないので、
+  // ダイアログを開いたときに (候補があれば) 自動で解析し直す。
+  void loadVoiTemplate().then(rec => {
+    if (!rec || voiStore.hasTemplate) return;
+    voiStore.setTemplate(rec.template, rec.check);
+    console.log(`[voi-template] restored: ${rec.template.sourceName} (${rec.template.labels.length} labels)`);
+  });
+
   // Parity test 用 window globals: Playwright や DevTools console から叩ける。
   // - isReady(): 全ボックスが描画準備完了か
   // - setMode(m): renderer mode を強制 + 全 box redraw
@@ -1837,6 +1848,10 @@ const loadVoiTemplateFiles = async (files: File[]): Promise<{ ok: boolean; messa
     const volume = parseNiftiLabelVolume(await nii.arrayBuffer(), nii.name);
     const check = checkVoiTemplate(volume, labels);
     voiStore.setTemplate({ volume, labels, header, sourceName: nii.name }, check);
+    // テンプレートをブラウザに憶える (ATLAS: 症例ごとに選び直させない)。失敗しても続行。
+    void saveVoiTemplate({ volume, labels, header, sourceName: nii.name }, check)
+      .then(() => console.log('[voi-template] saved to IndexedDB'))
+      .catch(e => console.warn('[voi-template] save failed', e));
     const notes: string[] = [];
     if (check.missingInTable.length) notes.push(`${check.missingInTable.length} label(s) in the volume have no name`);
     if (check.missingInVolume.length) notes.push(`${check.missingInVolume.length} named label(s) are absent from the volume`);
@@ -1925,6 +1940,29 @@ const runVoiAnalysis = (seriesIndex: number): { ok: boolean; message: string } =
   boxStateVersion.value++;
   show();
   return { ok: true, message: `${nonEmpty} of ${tpl.labels.length} regions received voxels.` };
+};
+
+// VOI 表の行クリックで、その領域の重心へ crosshair + 全 volume box をジャンプさせる
+// (HUNTER の lesion table の jump と同じ体験を ATLAS にも)。
+// 重心は labelOf (割り当て結果) の voxel 平均 → 解析対象シリーズの affine で world へ。
+const jumpToVoiRegion = (labelId: number) => {
+  const lab = voiStore.labelOf;
+  const sIdx = voiStore.analyzedSeriesIndex;
+  if (!lab || sIdx < 0 || sIdx >= seriesList.length) return;
+  const v = seriesList[sIdx].volume;
+  if (!v) return;
+  const nx = v.nx, ny = v.ny;
+  let n = 0, si = 0, sj = 0, sk = 0;
+  for (let idx = 0; idx < lab.length; idx++) {
+    if (lab[idx] !== labelId) continue;
+    n++;
+    si += idx % nx;
+    sj += ((idx / nx) | 0) % ny;
+    sk += (idx / (nx * ny)) | 0;
+  }
+  if (n === 0) return;
+  const w = voxelToWorld(new THREE.Vector3(si / n + 0.5, sj / n + 0.5, sk / n + 0.5), v);
+  jumpToWorld(w);
 };
 
 const downloadVoiCsv = () => {
@@ -4120,14 +4158,65 @@ const onSetActiveForSeg = (payload: { index: number; modality: 'PT' | 'CT' }) =>
   show();
 };
 
-const onSetSeriesModality = (payload: { index: number; modality: 'PT' | 'CT' | 'MR' }) => {
+// モダリティの手動指定 (最終手段, 2026-09)。NIfTI の「Set as PT/CT/MR」と
+// DICOM の「…」→ Change modality の両方がここに来る。'AUTO' は自動判定に戻す。
+//
+// **DICOM は volume を作り直す。** PT の voxel は SUV 倍、CT は HU そのままなので、
+// ラベルだけ差し替えると値の単位が壊れる。dicomModalityOf がユーザ指定を最優先で返すので、
+// 印を付けてから generateVolumeFromDicom し直せば SUV 化の有無も正しく決まる。
+const onSetSeriesModality = (payload: { index: number; modality: 'PT' | 'CT' | 'MR' | 'AUTO' }) => {
   const { index, modality } = payload;
   if (index < 0 || index >= seriesList.length) return;
-  const v = seriesList[index].volume;
+  const s = seriesList[index];
+
+  if (s.myDicom && s.myDicom.length > 0) {
+    // 解析中のマスクがこのシリーズに載っているなら、失われることを確認する
+    // (modality が変わると volume を作り直すので、同じ格子でもマスクは別物になる)。
+    const cur = segStore.petVolumeRef;
+    const onThis = !!cur && !!s.volume && cur.voxel === s.volume.voxel;
+    if (onThis && segStore.finalMask && segStore.finalMask.some(x => x !== 0)) {
+      if (!window.confirm('Changing the modality rebuilds this series. The current mask on it will be cleared. Continue?')) return;
+    }
+    setDicomModalityOverride(s.myDicom, modality === 'AUTO' ? null : modality);
+    const old = s.volume;
+    if (old) {
+      // 旧 volume を参照している store の参照を外してから作り直す
+      if (segStore.petVolumeRef?.voxel === old.voxel) segStore.setPetVolume(null);
+      if (segStore.ctVolumeRef?.voxel === old.voxel) segStore.setCtVolume(null);
+      if (segStore.mrVolumeRef?.voxel === old.voxel) segStore.setMrVolume(null);
+      s.volume = generateVolumeFromDicom(s.myDicom);
+      evictVolumeTexture(old.voxel);   // GPU cache は voxel 参照 key。旧 texture を解放
+      // このシリーズを表示している box は window の単位が変わる (SUV ⇔ HU) ので既定窓に戻す
+      const def = defaultWcWwForVolume(s.volume);
+      for (let i = 0; i < imageBoxInfos.value.length; i++) {
+        const info = imageBoxInfos.value[i] as any;
+        if (info && info.currentSeriesNumber === index && 'centerInWorld' in info) {
+          info.myWC = def.wc; info.myWW = def.ww;
+        }
+      }
+      const nv = s.volume;
+      const m = nv.metadata?.modality;
+      if (m === 'PT') segStore.setPetVolume(nv);
+      else if (m === 'CT') segStore.setCtVolume(nv);
+      else if (m === 'MR') segStore.setMrVolume(nv);
+    }
+    refreshSegStoreVolumeRefs();
+    rebuildSeriesSummaries();
+    boxStateVersion.value++;
+    show();
+    return;
+  }
+
+  // ---- NIfTI (volume のみ) ----
+  const v = s.volume;
   if (!v) return;
   const existing = v.metadata;
+  // 初回の手動指定時に自動判定の結果を憶えておき、'AUTO' で戻せるようにする
+  const autoModality = (existing as any)?.autoModality ?? existing?.modality ?? 'OTHER';
+  const nextModality = modality === 'AUTO' ? autoModality : modality;
   v.metadata = {
-    modality,
+    autoModality,
+    modality: nextModality,
     seriesUID: existing?.seriesUID ?? `nii-${index}-${Date.now()}`,
     seriesDescription: existing?.seriesDescription,
     suvFactor: existing?.suvFactor,
@@ -4138,11 +4227,11 @@ const onSetSeriesModality = (payload: { index: number; modality: 'PT' | 'CT' | '
     acquisitionTimeSec: existing?.acquisitionTimeSec,
     units: existing?.units,
   };
-  if (modality === 'PT') {
+  if (nextModality === 'PT') {
     segStore.setPetVolume(v);
-  } else if (modality === 'CT') {
+  } else if (nextModality === 'CT') {
     segStore.setCtVolume(v);
-  } else {
+  } else if (nextModality === 'MR') {
     segStore.setMrVolume(v);
   }
   rebuildSeriesSummaries();
@@ -4868,10 +4957,46 @@ const promoteBoxToVolume = (boxId: number, seriesIdx: number) => {
     // つまり axial が**前後逆**に表示されていた
     // (アトラスの前頭極−後頭極を画面下に射影して +165mm = 前頭極が下、と実測)。
     // 取得断面は保ったまま向きだけ解剖学的に決める。
-    ...planeVectorsWorld(v, nativePlaneOf(v)),
+    ...fitPlaneVectorsToBox(v, planeVectorsWorld(v, nativePlaneOf(v)), boxId),
     isMip: false,
     mip: null,
   } as VolumeImageBoxInfo;
+};
+
+// 小さい matrix の volume が「1 voxel = 1 画素」で切手サイズに開く問題 (実測: 79x95 の脳が
+// 数 cm 角) への対策。volume の world 範囲を box の画素数と比べ、**内容が box の 70% に
+// 満たないときだけ**拡大して ~85% を占めるようにする。
+// **縮小はしない** — 大きな CT が canvas から溢れる従来挙動は既知で、ここで変えると
+// MTV standard view など既存レイアウトの見た目が全部変わってしまう。
+const fitPlaneVectorsToBox = (
+  v: Volume.Volume,
+  pv: { vecx: THREE.Vector3; vecy: THREE.Vector3; vecz: THREE.Vector3 },
+  boxId: number,
+): { vecx: THREE.Vector3; vecy: THREE.Vector3; vecz: THREE.Vector3 } => {
+  const boxW = imageBoxW.value ?? 0;
+  const boxH = boxRenderHeight(boxId);
+  if (boxW <= 0 || boxH <= 0) return pv;
+  // volume の world bbox (8 隅) を画面軸 (vecx/vecy の単位ベクトル) に射影して内容の mm 幅を得る
+  const ux = pv.vecx.clone().normalize();
+  const uy = pv.vecy.clone().normalize();
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  const p = new THREE.Vector3();
+  for (let c = 0; c < 8; c++) {
+    p.set((c & 1) ? v.nx : 0, (c & 2) ? v.ny : 0, (c & 4) ? v.nz : 0);
+    const w = voxelToWorld(p, v);
+    const px = w.dot(ux), py = w.dot(uy);
+    if (px < minX) minX = px; if (px > maxX) maxX = px;
+    if (py < minY) minY = py; if (py > maxY) maxY = py;
+  }
+  const contentW = (maxX - minX) / pv.vecx.length();   // 内容の幅 (画素数)
+  const contentH = (maxY - minY) / pv.vecy.length();
+  if (!isFinite(contentW) || !isFinite(contentH) || contentW <= 0 || contentH <= 0) return pv;
+  const fill = Math.max(contentW / boxW, contentH / boxH);
+  if (fill >= 0.7) return pv;   // 十分大きく見えているなら触らない
+  const scale = fill / 0.85;    // mm/px を下げる = 拡大 (0.85 = 余白 15%)
+  pv.vecx.multiplyScalar(scale);
+  pv.vecy.multiplyScalar(scale);
+  return pv;
 };
 
 /**
@@ -5936,10 +6061,12 @@ const rebuildSeriesSummaries = () => {
   for (let i = 0; i < seriesList.length; i++){
     const s = seriesList[i];
     let description = '', modality = '-', matrixSize = '-', voxelSize = '-', fileCount = 0;
+    let modalityOverridden = false;
     if (s.myDicom && s.myDicom.length > 0){
       const ds = s.myDicom[0];
       description = ds.string("x0008103e") ?? '';
       modality = dicomModalityOf(ds);
+      modalityOverridden = isDicomModalityOverridden(ds);
       const rows = ds.int16("x00280010") ?? 0;
       const cols = ds.int16("x00280011") ?? 0;
       matrixSize = `${rows}×${cols}×${s.myDicom.length}`;
@@ -6042,6 +6169,7 @@ const rebuildSeriesSummaries = () => {
       isRgb,
       sourceType,
       datatypeName,
+      modalityOverridden,
     });
   }
   seriesSummaries.value = out;
@@ -6659,10 +6787,41 @@ const getPetCtSeriesCandidates = (): { pt: SeriesCand[]; ct: SeriesCand[] } => {
   return { pt, ct };
 };
 
+const studyOf = (idx: number): string => {
+  const dl = seriesList[idx]?.myDicom;
+  if (!dl || dl.length === 0) return '';
+  return (dl[0].string('x0020000d') ?? '').trim();
+};
+
+// **CT は、実際に使う PET に合わせて選ぶ** (2026-09)。
+// 以前は PT と CT をそれぞれ独立に「active → 最上位」で選んでいたため、複数 study
+// (経時比較で同一患者の複数回撮影を一緒に読む) だと別 study の CT と組まれうる。
+// 実測 sample-data/ac76 (4 study) では先頭 study が両方の最上位だったので**偶然**成立していた。
+// 優先順位: 同じ FrameOfReference (= 同じ撮影の PET/CT、機械的に位置が合っている)
+//        → 同じ study → (それ以外は) active → 最上位。
+// cands.ct はスコア順に並んでいるので、各段で最初に見つかったものが最良。
+const bestCtIndexForPet = (petIdx: number, ctCands?: SeriesCand[]): number => {
+  const ct = ctCands ?? getPetCtSeriesCandidates().ct;
+  if (ct.length === 0) return -1;
+  if (petIdx >= 0) {
+    const ptFor = frameOfRefOf(petIdx);
+    if (ptFor) {
+      const hit = ct.find(c => frameOfRefOf(c.idx) === ptFor);
+      if (hit) return hit.idx;
+    }
+    const ptStudy = studyOf(petIdx);
+    if (ptStudy) {
+      const hit = ct.find(c => studyOf(c.idx) === ptStudy);
+      if (hit) return hit.idx;
+    }
+  }
+  return (ct.find(c => c.isActive) ?? ct[0]).idx;
+};
+
 // 解決済 PT/CT index を返す。優先順位:
 //   1. override (引数で明示) — App.vue ピッカー確定時に使う
-//   2. segStore active (★ で指定された PT/CT)
-//   3. priority score 最大 (ATTN > NAC、WB > Lung 等のルールベース)
+//   2. PT: segStore active (★) → priority score 最大 (ATTN > NAC、WB > Lung 等)
+//   3. CT: **選ばれた PT と同じ FoR / study** (bestCtIndexForPet)
 const resolvePetCtIndices = (overridePetIdx?: number, overrideCtIdx?: number): { petIdx: number; ctIdx: number } => {
   const cands = getPetCtSeriesCandidates();
   let petIdx = overridePetIdx ?? -1;
@@ -6672,11 +6831,7 @@ const resolvePetCtIndices = (overridePetIdx?: number, overrideCtIdx?: number): {
     if (active) petIdx = active.idx;
     else if (cands.pt.length > 0) petIdx = cands.pt[0].idx;  // sort 済 = top-scored
   }
-  if (ctIdx < 0) {
-    const active = cands.ct.find(c => c.isActive);
-    if (active) ctIdx = active.idx;
-    else if (cands.ct.length > 0) ctIdx = cands.ct[0].idx;
-  }
+  if (ctIdx < 0) ctIdx = bestCtIndexForPet(petIdx, cands.ct);
   return { petIdx, ctIdx };
 };
 
@@ -7188,6 +7343,7 @@ defineExpose({
   //   getPetCtSeriesCandidates() — PT/CT 各候補一覧 (idx, label, isActive)
   //   resolvePetCtIndices()      — active → first-found 解決済み index
   getPetCtSeriesCandidates,
+  bestCtIndexForPet,
   resolvePetCtIndices,
   // App-bar の Preprocessing メニューから redraw を呼ぶ用
   redraw: show,
@@ -7229,6 +7385,7 @@ defineExpose({
   loadVoiTemplateFiles,
   voiCandidateSeries,
   runVoiAnalysis,
+  jumpToVoiRegion,
   downloadVoiCsv,
   /** overlay の ON/OFF・不透明度を変えたら再描画する (幾何は変わらないので show だけ) */
   refreshVoiOverlay: () => { boxStateVersion.value++; show(); },
